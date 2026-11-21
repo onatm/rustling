@@ -15,7 +15,8 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | Incremental decoding with per-visit KV and convolution state | done |
 | NEON kernels that multiply straight from NVFP4, MXFP8 and bfloat16 weights (`src/quant.rs`) | done |
 | Batched prompt processing: tokens share each pass over the weights, with results independent of batching | done; about 30 tokens/s for a 561-token prompt |
-| Metal backend for large batches, bit-identical to the CPU (`src/gpu.rs`, `src/shaders.metal`) | done; a 561-token prompt in 12.6 s against 18.1 s on the CPU |
+| Metal backend for large batches, bit-identical to the CPU (`src/gpu.rs`, `src/shaders.metal`) | done and the default; a 2,114-token prompt in 56 s against 80 s on the CPU |
+| Fast Metal path for prompts of 256 tokens or more, not bit-identical | done, opt-in with `--backend metal-fast`; the same prompt in about 38 s |
 | Sampler: temperature, top-k, top-p, seed (`src/sampler.rs`) | done |
 | Multi-turn chat that reuses the conversation's state, with a stop on repeating output (`src/session.rs`) | done |
 | OpenAI-compatible HTTP server: chat completions, streaming, tool calls (`src/server.rs`) | done |
@@ -42,6 +43,26 @@ cargo run --release -- generate "Write a function that reverses a list." --draft
 cargo run --release -- generate "Hello" --timing   # where the forward pass spends its time
 cargo run --release -- generate "Hello" --backend cpu   # default is auto: Metal for batches of 32+ tokens
 ```
+
+## Backends and reproducibility
+
+| `--backend` | Long prompts (256+ tokens) | Results |
+|---|---|---|
+| `auto` (default), `metal` | GPU kernels that repeat the CPU's arithmetic step for step | identical to the CPU's |
+| `metal-fast` | weights widened to float on the GPU, then Apple's tuned matrix product | differ from the CPU's in the last bits |
+| `cpu` | NEON kernels | the reference |
+
+Shorter batches and token-by-token generation use the exact kernels on every backend.
+
+What "differ in the last bits" leads to depends on `--activations`. With `float` nothing amplifies the
+difference and the fast path agrees with the exact one to four decimal places. With `quantised` (the default,
+and how the model was trained) the model is chaotic in this respect: a last-bit difference flips a few 4-bit
+activation codes, each flip is a large change, and over 48 layer visits the hidden states drift about a quarter
+of their size apart while still predicting mostly the same tokens (22 of 25 on a prose test). That is a property
+of 4-bit activations, not of this engine: any two implementations that differ at all will do it. In practice it
+means the same long prompt can lead to a different, equally valid reply depending on the backend, and on whether
+it was processed in one go or resumed from the prompt cache. That is why `metal-fast` is opt-in: the default
+backends give the same output every time.
 
 ## Variable-loop checkpoint
 

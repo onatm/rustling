@@ -179,7 +179,7 @@ pub struct ExpertMatrix<'a> {
     block: usize,
 }
 
-impl ExpertMatrix<'_> {
+impl<'a> ExpertMatrix<'a> {
     /// Decodes row `row` of expert `expert` into `out` (`cols` values).
     pub fn decode_row(&self, expert: usize, row: usize, out: &mut [f32]) {
         let (values, scales) = self.row(expert, row);
@@ -203,6 +203,19 @@ impl ExpertMatrix<'_> {
         match &self.format {
             ExpertFormat::Nvfp4 { outer_scales } => Some((self.values, self.scales, outer_scales)),
             ExpertFormat::Mxfp8 => None,
+        }
+    }
+
+    /// The stored values and block scales of every expert, whatever the format.
+    pub fn raw_parts(&self) -> (&'a [u8], &'a [u8]) {
+        (self.values, self.scales)
+    }
+
+    /// The scale applied to an expert's whole matrix on top of its block scales: 1 for MXFP8, which has none.
+    pub fn outer_scale(&self, expert: usize) -> f32 {
+        match &self.format {
+            ExpertFormat::Nvfp4 { outer_scales } => outer_scales[expert],
+            ExpertFormat::Mxfp8 => 1.0,
         }
     }
 

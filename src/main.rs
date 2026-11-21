@@ -134,7 +134,8 @@ struct RunArgs {
     /// Expert arithmetic: `quantised` as the model was trained, or `float` as transformers computes it.
     #[arg(long, value_enum, default_value_t = ActivationsArg::Quantised)]
     activations: ActivationsArg,
-    /// Where the heavy matrix products run: `auto` uses the GPU for large batches when there is one.
+    /// Where the heavy matrix products run: `auto` uses the GPU for large batches when there is one, with
+    /// results identical to the CPU's. `metal-fast` is quicker on long prompts but not bit-identical.
     #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
     backend: BackendArg,
 }
@@ -185,6 +186,9 @@ enum BackendArg {
     Auto,
     Cpu,
     Metal,
+    /// Metal with a faster path for prompts of 256 tokens or more. Its results are not bit-identical to the other
+    /// backends', and with quantised activations can be a different, equally valid reply.
+    MetalFast,
 }
 
 impl From<BackendArg> for Backend {
@@ -193,6 +197,7 @@ impl From<BackendArg> for Backend {
             BackendArg::Auto => Backend::Auto,
             BackendArg::Cpu => Backend::Cpu,
             BackendArg::Metal => Backend::Metal,
+            BackendArg::MetalFast => Backend::MetalFast,
         }
     }
 }

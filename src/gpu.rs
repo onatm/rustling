@@ -32,7 +32,14 @@ pub struct Gpu {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     dense: Pipeline,
     experts: Pipeline,
+    widen_bf16: Pipeline,
+    widen_nvfp4: Pipeline,
+    widen_mxfp8: Pipeline,
     e4m3: Buffer,
+    /// Working buffers of the fast path, reused from call to call and grown as needed; `(bytes, buffer)` by slot.
+    scratch: Mutex<Vec<Option<(usize, Buffer)>>>,
+    /// Whether large batches may take the fast path, whose results match the exact kernels only to rounding.
+    fast: bool,
     /// Memory maps that may be wrapped without copying, as `(address, length)`.
     mapped: Vec<(usize, usize)>,
     /// No-copy buffers over page-aligned spans of the maps, keyed by `(address, length)`.
@@ -82,7 +89,7 @@ struct Group {
 impl Gpu {
     /// Sets up the default device. `maps` are the memory-mapped files whose contents will be passed as weights;
     /// they must stay mapped for as long as the `Gpu` is used.
-    pub fn new(maps: &[&[u8]]) -> Result<Self> {
+    pub fn new(maps: &[&[u8]], fast: bool) -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
         let queue = device.newCommandQueue().context("creating a Metal command queue")?;
 
@@ -101,6 +108,8 @@ impl Gpu {
                 .map_err(|e| anyhow!("building kernel {name}: {}", e.localizedDescription()))
         };
         let (dense, experts) = (pipeline("dense")?, pipeline("experts")?);
+        let (widen_bf16, widen_nvfp4, widen_mxfp8) =
+            (pipeline("widen_bf16")?, pipeline("widen_nvfp4")?, pipeline("widen_mxfp8")?);
 
         let mut gpu = Self {
             e4m3: copied(&device, &E4M3[..])?,
@@ -108,6 +117,11 @@ impl Gpu {
             queue,
             dense,
             experts,
+            widen_bf16,
+            widen_nvfp4,
+            widen_mxfp8,
+            scratch: Mutex::new(Vec::new()),
+            fast,
             mapped: Vec::new(),
             wrapped: Mutex::new(HashMap::new()),
         };
@@ -235,6 +249,199 @@ impl Gpu {
         Ok(slots.iter().flat_map(|&slot| all[slot * job.rows..][..job.rows].iter().copied()).collect())
     }
 
+    /// Whether large batches may take the fast, inexact path.
+    pub fn fast(&self) -> bool {
+        self.fast
+    }
+
+    /// A working buffer of at least `bytes`, kept under `slot` for reuse. Its contents are whatever the last use
+    /// left there.
+    fn scratch(&self, slot: usize, bytes: usize) -> Result<Buffer> {
+        let mut scratch = self.scratch.lock().expect("scratch lock");
+        if scratch.len() <= slot {
+            scratch.resize(slot + 1, None);
+        }
+        match &scratch[slot] {
+            Some((size, buffer)) if *size >= bytes => Ok(buffer.clone()),
+            _ => {
+                // Drop the old one first, so the two are never held together.
+                scratch[slot] = None;
+                let buffer = empty(&self.device, bytes)?;
+                scratch[slot] = Some((bytes, buffer.clone()));
+                Ok(buffer)
+            }
+        }
+    }
+
+    /// [`Gpu::dense`] on the fast path: the weights are widened to float and multiplied by Apple's tuned matrix
+    /// product. Several times faster for many vectors, and equal to `dense` only up to rounding.
+    pub fn dense_fast(&self, jobs: &[DenseJob]) -> Result<Vec<Vec<f32>>> {
+        let commands = self.queue.commandBuffer().context("creating a command buffer")?;
+        let mut outputs = Vec::new();
+        for (index, job) in jobs.iter().enumerate() {
+            let vectors = job.xs.len() / job.cols;
+            ensure!(job.weights.len() == job.rows * job.cols * 2 && job.xs.len() == vectors * job.cols, "bad dense job");
+            ensure!(job.cols % 16 == 0, "the widening kernel takes 16 columns per step");
+            let (weights, offset) = self.weights(job.weights)?;
+            ensure!(offset % 4 == 0, "weights are not word-aligned in the checkpoint");
+            let widened = self.scratch(2 * index, job.rows * job.cols * 4)?;
+            let params = [job.rows as u32, job.cols as u32, 0];
+            self.encode(&commands, &self.widen_bf16, &[(&weights, offset), (&widened, 0)], &params, (job.cols / 8, job.rows))?;
+            let x = copied(&self.device, job.xs)?;
+            let out = self.scratch(2 * index + 1, vectors * job.rows * 4)?;
+            // out = x . widened^T: one row per vector.
+            self.multiply(&commands, (&x, 0, vectors, job.cols), (&widened, 0, job.rows, job.cols), (&out, 0), 1);
+            outputs.push((out, vectors * job.rows));
+        }
+        commands.commit();
+        commands.waitUntilCompleted();
+        finish(&commands)?;
+        Ok(outputs.into_iter().map(|(buffer, len)| read(&buffer, len)).collect())
+    }
+
+    /// Each expert of a stack applied to its own vectors, on the fast path.
+    ///
+    /// `values` and `scales` hold `experts` matrices of `rows x cols`, in NVFP4 or MXFP8 as `nvfp4` says.
+    /// `vectors[expert]` are that expert's inputs, each `cols` wide. Returns, per expert, its results end to end
+    /// (`rows` values per input). For NVFP4 that is without the expert's outer scale, which the caller applies.
+    /// `slot` (0 or 1) keeps a layer's two stacks apart.
+    ///
+    /// Experts get very different numbers of inputs, and one tuned product wants the same number for every matrix
+    /// in it. So the experts are sorted by how many they have and multiplied in groups of similar size, each
+    /// padded with zeros to its largest member.
+    pub fn experts_fast(
+        &self,
+        (values, scales): (&[u8], &[u8]),
+        (experts, rows, cols): (usize, usize, usize),
+        nvfp4: bool,
+        vectors: &[Vec<&[f32]>],
+        slot: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        ensure!(vectors.len() == experts, "one list of vectors per expert");
+        // NVFP4 packs two values per byte in blocks of 16; MXFP8 is a byte per value in blocks of 32.
+        let (values_per_byte, block, widen) = if nvfp4 { (2, 16, &self.widen_nvfp4) } else { (1, 32, &self.widen_mxfp8) };
+        let weights = experts * rows * cols;
+        ensure!(values.len() == weights / values_per_byte && scales.len() == weights / block, "bad expert stack");
+        ensure!(cols % 32 == 0 && vectors.iter().flatten().all(|v| v.len() == cols), "bad expert inputs");
+        let mut order: Vec<usize> = (0..experts).filter(|&e| !vectors[e].is_empty()).collect();
+        let mut outputs = vec![Vec::new(); experts];
+        if order.is_empty() {
+            return Ok(outputs);
+        }
+        order.sort_by_key(|&e| std::cmp::Reverse(vectors[e].len()));
+
+        // Groups of consecutive experts in that order, as (first position, experts, vectors each). An expert joins
+        // a group while it has at least half as many vectors as the group's first, so padding at most doubles
+        // the work.
+        let mut groups: Vec<(usize, usize, usize)> = Vec::new();
+        for (position, &expert) in order.iter().enumerate() {
+            match groups.last_mut() {
+                Some((_, count, most)) if vectors[expert].len() * 2 >= *most => *count += 1,
+                _ => groups.push((position, 1, vectors[expert].len())),
+            }
+        }
+
+        let (values_buffer, values_offset) = self.weights(values)?;
+        let (scales_buffer, scales_offset) = self.weights(scales)?;
+        ensure!(values_offset % 4 == 0, "expert weights are not word-aligned in the checkpoint");
+        // Slots after the dense ones.
+        let padded: usize = groups.iter().map(|&(_, count, most)| count * most).sum();
+        let widened = self.scratch(16 + slot, order.len() * rows * cols * 4)?;
+        let x = self.scratch(18 + slot, padded * cols * 4)?;
+        let out = self.scratch(20 + slot, padded * rows * 4)?;
+
+        // Inputs group by group, expert by expert, zero where an expert has fewer than its group's most.
+        // SAFETY: the buffer is shared-mode, at least `padded * cols` floats long, and nothing else uses it until
+        // the command buffer below is committed.
+        let inputs = unsafe { std::slice::from_raw_parts_mut(x.contents().as_ptr() as *mut f32, padded * cols) };
+        let mut rest = inputs;
+        for &(first, count, most) in &groups {
+            for &expert in &order[first..first + count] {
+                let (mine, after) = rest.split_at_mut(most * cols);
+                for (slot, vector) in mine.chunks_exact_mut(cols).zip(vectors[expert].iter().map(Some).chain(std::iter::repeat(None))) {
+                    match vector {
+                        Some(vector) => slot.copy_from_slice(vector),
+                        None => slot.fill(0.0),
+                    }
+                }
+                rest = after;
+            }
+        }
+
+        let commands = self.queue.commandBuffer().context("creating a command buffer")?;
+        let order_buffer = copied(&self.device, &order.iter().map(|&e| e as u32).collect::<Vec<u32>>())?;
+        let buffers = [
+            (&values_buffer, values_offset),
+            (&scales_buffer, scales_offset),
+            (&self.e4m3, 0),
+            (&order_buffer, 0),
+            (&widened, 0),
+        ];
+        let params = [rows as u32, cols as u32, order.len() as u32];
+        self.encode(&commands, widen, &buffers, &params, (cols / block, order.len() * rows))?;
+        let mut offset = 0;
+        for &(first, count, most) in &groups {
+            self.multiply(
+                &commands,
+                (&x, offset * cols * 4, most, cols),
+                (&widened, first * rows * cols * 4, rows, cols),
+                (&out, offset * rows * 4),
+                count,
+            );
+            offset += count * most;
+        }
+        commands.commit();
+        commands.waitUntilCompleted();
+        finish(&commands)?;
+
+        // SAFETY: as for `inputs`; the command buffer that wrote it has completed.
+        let results = unsafe { std::slice::from_raw_parts(out.contents().as_ptr() as *const f32, padded * rows) };
+        let mut offset = 0;
+        for &(first, count, most) in &groups {
+            for &expert in &order[first..first + count] {
+                outputs[expert] = results[offset * rows..][..vectors[expert].len() * rows].to_vec();
+                offset += most;
+            }
+        }
+        Ok(outputs)
+    }
+
+    /// Encodes `out = left . right^T` for `count` matrices laid end to end in each buffer, as float.
+    /// `left` is `(buffer, byte offset, rows, cols)` per matrix and `right` likewise; they share `cols`. `out` is
+    /// `(buffer, byte offset)`.
+    fn multiply(
+        &self,
+        commands: &ProtocolObject<dyn MTLCommandBuffer>,
+        left: (&Buffer, usize, usize, usize),
+        right: (&Buffer, usize, usize, usize),
+        out: (&Buffer, usize),
+        count: usize,
+    ) {
+        use objc2::AnyThread;
+        use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication};
+        let ((left, left_offset, vectors, cols), (right, right_offset, rows, _)) = (left, right);
+        // SAFETY: the callers size each buffer for `count` matrices of the stated shape past its offset, and hold
+        // the buffers until the command buffer completes.
+        unsafe {
+            let matrix = |buffer: &Buffer, offset: usize, r: usize, c: usize| {
+                let descriptor = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_matrices_rowBytes_matrixBytes_dataType(
+                    r, c, count, c * 4, r * c * 4, MPSDataType::Float32,
+                );
+                MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(), buffer, offset, &descriptor)
+            };
+            let kernel = MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
+                MPSMatrixMultiplication::alloc(), &self.device, false, true, vectors, rows, cols, 1.0, 0.0,
+            );
+            kernel.setBatchSize(count);
+            kernel.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
+                commands,
+                &matrix(left, left_offset, vectors, cols),
+                &matrix(right, right_offset, rows, cols),
+                &matrix(out.0, out.1, vectors, rows),
+            );
+        }
+    }
+
     /// Encodes one kernel over a `grid.0 x grid.1` grid. `params` goes in the slot after the buffers.
     fn encode(
         &self,
@@ -319,7 +526,7 @@ mod tests {
 
     #[test]
     fn dense_matches_the_cpu_kernel_exactly() {
-        let gpu = Gpu::new(&[]).unwrap();
+        let gpu = Gpu::new(&[], true).unwrap();
         // A small case, and the real width with a vector count that is not a multiple of the share.
         for (rows, cols, vectors) in [(5, 48, 1), (33, 2304, 7)] {
             // Small bfloat16 values: sign, a modest exponent, random mantissa.
@@ -341,7 +548,7 @@ mod tests {
     #[ignore]
     fn bench() {
         use std::time::Instant;
-        let gpu = Gpu::new(&[]).unwrap();
+        let gpu = Gpu::new(&[], true).unwrap();
         let (rows, cols, vectors) = (3072, 2304, 512);
         let weights: Vec<u8> =
             bytes(rows * cols * 2, 1).as_chunks::<2>().0.iter().flat_map(|b| [b[0], 0x3C | (b[1] & 0x83)]).collect();
@@ -384,8 +591,107 @@ mod tests {
     }
 
     #[test]
+    fn the_fast_dense_path_matches_to_rounding() {
+        let gpu = Gpu::new(&[], true).unwrap();
+        let (rows, cols, vectors) = (40, 2304, 70);
+        let weights: Vec<u8> =
+            bytes(rows * cols * 2, 5).as_chunks::<2>().0.iter().flat_map(|b| [b[0], 0x3C | (b[1] & 0x83)]).collect();
+        let xs = floats(vectors * cols, 6);
+        let job = [DenseJob { weights: &weights, rows, cols, xs: &xs }];
+        let (fast, exact) = (gpu.dense_fast(&job).unwrap().remove(0), gpu.dense(&job).unwrap().remove(0));
+        // Compared with the size of the terms summed: a result near zero from cancellation is still that accurate.
+        for v in 0..vectors {
+            for r in 0..rows {
+                let row = weights[r * cols * 2..][..cols * 2].as_chunks::<2>().0;
+                let magnitude: f32 = row.iter().zip(&xs[v * cols..]).map(|(w, x)| (half::bf16::from_le_bytes(*w).to_f32() * x).abs()).sum();
+                let (a, b) = (fast[v * rows + r], exact[v * rows + r]);
+                assert!((a - b).abs() <= 1e-5 * magnitude, "vector {v}, row {r}: {a} against {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_fast_expert_path_matches_to_rounding() {
+        let gpu = Gpu::new(&[], true).unwrap();
+        let (experts, rows, cols) = (6, 24, 2304);
+        let values = bytes(experts * rows * cols / 2, 7);
+        let scales: Vec<u8> =
+            bytes(experts * rows * cols / 16, 8).into_iter().map(|b| if b & 0x7F == 0x7F { b & 0xF0 } else { b }).collect();
+        // Very uneven counts, one expert with none: several groups, with padding inside them.
+        let counts = [3usize, 40, 0, 7, 21, 1];
+        let activations: Vec<Vec<Nvfp4Activation>> = counts
+            .iter()
+            .enumerate()
+            .map(|(e, &n)| (0..n as u64).map(|i| quantize_nvfp4(&floats(cols, 100 * e as u64 + i))).collect())
+            .collect();
+        let unscaled: Vec<Vec<Vec<f32>>> =
+            activations.iter().map(|list| list.iter().map(Nvfp4Activation::unscaled).collect()).collect();
+        let vectors: Vec<Vec<&[f32]>> = unscaled.iter().map(|list| list.iter().map(Vec::as_slice).collect()).collect();
+        let out = gpu.experts_fast((&values, &scales), (experts, rows, cols), true, &vectors, 0).unwrap();
+        let mut decoded = vec![0.0f32; cols];
+        for (expert, list) in activations.iter().enumerate() {
+            assert_eq!(out[expert].len(), list.len() * rows);
+            for (i, activation) in list.iter().enumerate() {
+                for r in 0..rows {
+                    let row = expert * rows + r;
+                    // The exact kernel with outer weight scale 1, without the activation's outer scale.
+                    let exact = dot_nvfp4_row_quantized(
+                        &values[row * cols / 2..][..cols / 2],
+                        &scales[row * cols / 16..][..cols / 16],
+                        1.0,
+                        activation,
+                    ) / activation.outer_scale();
+                    let fast = out[expert][i * rows + r];
+                    // Compared with the size of the terms summed, which nearly cancel for random weights.
+                    crate::quant::decode_nvfp4_row(
+                        &values[row * cols / 2..][..cols / 2],
+                        &scales[row * cols / 16..][..cols / 16],
+                        1.0,
+                        &mut decoded,
+                    );
+                    let magnitude: f32 = decoded.iter().zip(&unscaled[expert][i]).map(|(w, x)| (w * x).abs()).sum();
+                    assert!((fast - exact).abs() <= 1e-5 * magnitude, "expert {expert}, input {i}, row {r}: {fast} against {exact}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_fast_mxfp8_path_matches_to_rounding() {
+        let gpu = Gpu::new(&[], true).unwrap();
+        let (experts, rows, cols) = (4, 20, 1152);
+        let values: Vec<u8> =
+            bytes(experts * rows * cols, 9).into_iter().map(|b| if b & 0x7F == 0x7F { b & 0xF0 } else { b }).collect();
+        // Block exponents near 127 keep the products in range; one zero byte exercises the subnormal scale.
+        let mut scales: Vec<u8> = bytes(experts * rows * cols / 32, 10).iter().map(|b| 115 + b % 20).collect();
+        scales[5] = 0;
+        let counts = [2usize, 0, 9, 5];
+        let inputs: Vec<Vec<Vec<f32>>> = counts
+            .iter()
+            .enumerate()
+            .map(|(e, &n)| (0..n as u64).map(|i| floats(cols, 200 * e as u64 + i)).collect())
+            .collect();
+        let vectors: Vec<Vec<&[f32]>> = inputs.iter().map(|list| list.iter().map(Vec::as_slice).collect()).collect();
+        let out = gpu.experts_fast((&values, &scales), (experts, rows, cols), false, &vectors, 0).unwrap();
+        let mut decoded = vec![0.0f32; cols];
+        for (expert, list) in inputs.iter().enumerate() {
+            assert_eq!(out[expert].len(), list.len() * rows);
+            for (i, x) in list.iter().enumerate() {
+                for r in 0..rows {
+                    let row = expert * rows + r;
+                    crate::quant::decode_mxfp8_row(&values[row * cols..][..cols], &scales[row * cols / 32..][..cols / 32], &mut decoded);
+                    let exact = crate::quant::dot_f32_row(&decoded, x);
+                    let magnitude: f32 = decoded.iter().zip(x).map(|(w, x)| (w * x).abs()).sum();
+                    let fast = out[expert][i * rows + r];
+                    assert!((fast - exact).abs() <= 1e-5 * magnitude, "expert {expert}, input {i}, row {r}: {fast} against {exact}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn experts_match_the_cpu_kernel_exactly() {
-        let gpu = Gpu::new(&[]).unwrap();
+        let gpu = Gpu::new(&[], true).unwrap();
         let (experts, rows, cols) = (3, 40, 2304);
         let values = bytes(experts * rows * cols / 2, 3);
         let scales: Vec<u8> =

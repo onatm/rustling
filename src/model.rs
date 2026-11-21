@@ -12,6 +12,7 @@ use half::bf16;
 use safetensors::Dtype;
 use rayon::prelude::*;
 
+use crate::accel;
 use crate::checkpoint::{Checkpoint, ExpertMatrix, Experts};
 use crate::config::{Config, TextConfig};
 #[cfg(target_os = "macos")]
@@ -39,6 +40,11 @@ const GPU_MIN_TOKENS: usize = 32;
 /// about equally fast at it.
 #[cfg(target_os = "macos")]
 const GPU_EXPERT_SHARE: f32 = 0.5;
+
+/// Batches of at least this many tokens take the GPU's fast path when it was asked for: tuned float matrix products
+/// in place of the exact kernels. Below it the fast path's fixed costs outweigh its speed.
+#[cfg(target_os = "macos")]
+const FAST_MIN_TOKENS: usize = 256;
 
 /// (expert, token) products per GPU submission, which bounds the size of the output buffer.
 #[cfg(target_os = "macos")]
@@ -691,28 +697,43 @@ impl<'a> Model<'a> {
                     trace::record_at("bias", tokens * heads * tokens, offset, &[*value]);
                 }
             }
-            let mut weights: Vec<f32> = (first..=t)
-                .map(|s| {
-                    let key = &k[(s - cached_from) * kv_dim + kv * dim..][..dim];
-                    match bf16 {
-                        false => dot(query, key) * scaling + bias.get(t - s).copied().unwrap_or(0.0),
-                        // The product, the scaling and the bias are three bfloat16 results in transformers.
-                        true => {
-                            let score = round_bf16(round_bf16(dot(query, key)) * scaling);
-                            round_bf16(score + bias.get(t - s).copied().unwrap_or(0.0))
-                        }
-                    }
-                })
-                .collect();
             // The sink is one extra logit with a zero value: it only absorbs probability mass.
             let sink = sinks[i * heads + head];
-            let max = weights.iter().copied().fold(sink, f32::max);
-            weights.iter_mut().for_each(|w| *w = (*w - max).exp());
-            let total = weights.iter().sum::<f32>() + (sink - max).exp();
-            for (weight, s) in weights.iter().zip(first..=t) {
-                let value = &v[(s - cached_from) * kv_dim + kv * dim..][..dim];
-                let p = if bf16 { round_bf16(weight / total) } else { weight / total };
-                out.iter_mut().zip(value).for_each(|(o, x)| *o += p * x);
+            let keys = t + 1 - first;
+            let base = (first - cached_from) * kv_dim + kv * dim;
+            if bf16 {
+                // The reference's steps one by one, each landing on bfloat16.
+                let mut weights: Vec<f32> = (first..=t)
+                    .map(|s| {
+                        let key = &k[(s - cached_from) * kv_dim + kv * dim..][..dim];
+                        // The product, the scaling and the bias are three bfloat16 results in transformers.
+                        let score = round_bf16(round_bf16(dot(query, key)) * scaling);
+                        round_bf16(score + bias.get(t - s).copied().unwrap_or(0.0))
+                    })
+                    .collect();
+                let max = weights.iter().copied().fold(sink, f32::max);
+                weights.iter_mut().for_each(|w| *w = (*w - max).exp());
+                let total = weights.iter().sum::<f32>() + (sink - max).exp();
+                for (weight, s) in weights.iter().zip(first..=t) {
+                    let value = &v[(s - cached_from) * kv_dim + kv * dim..][..dim];
+                    let p = round_bf16(weight / total);
+                    out.iter_mut().zip(value).for_each(|(o, x)| *o += p * x);
+                }
+            } else {
+                let mut weights: Vec<f32> = (0..keys)
+                    .map(|j| {
+                        // Key `j` is `keys - 1 - j` positions back.
+                        let key = &k[base + j * kv_dim..][..dim];
+                        dot(query, key) * scaling + bias.get(keys - 1 - j).copied().unwrap_or(0.0)
+                    })
+                    .collect();
+                let max = weights.iter().copied().fold(sink, f32::max);
+                weights.iter_mut().for_each(|w| *w = (*w - max).exp());
+                let total = weights.iter().sum::<f32>() + (sink - max).exp();
+                for (j, weight) in weights.iter().enumerate() {
+                    let p = weight / total;
+                    out.iter_mut().zip(&v[base + j * kv_dim..][..dim]).for_each(|(o, x)| *o += p * x);
+                }
             }
             round_all(bf16, out);
             let gate = &gate[unit * dim..][..dim];
@@ -929,6 +950,72 @@ impl<'a> Model<'a> {
                 .collect()
         };
 
+        // A long batch, where the fast path is allowed: every expert's tokens go through one tuned float product
+        // per matrix. The activations are the same quantised values as below, so only the order of the sums, and
+        // with it the last bits before rounding, differs.
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = &self.gpu
+            && gpu.fast()
+            && inputs.len() >= FAST_MIN_TOKENS
+        {
+            let count = tokens_of.len();
+            let nvfp4 = experts.gate_up.is_nvfp4();
+            // An input as plain floats and the scale left out of them: NVFP4 keeps its outer scale apart so the
+            // floats are exact; an MXFP8 input is already the values it stands for.
+            let activation = |input: &Input| -> (Vec<f32>, f32) {
+                match input {
+                    Input::Nvfp4(x) => (x.unscaled(), x.outer_scale()),
+                    Input::Mxfp8(x) => (x.clone(), 1.0),
+                }
+            };
+            let run = || -> Result<Vec<(usize, Vec<f32>)>> {
+                let unscaled: Vec<(Vec<f32>, f32)> = inputs.par_iter().map(activation).collect();
+                let firsts: Vec<Vec<&[f32]>> =
+                    tokens_of.iter().map(|tokens| tokens.iter().map(|&(t, _)| unscaled[t].0.as_slice()).collect()).collect();
+                let (rows, cols) = (experts.gate_up.rows, experts.gate_up.cols);
+                let gate_up = gpu.experts_fast(experts.gate_up.raw_parts(), (count, rows, cols), nvfp4, &firsts, 0)?;
+
+                // Scale, round, activate with the routing weight, and quantise again, per (expert, token).
+                let acts: Vec<Vec<(Vec<f32>, f32)>> = gate_up
+                    .par_iter()
+                    .zip(tokens_of)
+                    .enumerate()
+                    .map(|(expert, (products, tokens))| {
+                        let per_token = products.par_chunks_exact(rows).zip(tokens).map(|(products, &(t, weight))| {
+                            let scale = experts.gate_up.outer_scale(expert) * unscaled[t].1;
+                            let (mut gate, mut up): (Vec<f32>, Vec<f32>) = products
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|&[gate, up]| (round_bf16(gate * scale), round_bf16(up * scale)))
+                                .unzip();
+                            capped_swiglu(&mut gate, &mut up, cfg.mlp_gate_softcap, cfg.mlp_up_softcap, weight);
+                            activation(&quantise(gate))
+                        });
+                        per_token.collect()
+                    })
+                    .collect();
+                let seconds: Vec<Vec<&[f32]>> =
+                    acts.iter().map(|acts| acts.iter().map(|(values, _)| values.as_slice()).collect()).collect();
+                let (rows, cols) = (experts.down.rows, experts.down.cols);
+                let down = gpu.experts_fast(experts.down.raw_parts(), (count, rows, cols), nvfp4, &seconds, 1)?;
+
+                // In expert order, then token order: the order the other routes produce their outputs in.
+                let mut outputs = Vec::new();
+                for (expert, ((products, acts), tokens)) in down.iter().zip(&acts).zip(tokens_of).enumerate() {
+                    for ((product, (_, act_scale)), &(t, _)) in products.chunks_exact(rows).zip(acts).zip(tokens) {
+                        let scale = experts.down.outer_scale(expert) * act_scale;
+                        outputs.push((t, product.iter().map(|v| round_bf16(v * scale)).collect()));
+                    }
+                }
+                Ok(outputs)
+            };
+            match run() {
+                Ok(outputs) => return outputs,
+                Err(error) => gpu_failed(&error),
+            }
+        }
+
         // Enough tokens, a GPU and NVFP4 weights: the GPU takes the first experts and the CPU the rest, at the
         // same time. Both give the same results, so the split only affects speed. On the GPU both matrices run
         // there, with the activation function and the second quantisation in between done here.
@@ -1020,12 +1107,16 @@ impl<'a> Model<'a> {
 /// Where the heavy matrix products run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    /// The GPU for large batches when there is one, otherwise the CPU.
+    /// The GPU for large batches when there is one, otherwise the CPU. Either way the results are the same,
+    /// bit for bit.
     #[default]
     Auto,
     Cpu,
     /// As `Auto`, but failing to set up the GPU is an error.
     Metal,
+    /// The GPU with a faster path for long prompts, whose results match the others' only to rounding. With
+    /// quantised activations that small difference grows into a different, equally valid result.
+    MetalFast,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1038,14 +1129,18 @@ pub struct Options {
 fn open_gpu(checkpoint: &Checkpoint, backend: Backend) -> Result<Option<Gpu>> {
     match backend {
         Backend::Cpu => Ok(None),
-        Backend::Auto => Ok(Gpu::new(&checkpoint.maps()).ok()),
-        Backend::Metal => Gpu::new(&checkpoint.maps()).map(Some).context("setting up Metal"),
+        Backend::Auto => Ok(Gpu::new(&checkpoint.maps(), false).ok()),
+        Backend::Metal => Gpu::new(&checkpoint.maps(), false).map(Some).context("setting up Metal"),
+        Backend::MetalFast => Gpu::new(&checkpoint.maps(), true).map(Some).context("setting up Metal"),
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn open_gpu(_checkpoint: &Checkpoint, backend: Backend) -> Result<Option<Gpu>> {
-    ensure!(backend != Backend::Metal, "the Metal backend is only available on macOS");
+    ensure!(
+        !matches!(backend, Backend::Metal | Backend::MetalFast),
+        "the Metal backend is only available on macOS"
+    );
     Ok(None)
 }
 
@@ -1067,6 +1162,20 @@ pub enum Activations {
     /// Rounded to the expert weights' own format, as the model was trained and as SGLang and vLLM serve it.
     #[default]
     Quantised,
+}
+
+/// `gate[i] = softcap(gate[i]) * sigmoid(gate[i]) * softcap(up[i]) * weight`, the experts' activation, over whole
+/// vectors, with vectorised `tanh` and `exp`. `up` is used as working space.
+fn capped_swiglu(gate: &mut [f32], up: &mut [f32], gate_cap: f32, up_cap: f32, weight: f32) {
+    let mut capped: Vec<f32> = gate.iter().map(|g| g / gate_cap).collect();
+    let mut negated: Vec<f32> = gate.iter().map(|g| -g).collect();
+    up.iter_mut().for_each(|u| *u /= up_cap);
+    accel::tanh_in_place(&mut capped);
+    accel::exp_in_place(&mut negated);
+    accel::tanh_in_place(up);
+    for (((gate, capped), exp), up) in gate.iter_mut().zip(&capped).zip(&negated).zip(up.iter()) {
+        *gate = (capped * gate_cap) * (1.0 / (1.0 + exp)) * (up * up_cap) * weight;
+    }
 }
 
 fn round_bf16(x: f32) -> f32 {
@@ -1174,7 +1283,8 @@ pub(crate) fn apply_many(gpu: Option<&Gpu>, jobs: &[(&Mat, &[f32])]) -> Vec<Seq>
     {
         let dense: Vec<DenseJob> =
             jobs.iter().map(|(m, xs)| DenseJob { weights: m.bytes, rows: m.rows, cols: m.cols, xs }).collect();
-        match gpu.dense(&dense) {
+        let fast = gpu.fast() && jobs.iter().any(|(m, xs)| xs.len() / m.cols >= FAST_MIN_TOKENS);
+        match if fast { gpu.dense_fast(&dense) } else { gpu.dense(&dense) } {
             Ok(outs) => return outs,
             Err(error) => gpu_failed(&error),
         }

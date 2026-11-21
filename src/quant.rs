@@ -153,6 +153,22 @@ impl Nvfp4Activation {
         (&self.even, &self.odd, &self.block_scales, self.outer_scale)
     }
 
+    /// The values without the outer scale: each is an E2M1 value times its block's scale, exactly.
+    pub fn unscaled(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.len());
+        for ((even, odd), scale) in self.even.chunks_exact(8).zip(self.odd.chunks_exact(8)).zip(&self.block_scales) {
+            for (e, o) in even.iter().zip(odd) {
+                out.push(*e as f32 * 0.5 * scale);
+                out.push(*o as f32 * 0.5 * scale);
+            }
+        }
+        out
+    }
+
+    pub fn outer_scale(&self) -> f32 {
+        self.outer_scale
+    }
+
     /// The values the quantised vector stands for.
     pub fn dequantize(&self) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.len());

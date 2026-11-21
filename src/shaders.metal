@@ -166,3 +166,93 @@ kernel void experts(const device uchar* values [[buffer(0)]],
         out[(ulong(id.y) * SHARE + k) * p.rows + id.x] = round_bf16(product);
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// The fast path for long prompts: weights are widened to float here and multiplied by Apple's tuned matrix
+// product. Sums come out in whatever order that kernel uses, so results agree with the exact kernels above only
+// to rounding.
+
+struct WidenParams {
+    uint rows;
+    // A multiple of 16.
+    uint cols;
+    uint unused;
+};
+
+// out[row][col] = weights[row][col], bfloat16 to float. The grid is (cols / 8) x rows.
+kernel void widen_bf16(const device uchar* weights [[buffer(0)]],
+                       device float* out [[buffer(1)]],
+                       constant WidenParams& p [[buffer(2)]],
+                       uint2 id [[thread_position_in_grid]]) {
+    if (id.x * 8 >= p.cols || id.y >= p.rows) {
+        return;
+    }
+    ulong base = ulong(id.y) * p.cols + id.x * 8;
+    uint4 words = *((const device packed_uint4*)(weights + base * 2));
+    float4 first = as_type<float4>(words << 16), second = as_type<float4>(words & 0xFFFF0000u);
+    device packed_float4* o = (device packed_float4*)(out + base);
+    o[0] = float4(first.x, second.x, first.y, second.y);
+    o[1] = float4(first.z, second.z, first.w, second.w);
+}
+
+struct WidenStackParams {
+    // Rows per matrix.
+    uint rows;
+    // A multiple of 16.
+    uint cols;
+    // How many matrices to widen.
+    uint count;
+};
+
+// Widens chosen matrices of an NVFP4 stack, in a chosen order: out matrix `i` is stack matrix `order[i]`, each value
+// its E2M1 value times its E4M3 block scale. The per-matrix outer scale is left out, so every value is exact. The
+// grid is (cols / 16) x (count * rows): one thread per block.
+kernel void widen_nvfp4(const device uchar* values [[buffer(0)]],
+                        const device uchar* scales [[buffer(1)]],
+                        const device float* e4m3 [[buffer(2)]],
+                        const device uint* order [[buffer(3)]],
+                        device float* out [[buffer(4)]],
+                        constant WidenStackParams& p [[buffer(5)]],
+                        uint2 id [[thread_position_in_grid]]) {
+    uint blocks = p.cols / 16;
+    if (id.x >= blocks || id.y >= p.count * p.rows) {
+        return;
+    }
+    uint slot = id.y / p.rows, row = id.y % p.rows;
+    ulong block = (ulong(order[slot]) * p.rows + row) * blocks + id.x;
+    float scale = 0.5f * e4m3[scales[block]];
+    const device packed_uchar4* packed = (const device packed_uchar4*)(values + block * 8);
+    device packed_float4* o = (device packed_float4*)(out + (ulong(id.y) * blocks + id.x) * 16);
+    for (uint j = 0; j < 2; j++) {
+        uint4 bytes = uint4(uchar4(packed[j]));
+        float4 low = float4(twice_e2m1(bytes & 15u)) * scale, high = float4(twice_e2m1(bytes >> 4)) * scale;
+        o[2 * j] = float4(low.x, high.x, low.y, high.y);
+        o[2 * j + 1] = float4(low.z, high.z, low.w, high.w);
+    }
+}
+
+// As `widen_nvfp4`, for a stack of MXFP8 matrices: each value is its E4M3 value times its block's power-of-two
+// scale, 2^(scale - 127). Blocks are 32 values. The grid is (cols / 32) x (count * rows): one thread per block.
+kernel void widen_mxfp8(const device uchar* values [[buffer(0)]],
+                        const device uchar* scales [[buffer(1)]],
+                        const device float* e4m3 [[buffer(2)]],
+                        const device uint* order [[buffer(3)]],
+                        device float* out [[buffer(4)]],
+                        constant WidenStackParams& p [[buffer(5)]],
+                        uint2 id [[thread_position_in_grid]]) {
+    uint blocks = p.cols / 32;
+    if (id.x >= blocks || id.y >= p.count * p.rows) {
+        return;
+    }
+    uint slot = id.y / p.rows, row = id.y % p.rows;
+    ulong block = (ulong(order[slot]) * p.rows + row) * blocks + id.x;
+    // A float whose exponent field is the scale byte is 2^(scale - 127); a zero byte means 2^-127, a subnormal.
+    uint exponent = scales[block];
+    float scale = as_type<float>(exponent == 0 ? 0x00400000u : exponent << 23);
+    const device packed_uchar4* packed = (const device packed_uchar4*)(values + block * 32);
+    device packed_float4* o = (device packed_float4*)(out + (ulong(id.y) * blocks + id.x) * 32);
+    for (uint j = 0; j < 8; j++) {
+        uint4 bytes = uint4(uchar4(packed[j]));
+        o[j] = float4(e4m3[bytes.x], e4m3[bytes.y], e4m3[bytes.z], e4m3[bytes.w]) * scale;
+    }
+}
