@@ -18,6 +18,7 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use rustling::cache::PromptCache;
 use rustling::checkpoint::Checkpoint;
 use rustling::config::Config;
 use rustling::draft::Draft;
@@ -51,6 +52,8 @@ struct App {
     model: std::sync::Arc<str>,
 }
 
+const GIB: f64 = (1u64 << 30) as f64;
+
 /// How many of its own replies the server remembers the reasoning of; see [`Memory`].
 const REMEMBERED_REPLIES: usize = 64;
 
@@ -67,6 +70,10 @@ pub struct ServerOptions {
     pub draft_confidence: Option<f32>,
     /// Overrides how many times the looped layers run, for a variable-loop checkpoint.
     pub passes: Option<usize>,
+    /// How much memory processed prompts may take up, for reuse by later requests.
+    pub cache_bytes: usize,
+    /// Where to keep the processed prompts between runs.
+    pub cache_dir: Option<PathBuf>,
 }
 
 /// The fields of a chat completion request that the server acts on. Unknown fields are ignored.
@@ -141,11 +148,12 @@ pub fn serve(model_dir: &Path, options: ServerOptions) -> Result<()> {
     let address = format!("{}:{}", options.host, options.port);
     let model: std::sync::Arc<str> = model_name(model_dir, options.passes).into();
     let model_dir: PathBuf = model_dir.to_owned();
-    std::thread::Builder::new().name("model".into()).spawn(move || worker(&model_dir, options, queue, ready))?;
+    let worker =
+        std::thread::Builder::new().name("model".into()).spawn(move || worker(&model_dir, options, queue, ready))?;
     loaded.recv().context("the model thread stopped while loading")??;
 
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-    runtime.block_on(async move {
+    let served = runtime.block_on(async move {
         let app = Router::new()
             .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
             .route("/v1/models", get(models))
@@ -159,7 +167,11 @@ pub fn serve(model_dir: &Path, options: ServerOptions) -> Result<()> {
             })
             .await?;
         Ok(())
-    })
+    });
+    // Dropping the runtime drops the last sender to the model thread, which then saves its cache and ends.
+    drop(runtime);
+    worker.join().map_err(|_| anyhow!("the model thread panicked"))?;
+    served
 }
 
 async fn models(State(app): State<App>) -> Json<Value> {
@@ -321,14 +333,47 @@ fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Jo
         Some(draft) => Session::new(&model).with_draft(draft),
         None => Session::new(&model),
     };
+    // What snapshots depend on: one made with another model, pass count or arithmetic must not be reused.
+    let fingerprint = format!(
+        "{}|{} bytes|{} visits|{:?}|draft {}",
+        model_dir.display(),
+        checkpoint.maps().iter().map(|map| map.len()).sum::<usize>(),
+        config.text_config.visits().len(),
+        options.model.activations,
+        draft.is_some(),
+    );
+    let mut cache = match &options.cache_dir {
+        Some(dir) => match PromptCache::load(dir, &fingerprint, options.cache_bytes) {
+            Ok(cache) => cache,
+            Err(error) => {
+                eprintln!("starting with an empty prompt cache: {error:#}");
+                PromptCache::new(options.cache_bytes)
+            }
+        },
+        None => PromptCache::new(options.cache_bytes),
+    };
+    if !cache.is_empty() {
+        eprintln!("prompt cache: {} processed prompts, {:.1} GiB", cache.len(), cache.bytes() as f64 / GIB);
+    }
+
     let mut memory = Memory::default();
     let mut calls = 0usize;
     for job in queue {
         let events = job.events.clone();
-        let handled = handle(&job, &options, &config, &prompter, &mut session, &mut memory, &mut calls);
+        let handled = handle(&job, &options, &config, &prompter, &mut session, &mut cache, &mut memory, &mut calls);
         if let Err(failure) = handled {
             // The receiver may already be gone, when the failure is the client hanging up.
             let _ = events.blocking_send(Event::Failed { status: failure.status, message: failure.message });
+        }
+    }
+
+    // Shutting down: the conversation in the session is worth keeping too.
+    if let Some(dir) = &options.cache_dir {
+        cache.keep(&session);
+        let (count, bytes) = (cache.len(), cache.bytes());
+        match cache.save(dir, &fingerprint) {
+            Ok(()) => eprintln!("saved {count} processed prompts ({:.1} GiB) to {}", bytes as f64 / GIB, dir.display()),
+            Err(error) => eprintln!("could not save the prompt cache: {error:#}"),
         }
     }
 }
@@ -428,6 +473,7 @@ fn handle(
     config: &Config,
     prompter: &Prompter,
     session: &mut Session,
+    cache: &mut PromptCache,
     memory: &mut Memory,
     calls: &mut usize,
 ) -> Result<(), Failure> {
@@ -457,12 +503,22 @@ fn handle(
     };
 
     // Template errors (an unknown role, a bad effort level) are the client's to fix.
+    // The header, system messages and tool declarations, is what other conversations with the same setup start
+    // with. It renders on its own to a prefix of the whole prompt.
+    let leading = messages.iter().take_while(|message| message["role"] == "system").count();
+    let header = prompter
+        .render(&Value::Array(messages[..leading].to_vec()), request.tools.as_ref(), request.reasoning_effort.as_ref())
+        .ok();
     let rendered = prompter
         .render(&Value::Array(messages), request.tools.as_ref(), request.reasoning_effort.as_ref())
         .map_err(|e| Failure::bad_request(format!("{e:#}")))?;
     let ids = prompter.encode(&rendered)?;
+    let header = match header {
+        Some(header) => Some(prompter.encode(&header)?).filter(|header| ids.starts_with(header)).map(|h| h.len()),
+        None => None,
+    };
     send(Event::Started)?;
-    let cached_tokens = session.set_context(&ids)?;
+    let cached_tokens = cache.prepare(session, &ids, header)?;
 
     // Streamed text is the growth of the reply's reasoning and content; tool calls go out whole once closed.
     let mut sampler = Sampler::new(sampling, request.seed);

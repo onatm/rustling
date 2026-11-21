@@ -73,6 +73,7 @@ struct Head<'a> {
 }
 
 /// The draft's view of the conversation: context keys and values for every token the main model has processed.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DraftState {
     /// Per layer, `kv_dim` values per token.
     keys: Vec<Vec<f32>>,
@@ -85,6 +86,12 @@ pub struct DraftState {
 impl DraftState {
     pub fn tokens(&self) -> usize {
         self.tokens
+    }
+
+    /// Roughly how much memory the state holds.
+    pub fn bytes(&self) -> usize {
+        let floats: usize = self.keys.iter().chain(&self.values).map(Vec::len).sum::<usize>() + self.head_context.len();
+        floats * size_of::<f32>()
     }
 }
 

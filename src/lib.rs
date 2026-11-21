@@ -1,5 +1,6 @@
 //! rustling: an inference engine for Thinking Machines' Inkling 2 Mini.
 
+pub mod cache;
 pub mod checkpoint;
 pub mod config;
 pub mod draft;

@@ -1,7 +1,8 @@
 //! A conversation's running context: the tokens the model has seen, the state they left behind, and generation
 //! from there. Later turns only pay for the tokens they add.
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
+use serde::{Deserialize, Serialize};
 
 use crate::draft::{Draft, DraftState};
 use crate::model::{Model, State};
@@ -17,6 +18,28 @@ pub struct Session<'m, 'a> {
     /// A draft model proposing several tokens at a time, and its view of the context.
     draft: Option<(&'m Draft<'a>, DraftState)>,
     drafting: Drafting,
+}
+
+/// A session's context frozen at one point: the tokens and everything they left behind. Restoring it puts a
+/// session back there without reprocessing the tokens.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    tokens: Vec<u32>,
+    state: State,
+    last: Vec<f32>,
+    draft: Option<DraftState>,
+}
+
+impl Snapshot {
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// Roughly how much memory the snapshot holds.
+    pub fn bytes(&self) -> usize {
+        let draft = self.draft.as_ref().map_or(0, DraftState::bytes);
+        self.state.bytes() + draft + self.last.len() * size_of::<f32>() + self.tokens.len() * size_of::<u32>()
+    }
 }
 
 /// How the draft model has fared so far in a session.
@@ -68,6 +91,48 @@ impl<'m, 'a> Session<'m, 'a> {
 
     pub fn context(&self) -> &[u32] {
         &self.context
+    }
+
+    /// A copy of the session's current context.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            tokens: self.context.clone(),
+            state: self.state.clone(),
+            last: self.last.clone(),
+            draft: self.draft.as_ref().map(|(_, state)| state.clone()),
+        }
+    }
+
+    /// The session's current context, moved out without copying. The session is left empty.
+    pub fn take_snapshot(&mut self) -> Snapshot {
+        let draft = self.draft.as_mut().map(|(draft, state)| std::mem::replace(state, draft.new_state()));
+        Snapshot {
+            tokens: std::mem::take(&mut self.context),
+            state: std::mem::replace(&mut self.state, self.model.new_state()),
+            last: std::mem::take(&mut self.last),
+            draft,
+        }
+    }
+
+    /// Puts the session at a snapshot's context. Fails, leaving the session as it was, if the snapshot was not
+    /// made by a session set up like this one: the same model, and a draft model or not.
+    pub fn restore(&mut self, snapshot: Snapshot) -> Result<()> {
+        ensure!(snapshot.state.fits(self.model), "the snapshot was made with a different model or pass count");
+        ensure!(snapshot.state.position() == snapshot.tokens.len(), "the snapshot is inconsistent");
+        ensure!(
+            snapshot.tokens.is_empty() || snapshot.last.len() == self.model.config().hidden_size,
+            "the snapshot is inconsistent"
+        );
+        match (&mut self.draft, snapshot.draft) {
+            (Some((_, state)), Some(saved)) => {
+                ensure!(saved.tokens() == snapshot.tokens.len(), "the snapshot's draft state is inconsistent");
+                *state = saved;
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("the snapshot and the session disagree on whether a draft model is in use"),
+        }
+        (self.context, self.state, self.last) = (snapshot.tokens, snapshot.state, snapshot.last);
+        Ok(())
     }
 
     /// Makes the context exactly `ids`. When `ids` extends the current context only the new tokens are processed;

@@ -19,6 +19,7 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | Sampler: temperature, top-k, top-p, seed (`src/sampler.rs`) | done |
 | Multi-turn chat that reuses the conversation's state, with a stop on repeating output (`src/session.rs`) | done |
 | OpenAI-compatible HTTP server: chat completions, streaming, tool calls (`src/server.rs`) | done |
+| Processed prompts reused across conversations and restarts (`src/cache.rs`) | done |
 | DSpark draft model: proposes several tokens at a time for the main model to check (`src/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, no gain on prose |
 | Quantised expert activations with an integer dot-product kernel, as the model was trained | done and the default; about 10 tokens/s. `--activations float` gives the transformers arithmetic |
 | Variable-loop checkpoint with a chosen pass count (`--passes`) | done; 16 tokens/s at 1 pass, 12 at 2, 9 at 3 |
@@ -92,10 +93,26 @@ It serves `POST /v1/chat/completions`, `GET /v1/models` and `GET /health`. Reque
 `top_p`, `top_k`, `seed`, `max_tokens`, `stop`, `tools`, `reasoning_effort` and `stream`; the command's own
 sampling flags are the defaults. Reasoning comes back as `reasoning_content`.
 
-One request runs at a time and the rest queue. The server keeps the state of the last prompt, so the next turn
-of the same conversation only processes its new tokens (`usage.prompt_tokens_details.cached_tokens` reports how
-many were reused). Clients usually drop the assistant's reasoning when they send the history back; the server
-restores it for replies it generated, which is what keeps the cached state usable. Text input only.
+One request runs at a time and the rest queue. Text input only.
+
+### Reusing processed prompts
+
+Processing a prompt is the slow part of a request, so the server keeps what it has processed and starts later
+requests from the longest part they share with it. `usage.prompt_tokens_details.cached_tokens` reports how many
+prompt tokens were reused. Three things are kept:
+
+- each conversation as it stands, so its next turn only processes the new messages, even after other
+  conversations have been served in between;
+- the header (system messages and tool declarations), so a new conversation with the same setup skips it;
+- any point where a new prompt stops agreeing with an earlier one, so the part they share is processed once more
+  at most.
+
+These snapshots are large, roughly 0.4 MB per token up to 1,024 tokens and 64 KB per token beyond. `--cache-gb`
+(default 4) bounds their total, dropping the least recently used first. `--cache-dir <dir>` saves them on
+shutdown and loads them at start; a cache made with a different model, pass count or arithmetic is ignored.
+
+Clients usually drop the assistant's reasoning when they send the history back. The server restores it for
+replies it generated, which is what lets the next turn match the conversation it kept.
 
 ## Testing against the reference
 

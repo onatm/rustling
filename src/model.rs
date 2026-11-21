@@ -130,6 +130,7 @@ pub struct Forward {
 }
 
 /// Everything the tokens seen so far left behind for the tokens to come.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct State {
     /// Number of tokens already processed, which is the position of the next one.
     position: usize,
@@ -139,6 +140,29 @@ pub struct State {
 impl State {
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// Roughly how much memory the state holds.
+    pub fn bytes(&self) -> usize {
+        let floats: usize = self
+            .visits
+            .iter()
+            .map(|v| v.keys.len() + v.values.len() + v.convs.iter().map(Vec::len).sum::<usize>())
+            .sum();
+        floats * size_of::<f32>()
+    }
+
+    /// Whether the state has the shape `model` expects, as a check on one read back from disk.
+    pub fn fits(&self, model: &Model) -> bool {
+        let fresh = model.new_state();
+        self.visits.len() == fresh.visits.len()
+            && self.visits.iter().zip(&fresh.visits).all(|(mine, theirs)| {
+                let kv_dim = theirs.conv_channels[0];
+                mine.conv_channels == theirs.conv_channels
+                    && mine.first <= self.position
+                    && mine.keys.len() == (self.position - mine.first) * kv_dim
+                    && mine.values.len() == mine.keys.len()
+            })
     }
 
     /// Forgets the last `tokens` tokens, as if they had never been processed. Only the most recent
@@ -161,7 +185,7 @@ impl State {
 /// inputs beyond the ones it needs.
 pub const MAX_ROLLBACK: usize = 16;
 
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct VisitState {
     /// Keys and values of earlier tokens, `kv_dim` each, starting at position `first`. Sliding-window visits
     /// drop whatever has left the window.

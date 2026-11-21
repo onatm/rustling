@@ -67,6 +67,13 @@ enum Command {
         host: String,
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        /// Memory, in GiB, for keeping processed prompts so later requests that share them start from there.
+        /// 0 keeps only the latest conversation.
+        #[arg(long, default_value_t = 4.0)]
+        cache_gb: f64,
+        /// Keep the processed prompts in this directory between runs.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
         #[command(flatten)]
         run: RunArgs,
     },
@@ -231,7 +238,8 @@ fn main() -> Result<()> {
         Command::Prompt { text, effort } => prompt(&model_dir, &text, effort.as_deref()),
         Command::Generate { text, run, top, timing } => generate(&model_dir, &text, &run, top, timing),
         Command::Chat { system, run } => chat(&model_dir, system.as_deref(), &run),
-        Command::Serve { host, port, run } => {
+        Command::Serve { host, port, cache_gb, cache_dir, run } => {
+            anyhow::ensure!(cache_gb >= 0.0, "--cache-gb must not be negative");
             run.sampler()?;
             anyhow::ensure!(run.effort.is_none(), "--effort does not apply to serve: requests set reasoning_effort");
             let options = server::ServerOptions {
@@ -243,6 +251,8 @@ fn main() -> Result<()> {
                 stop_on_loop: !run.allow_loops,
                 draft_confidence: run.draft.then_some(run.draft_confidence),
                 passes: cli.passes,
+                cache_bytes: (cache_gb * (1u64 << 30) as f64) as usize,
+                cache_dir,
             };
             server::serve(&model_dir, options)
         }
