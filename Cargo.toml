@@ -1,0 +1,27 @@
+[package]
+name = "rustling"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+clap = { version = "4.6.9", features = ["derive"] }
+half = "2.7.1"
+memmap2 = "0.9.12"
+minijinja = { version = "3.1.0", features = ["preserve_order", "json", "serde"] }
+rand = "0.10.4"
+rayon = "1.12.0"
+rustyline = "19.0.0"
+safetensors = "0.8.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tiny_http = "0.12.0"
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "net", "signal"] }
+tokio-stream = "0.1.19"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"

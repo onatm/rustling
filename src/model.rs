@@ -1,0 +1,1343 @@
+//! Text-only forward pass, correctness first: f32 throughout, weights decoded on the fly.
+//!
+//! Ported from transformers' `modeling_inkling2_loop.py`. A sequence of `T` vectors of width `D` is a flat
+//! `Vec<f32>` of length `T * D`.
+//!
+//! Decoding is incremental: [`State`] carries what earlier tokens left behind, so each call only computes the
+//! tokens it is given. The only cross-token state is the attention keys and values and the short convolutions'
+//! recent inputs, and every layer visit has its own copy of both.
+
+use anyhow::{Context, Result, ensure};
+use half::bf16;
+use safetensors::Dtype;
+use rayon::prelude::*;
+
+use crate::checkpoint::{Checkpoint, ExpertMatrix, Experts};
+use crate::config::{Config, TextConfig};
+#[cfg(target_os = "macos")]
+use crate::gpu::{DenseJob, ExpertJob, Gpu};
+use crate::timing::{self, Stage, time};
+use crate::trace;
+use crate::quant::{
+    NVFP4_MAX_BATCH, Nvfp4Activation, decode_bf16_row, dot_bf16_row, dot_f32_row_many, quantize_nvfp4,
+    requantize_mxfp8,
+};
+
+pub(crate) type Seq = Vec<f32>;
+
+/// `UnweightedRMSNorm` in the reference is built with its default epsilon in the attention residuals.
+const RESIDUAL_NORM_EPS: f32 = 1e-6;
+
+/// Below this many multiply-adds a batch of matrix products runs on the calling thread: waking the pool costs more.
+const PARALLEL_MIN_WORK: usize = 1 << 20;
+
+/// Batches of at least this many tokens go to the GPU when there is one. Below it, submitting the work costs
+/// more than it saves; the results are the same either way.
+const GPU_MIN_TOKENS: usize = 32;
+
+/// The fraction of an expert layer's work given to the GPU; the CPU does the rest at the same time. The two are
+/// about equally fast at it.
+#[cfg(target_os = "macos")]
+const GPU_EXPERT_SHARE: f32 = 0.5;
+
+/// (expert, token) products per GPU submission, which bounds the size of the output buffer.
+#[cfg(target_os = "macos")]
+const GPU_PAIR_BATCH: usize = 4096;
+
+/// Stands in for the Metal backend where there is none; it has no values, so `Option<Gpu>` is always `None`.
+#[cfg(not(target_os = "macos"))]
+pub(crate) enum Gpu {}
+
+/// Fewer tokens than this are handled on the calling thread in the cheap per-token steps.
+const PARALLEL_MIN_TOKENS: usize = 8;
+
+/// Rows per parallel task in a matrix product.
+const TASK_ROWS: usize = 128;
+
+/// Tokens that share one pass over a block of weight rows. Large enough that the weights are read once for many
+/// tokens, small enough that the tokens' vectors stay in cache while the rows go by.
+const TOKEN_TILE: usize = NVFP4_MAX_BATCH;
+
+/// Tokens per tile in the dense products, where each token's vector is four times the size.
+const DENSE_TILE: usize = 16;
+
+pub struct Model<'a> {
+    cfg: TextConfig,
+    checkpoint: &'a Checkpoint,
+    activations: Activations,
+    gpu: Option<Gpu>,
+    embed_norm: Vec<f32>,
+    final_norm: Vec<f32>,
+    output_query: Vec<f32>,
+    /// Per looped layer: the query, key, value and MLP message queries, `4 * hidden`.
+    message_queries: Vec<Vec<f32>>,
+    layers: Vec<Layer<'a>>,
+}
+
+struct Layer<'a> {
+    /// Whether this is the first layer, the one [`trace`] captures.
+    traced: bool,
+    local: bool,
+    wq: Mat<'a>,
+    wk: Mat<'a>,
+    wv: Mat<'a>,
+    wr: Mat<'a>,
+    wo: Mat<'a>,
+    gate: Mat<'a>,
+    sink: Mat<'a>,
+    q_scale: Vec<f32>,
+    rel_scale: Vec<f32>,
+    /// `[d_rel, rel_extent]`: one bias-versus-distance profile per relative dimension.
+    rel_proj: Vec<f32>,
+    k_conv: KvConv<'a>,
+    v_conv: KvConv<'a>,
+    attn_conv: Vec<f32>,
+    mlp_conv: Vec<f32>,
+    /// One norm (sliding layers) or separate query, key and value norms (full layers).
+    input_norms: Vec<Vec<f32>>,
+    mlp_norm: Vec<f32>,
+    /// Absent in layer 0, which reads its input directly.
+    attn_query: Option<Vec<f32>>,
+    mlp_query: Vec<f32>,
+    router: Mat<'a>,
+    router_bias: Vec<f32>,
+    experts: Experts<'a>,
+    /// Message gates for the query, key, value and MLP inputs; looped layers only.
+    controllers: Option<[Controller<'a>; 4]>,
+}
+
+enum KvConv<'a> {
+    /// `[channels, kernel]`, last tap on the current token.
+    Static(Vec<f32>),
+    /// `static_w` is `[kernel, channels]` with tap 0 on the current token; `proj` adds per-token, per-head taps.
+    Dynamic { static_w: Vec<f32>, proj: Mat<'a> },
+}
+
+struct Controller<'a> {
+    down: Mat<'a>,
+    forget: Mat<'a>,
+    gain: Mat<'a>,
+}
+
+/// What one call computed, for the tokens it was given. `hidden` is filled only when tracing.
+pub struct Forward {
+    /// The output of each layer visit, in execution order.
+    pub hidden: Vec<Seq>,
+    /// The final normed state, `tokens * hidden`, ready for [`Model::logits`].
+    pub last: Seq,
+    /// The hidden state entering each visit asked for with [`Model::forward_tapped`], in visit order.
+    pub taps: Vec<Seq>,
+}
+
+/// Everything the tokens seen so far left behind for the tokens to come.
+pub struct State {
+    /// Number of tokens already processed, which is the position of the next one.
+    position: usize,
+    visits: Vec<VisitState>,
+}
+
+impl State {
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Forgets the last `tokens` tokens, as if they had never been processed. Only the most recent
+    /// [`MAX_ROLLBACK`] tokens can be taken back.
+    pub fn truncate(&mut self, tokens: usize) {
+        assert!(tokens <= MAX_ROLLBACK && tokens <= self.position, "cannot take back {tokens} tokens");
+        self.position -= tokens;
+        for visit in &mut self.visits {
+            let kv_dim = visit.keys.len() / (self.position + tokens - visit.first);
+            visit.keys.truncate(visit.keys.len() - tokens * kv_dim);
+            visit.values.truncate(visit.values.len() - tokens * kv_dim);
+            for (history, channels) in visit.convs.iter_mut().zip(visit.conv_channels) {
+                history.truncate(history.len() - tokens * channels);
+            }
+        }
+    }
+}
+
+/// How many of the most recent tokens [`State::truncate`] can take back: each convolution remembers this many
+/// inputs beyond the ones it needs.
+pub const MAX_ROLLBACK: usize = 16;
+
+#[derive(Default)]
+struct VisitState {
+    /// Keys and values of earlier tokens, `kv_dim` each, starting at position `first`. Sliding-window visits
+    /// drop whatever has left the window.
+    keys: Vec<f32>,
+    values: Vec<f32>,
+    first: usize,
+    /// The recent inputs of the key, value, post-attention and post-MLP convolutions: the `kernel - 1` they
+    /// need, and up to [`MAX_ROLLBACK`] more so recent tokens can be taken back.
+    convs: [Vec<f32>; 4],
+    /// The width of each convolution's input.
+    conv_channels: [usize; 4],
+}
+
+impl<'a> Model<'a> {
+    pub fn load(config: &Config, checkpoint: &'a Checkpoint, options: Options) -> Result<Self> {
+        let gpu = open_gpu(checkpoint, options.backend)?;
+        let cfg = config.text_config.clone();
+        let h = cfg.hidden_size;
+        let vec = |name: &str, len: usize| -> Result<Vec<f32>> {
+            let dense = checkpoint.dense(name)?;
+            ensure!(dense.data.len() == len, "{name}: expected {len} values, found shape {:?}", dense.shape);
+            Ok(dense.data)
+        };
+        // Dense matrices stay in the checkpoint's bfloat16, read in place.
+        let mat = |name: &str, rows: usize, cols: usize| -> Result<Mat<'a>> {
+            let (info, bytes) = checkpoint.bytes(name)?;
+            ensure!(info.dtype == Dtype::BF16, "{name}: expected bfloat16, found {:?}", info.dtype);
+            ensure!(bytes.len() == rows * cols * 2, "{name}: expected {rows}x{cols}, found shape {:?}", info.shape);
+            Ok(Mat { rows, cols, bytes })
+        };
+
+        let layers = (0..cfg.num_hidden_layers)
+            .into_par_iter()
+            .map(|l| {
+                let p = format!("model.llm.layers.{l}");
+                let local = cfg.is_local(l);
+                let (heads, kv_heads, head_dim, k) =
+                    (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.sconv_kernel_size);
+                let (q_dim, kv_dim) = (heads * head_dim, kv_heads * head_dim);
+                let kv_conv = |which: &str| -> Result<KvConv<'a>> {
+                    Ok(if local {
+                        KvConv::Static(vec(&format!("{p}.attn.{which}_sconv.weight"), kv_dim * k)?)
+                    } else {
+                        KvConv::Dynamic {
+                            static_w: vec(&format!("{p}.attn.{which}_sconv.static_w"), k * kv_dim)?,
+                            proj: mat(&format!("{p}.attn.{which}_sconv.weight_proj"), kv_heads * k, h)?,
+                        }
+                    })
+                };
+                let input_norms = if local {
+                    vec![vec(&format!("{p}.attn_norm.weight"), h)?]
+                } else {
+                    ["q", "k", "v"]
+                        .iter()
+                        .map(|w| vec(&format!("{p}.{w}_input_norm.weight"), h))
+                        .collect::<Result<_>>()?
+                };
+                let controller = |which: &str| -> Result<Controller<'a>> {
+                    let rank = cfg.loop_config.gate_rank;
+                    let c = format!("{p}.controllers.{which}");
+                    Ok(Controller {
+                        down: mat(&format!("{c}.down_weight"), rank, 2 * h)?,
+                        forget: mat(&format!("{c}.forget_weight"), h, rank)?,
+                        gain: mat(&format!("{c}.gain_weight"), h, rank)?,
+                    })
+                };
+                // attn_queries.{i} belongs to layer i + 1: one query in sliding layers, three in full layers.
+                let attn_query = match l {
+                    0 => None,
+                    _ => Some(vec(&format!("model.llm.attn_res.attn_queries.{}", l - 1), if local { h } else { 3 * h })?),
+                };
+                Ok(Layer {
+                    traced: l == 0,
+                    local,
+                    wq: mat(&format!("{p}.attn.wq_du.weight"), q_dim, h)?,
+                    wk: mat(&format!("{p}.attn.wk_dv.weight"), kv_dim, h)?,
+                    wv: mat(&format!("{p}.attn.wv_dv.weight"), kv_dim, h)?,
+                    wr: mat(&format!("{p}.attn.wr_du.weight"), heads * cfg.d_rel, h)?,
+                    wo: mat(&format!("{p}.attn.wo_ud.weight"), h, q_dim)?,
+                    gate: mat(&format!("{p}.attn.gate_attn.weight"), q_dim, h)?,
+                    sink: mat(&format!("{p}.attn.attn_sink_proj.weight"), heads, h)?,
+                    q_scale: vec(&format!("{p}.attn.q_l2_clip.scale"), q_dim)?,
+                    rel_scale: vec(&format!("{p}.attn.rel_l2_clip.scale"), heads * cfg.d_rel)?,
+                    rel_proj: vec(&format!("{p}.attn.rel_logits_proj.proj"), cfg.d_rel * cfg.rel_extent)?,
+                    k_conv: kv_conv("k")?,
+                    v_conv: kv_conv("v")?,
+                    attn_conv: vec(&format!("{p}.attn_sconv.weight"), h * k)?,
+                    mlp_conv: vec(&format!("{p}.mlp_sconv.weight"), h * k)?,
+                    input_norms,
+                    mlp_norm: vec(&format!("{p}.mlp_norm.weight"), h)?,
+                    attn_query,
+                    mlp_query: vec(&format!("model.llm.attn_res.mlp_queries.{l}"), h)?,
+                    router: mat(&format!("{p}.mlp.gate.weight"), cfg.n_routed_experts, h)?,
+                    router_bias: vec(&format!("{p}.mlp.gate.bias"), cfg.n_routed_experts)?,
+                    experts: checkpoint.experts(l)?,
+                    controllers: match cfg.is_looped(l) {
+                        true => Some([controller("attn")?, controller("k")?, controller("v")?, controller("mlp")?]),
+                        false => None,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .context("loading decoder layers")?;
+
+        // The checkpoint stores [query, mlp] pairs and [key, value] pairs per looped layer, in two tensors.
+        let core = cfg.loop_config.core_end - cfg.loop_config.core_start;
+        let q_mlp = vec("model.llm.middle_cycle_cross_pass_queries", 2 * core * h)?;
+        let k_v = vec("model.llm.middle_cycle_cross_pass_kv_queries", 2 * core * h)?;
+        let message_queries = (0..core)
+            .map(|i| {
+                let pair = |source: &[f32], j: usize| source[(2 * i + j) * h..(2 * i + j + 1) * h].to_vec();
+                [pair(&q_mlp, 0), pair(&k_v, 0), pair(&k_v, 1), pair(&q_mlp, 1)].concat()
+            })
+            .collect();
+
+        ensure!(cfg.rel_extent == cfg.sliding_window_size, "relative extent and sliding window are assumed equal");
+        Ok(Self {
+            embed_norm: vec("model.llm.embed_norm.weight", h)?,
+            final_norm: vec("model.llm.norm.weight", h)?,
+            output_query: vec("model.llm.attn_res.output_query", h)?,
+            message_queries,
+            layers,
+            cfg,
+            checkpoint,
+            activations: options.activations,
+            gpu,
+        })
+    }
+
+    /// Whether to imitate transformers' bfloat16 rounding.
+    fn bf16(&self) -> bool {
+        self.activations == Activations::FloatBf16
+    }
+
+    /// Whether large batches run on the GPU.
+    pub fn uses_gpu(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    pub fn config(&self) -> &TextConfig {
+        &self.cfg
+    }
+
+    /// A fresh context with no tokens in it.
+    pub fn new_state(&self) -> State {
+        let cfg = &self.cfg;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let conv_channels = [kv_dim, kv_dim, cfg.hidden_size, cfg.hidden_size];
+        let visits = cfg.visits().iter().map(|_| VisitState { conv_channels, ..Default::default() }).collect();
+        State { position: 0, visits }
+    }
+
+    /// Runs the decoder over `ids`, which continue the context in `state`. With `trace`, keeps the output of
+    /// every layer visit.
+    pub fn forward(&self, ids: &[u32], state: &mut State, trace: bool) -> Result<Forward> {
+        self.run(ids, state, trace, &[])
+    }
+
+    /// As [`Model::forward`], also keeping the hidden state that enters each of the visits in `taps`.
+    pub fn forward_tapped(&self, ids: &[u32], state: &mut State, taps: &[usize]) -> Result<Forward> {
+        self.run(ids, state, false, taps)
+    }
+
+    /// The normed embedding of one token: what the first layer reads.
+    pub(crate) fn embed(&self, id: u32) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let (_, embed) = self.checkpoint.bytes("model.llm.embed.weight")?;
+        ensure!((id as usize) < cfg.vocab_size, "token id {id} is out of range");
+        let row = &embed[id as usize * h * 2..(id as usize + 1) * h * 2];
+        let mut x: Vec<f32> = row.as_chunks::<2>().0.iter().map(|b| bf16::from_le_bytes(*b).to_f32()).collect();
+        rms_norm(&mut x, Some(&self.embed_norm), cfg.rms_norm_eps);
+        round_all(self.bf16(), &mut x);
+        Ok(x)
+    }
+
+    fn run(&self, ids: &[u32], state: &mut State, trace: bool, taps: &[usize]) -> Result<Forward> {
+        let cfg = &self.cfg;
+        let (h, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
+        let (start, end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
+
+        let mut hidden: Seq = Vec::with_capacity(ids.len() * h);
+        for &id in ids {
+            hidden.extend(self.embed(id)?);
+        }
+        trace::record("embed", &hidden);
+
+        let mut tapped = Vec::new();
+        let mut visits = Vec::new();
+        let mut blocks: Vec<Seq> = Vec::new();
+        let mut run = |layers: std::ops::Range<usize>,
+                       pass: usize,
+                       hidden: &mut Seq,
+                       blocks: &mut Vec<Seq>,
+                       previous: Option<(&Seq, &Seq)>| {
+            for l in layers {
+                let messages = previous.map(|(block, last)| {
+                    let read = attn_res(&self.message_queries[l - start], &[block], last, h);
+                    <[Seq; 4]>::try_from(read).unwrap_or_else(|_| unreachable!("four message queries"))
+                });
+                // Visits run prelude, then the core once per pass, then the coda.
+                let visit = match l {
+                    l if l < start => l,
+                    l if l < end => start + pass * (end - start) + (l - start),
+                    l => l + (cfg.loop_config.num_passes - 1) * (end - start),
+                };
+                if taps.contains(&visit) {
+                    tapped.push(hidden.clone());
+                }
+                let out = self.layer(l, hidden, blocks, messages.as_ref(), &mut state.visits[visit], state.position);
+                // A block boundary files the layer's input as a finished block.
+                if l % cfg.n_layers_per_attn_res_block == 0 {
+                    blocks.push(std::mem::take(hidden));
+                }
+                *hidden = out;
+                if trace {
+                    visits.push(hidden.clone());
+                }
+            }
+        };
+
+        run(0..start, 0, &mut hidden, &mut blocks, None);
+        let (prelude_hidden, prelude_blocks) = (hidden.clone(), blocks.clone());
+        run(start..end, 0, &mut hidden, &mut blocks, None);
+        for pass in 1..cfg.loop_config.num_passes {
+            // Every pass restarts from the prelude and sees the previous pass only through messages, which are
+            // read from that pass's blocks after its first (the first is just the prelude output again).
+            let previous_blocks = &blocks[prelude_blocks.len() + 1..];
+            ensure!(previous_blocks.len() == 1, "message reads assume a loop core of exactly two blocks");
+            let (previous_block, previous_hidden) = (previous_blocks[0].clone(), hidden);
+            hidden = prelude_hidden.clone();
+            blocks = prelude_blocks.clone();
+            run(start..end, pass, &mut hidden, &mut blocks, Some((&previous_block, &previous_hidden)));
+        }
+        run(end..cfg.num_hidden_layers, 0, &mut hidden, &mut blocks, None);
+        drop(run);
+        state.position += ids.len();
+
+        let block_refs: Vec<&Seq> = blocks.iter().collect();
+        let mut last = attn_res(&self.output_query, &block_refs, &hidden, h).remove(0);
+        last.chunks_exact_mut(h).for_each(|x| rms_norm(x, Some(&self.final_norm), eps));
+        round_all(self.bf16(), &mut last);
+        Ok(Forward { hidden: visits, last, taps: tapped })
+    }
+
+    /// Soft-capped logits over the usable vocabulary for one final state.
+    pub fn logits(&self, state: &[f32]) -> Result<Vec<f32>> {
+        let started = std::time::Instant::now();
+        let logits = self.project(state);
+        timing::since(Stage::Logits, started);
+        logits
+    }
+
+    /// [`Model::logits`] for several final states at once, `states` holding one after another. The output
+    /// weights are read once for all of them; each result is identical to what `logits` gives on its own.
+    pub fn logits_many(&self, states: &[f32]) -> Result<Vec<Vec<f32>>> {
+        let (h, cap, vocab) = (self.cfg.hidden_size, self.cfg.final_logit_softcapping, self.cfg.unpadded_vocab_size);
+        let xs: Vec<&[f32]> = states.chunks_exact(h).collect();
+        if xs.len() == 1 {
+            return Ok(vec![self.logits(states)?]);
+        }
+        let started = std::time::Instant::now();
+        let bf16 = self.bf16();
+        let (_, unembed) = self.checkpoint.bytes("model.llm.unembed.weight")?;
+        // Per token: one value for each state.
+        let mut by_token = vec![0.0f32; vocab * xs.len()];
+        by_token.par_chunks_mut(1024 * xs.len()).enumerate().for_each_init(
+            || vec![0.0f32; h],
+            |widened, (chunk, out)| {
+                for (i, out) in out.chunks_exact_mut(xs.len()).enumerate() {
+                    let token = chunk * 1024 + i;
+                    decode_bf16_row(&unembed[token * h * 2..(token + 1) * h * 2], widened);
+                    dot_f32_row_many(widened, &xs, out);
+                    for sum in out {
+                        let rounded = if bf16 { round_bf16(*sum) } else { *sum };
+                        *sum = (rounded / cap).tanh() * cap;
+                    }
+                }
+            },
+        );
+        timing::since(Stage::Logits, started);
+        Ok((0..xs.len()).map(|x| by_token.iter().skip(x).step_by(xs.len()).copied().collect()).collect())
+    }
+
+    fn project(&self, state: &[f32]) -> Result<Vec<f32>> {
+        let (h, cap) = (self.cfg.hidden_size, self.cfg.final_logit_softcapping);
+        let (_, unembed) = self.checkpoint.bytes("model.llm.unembed.weight")?;
+        let mut logits = vec![0.0f32; self.cfg.unpadded_vocab_size];
+        logits.par_chunks_mut(1024).enumerate().for_each(|(chunk, logits)| {
+            for (i, logit) in logits.iter_mut().enumerate() {
+                let token = chunk * 1024 + i;
+                let sum = dot_bf16_row(&unembed[token * h * 2..(token + 1) * h * 2], state);
+                let sum = if self.bf16() { round_bf16(sum) } else { sum };
+                *logit = (sum / cap).tanh() * cap;
+            }
+        });
+        Ok(logits)
+    }
+
+    /// One layer visit over new tokens starting at `position`, reading and extending that visit's `state`.
+    fn layer(
+        &self,
+        l: usize,
+        input: &Seq,
+        blocks: &[Seq],
+        messages: Option<&[Seq; 4]>,
+        state: &mut VisitState,
+        position: usize,
+    ) -> Seq {
+        let cfg = &self.cfg;
+        let (h, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
+        let layer = &self.layers[l];
+        let mut block_refs: Vec<&Seq> = blocks.iter().collect();
+        let gates = layer.controllers.as_ref().zip(messages);
+        let bf16 = self.bf16();
+
+        // Attention inputs: read from the residual blocks, merge the previous pass's messages, then norm.
+        let (q_in, k_in, v_in) = time(Stage::Inputs, || {
+            let reads = match &layer.attn_query {
+                Some(query) => attn_res(query, &block_refs, input, h),
+                None => vec![input.clone()],
+            };
+            let input = |i: usize| {
+                let read = &reads[if layer.local { 0 } else { i }];
+                let mut x = match gates {
+                    Some((controllers, messages)) => controllers[i].merge(read, &messages[i], h, eps, bf16),
+                    None => read.clone(),
+                };
+                let norm = &layer.input_norms[if layer.local { 0 } else { i }];
+                x.chunks_exact_mut(h).for_each(|x| rms_norm(x, Some(norm), eps));
+                round_all(bf16, &mut x);
+                x
+            };
+            // The three merges are independent and, for a lone token, each runs on one thread.
+            match gates {
+                Some(_) => {
+                    let (q, (k, v)) = rayon::join(|| input(0), || rayon::join(|| input(1), || input(2)));
+                    (q, k, v)
+                }
+                None => (input(0), input(1), input(2)),
+            }
+        });
+
+        let tracing = layer.traced && trace::enabled();
+        if tracing {
+            trace::record("attn_in", &q_in);
+        }
+        let attn = self.attention(layer, &q_in, &k_in, &v_in, state, position);
+        if tracing {
+            trace::record("attn", &attn);
+        }
+        let attn = time(Stage::AttentionOutput, || {
+            let mut attn = static_conv(&attn, &layer.attn_conv, h, cfg.sconv_kernel_size, &mut state.convs[2]);
+            round_all(bf16, &mut attn);
+            attn
+        });
+        if tracing {
+            trace::record("attn_conv", &attn);
+        }
+
+        // The first layer of a block starts a fresh residual; the block's input becomes a source instead.
+        let residual = if l % cfg.n_layers_per_attn_res_block == 0 {
+            block_refs.push(input);
+            attn
+        } else {
+            add(input, &attn)
+        };
+
+        let x = time(Stage::Inputs, || {
+            let mut x = attn_res(&layer.mlp_query, &block_refs, &residual, h).remove(0);
+            if let Some((controllers, messages)) = gates {
+                x = controllers[3].merge(&x, &messages[3], h, eps, bf16);
+            }
+            x.chunks_exact_mut(h).for_each(|x| rms_norm(x, Some(&layer.mlp_norm), eps));
+            round_all(bf16, &mut x);
+            x
+        });
+        let mlp = time(Stage::Experts, || self.experts(layer, &x));
+        if tracing {
+            trace::record("mlp_in", &x);
+            trace::record("mlp", &mlp);
+        }
+        let out = time(Stage::ExpertOutput, || {
+            let mut mlp = static_conv(&mlp, &layer.mlp_conv, h, cfg.sconv_kernel_size, &mut state.convs[3]);
+            round_all(bf16, &mut mlp);
+            if tracing {
+                trace::record("mlp_conv", &mlp);
+            }
+            let mut out = add(&residual, &mlp);
+            round_all(bf16, &mut out);
+            out
+        });
+        if tracing {
+            trace::record("out", &out);
+        }
+        out
+    }
+
+    fn attention(
+        &self,
+        layer: &Layer,
+        q_in: &Seq,
+        k_in: &Seq,
+        v_in: &Seq,
+        state: &mut VisitState,
+        position: usize,
+    ) -> Seq {
+        let cfg = &self.cfg;
+        let (heads, kv_heads, dim, d_rel) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.d_rel);
+        let (q_dim, kv_dim, group) = (heads * dim, kv_heads * dim, heads / kv_heads);
+        let tokens = q_in.len() / cfg.hidden_size;
+        // Full-attention layers scale queries and relative states up logarithmically at long range.
+        let tau = |t: usize| match layer.local {
+            true => 1.0,
+            false => 1.0 + cfg.log_scaling_alpha * ((t + 1) as f32 / cfg.log_scaling_n_floor).max(1.0).ln(),
+        };
+
+        // All input projections in one parallel region.
+        let mut projected = time(Stage::Projections, || {
+            apply_many(self.gpu.as_ref(), &[
+                (&layer.wq, q_in),
+                (&layer.wk, k_in),
+                (&layer.wv, v_in),
+                (&layer.wr, q_in),
+                (&layer.sink, q_in),
+                (&layer.gate, q_in),
+            ])
+        });
+        let attention_started = std::time::Instant::now();
+        // In the bfloat16 imitation every projection and every step after it lands on bfloat16 values, as each is
+        // a separate bfloat16 tensor in transformers.
+        let bf16 = self.bf16();
+        projected.iter_mut().for_each(|projection| round_all(bf16, projection));
+        let (gate, sinks, mut rel) = (projected.remove(5), projected.remove(4), projected.remove(3));
+        let (v, k, mut q) = (projected.remove(2), projected.remove(1), projected.remove(0));
+        q.chunks_exact_mut(q_dim).enumerate().for_each(|(i, q)| {
+            for (head, scale) in q.chunks_exact_mut(dim).zip(layer.q_scale.chunks_exact(dim)) {
+                head.iter_mut().zip(scale).for_each(|(x, s)| *x *= s);
+                l2_clip(head, cfg.qk_l2_clip_threshold);
+                round_all(bf16, head);
+                head.iter_mut().for_each(|x| *x *= tau(position + i));
+                round_all(bf16, head);
+            }
+        });
+        let mut k = layer.k_conv.apply(&k, k_in, kv_dim, cfg, &mut state.convs[0], bf16);
+        round_all(bf16, &mut k);
+        k.chunks_exact_mut(dim).for_each(|head| l2_clip(head, cfg.qk_l2_clip_threshold));
+        round_all(bf16, &mut k);
+        let mut v = layer.v_conv.apply(&v, v_in, kv_dim, cfg, &mut state.convs[1], bf16);
+        round_all(bf16, &mut v);
+        v.chunks_exact_mut(dim).for_each(|head| rms_norm(head, None, cfg.rms_norm_eps));
+        round_all(bf16, &mut v);
+        let tracing = layer.traced && trace::enabled();
+        if tracing {
+            trace::record("q", &q);
+            trace::record("k", &k);
+            trace::record("v", &v);
+        }
+
+        // Sliding layers see the last `sliding_window_size` tokens; full layers see everything.
+        let window_start = |t: usize| if layer.local { (t + 1).saturating_sub(cfg.sliding_window_size) } else { 0 };
+        let stale = window_start(position).saturating_sub(state.first).min(state.keys.len() / kv_dim);
+        state.keys.drain(..stale * kv_dim);
+        state.values.drain(..stale * kv_dim);
+        state.first += stale;
+        state.keys.extend(k);
+        state.values.extend(v);
+        let (k, v, cached_from) = (&state.keys, &state.values, state.first);
+
+        rel.chunks_exact_mut(heads * d_rel).enumerate().for_each(|(i, rel)| {
+            for (head, scale) in rel.chunks_exact_mut(d_rel).zip(layer.rel_scale.chunks_exact(d_rel)) {
+                head.iter_mut().zip(scale).for_each(|(x, s)| *x *= s);
+                l2_clip(head, cfg.rel_l2_clip_threshold);
+                round_all(bf16, head);
+                head.iter_mut().for_each(|x| *x *= tau(position + i));
+                round_all(bf16, head);
+            }
+        });
+
+        let scaling = (dim as f32).powf(-0.5);
+        let extent = cfg.rel_extent;
+        let mut out = vec![0.0f32; tokens * q_dim];
+        // One unit of work per (token, head): many tokens or a long context both spread across threads.
+        let attend = |(unit, out): (usize, &mut [f32])| {
+            // `i` indexes the new tokens, `t` and `s` are absolute positions.
+            let (i, head) = (unit / heads, unit % heads);
+            let t = position + i;
+            let first = window_start(t);
+            let kv = head / group;
+            let query = &q[i * q_dim + head * dim..][..dim];
+            let rel = &rel[(i * heads + head) * d_rel..][..d_rel];
+            // bias[d] for backward distance d; zero beyond the relative extent.
+            let mut bias = vec![0.0f32; (t + 1 - first).min(extent)];
+            for (r, rel) in rel.iter().enumerate() {
+                let profile = &layer.rel_proj[r * extent..][..bias.len()];
+                bias.iter_mut().zip(profile).for_each(|(b, p)| *b += rel * p);
+            }
+            round_all(bf16, &mut bias);
+            if tracing {
+                // As the reference lays it out: [query token][head][key token], zero for keys after the query.
+                for (distance, value) in bias.iter().enumerate() {
+                    let offset = (i * heads + head) * tokens + (i - distance);
+                    trace::record_at("bias", tokens * heads * tokens, offset, &[*value]);
+                }
+            }
+            let mut weights: Vec<f32> = (first..=t)
+                .map(|s| {
+                    let key = &k[(s - cached_from) * kv_dim + kv * dim..][..dim];
+                    match bf16 {
+                        false => dot(query, key) * scaling + bias.get(t - s).copied().unwrap_or(0.0),
+                        // The product, the scaling and the bias are three bfloat16 results in transformers.
+                        true => {
+                            let score = round_bf16(round_bf16(dot(query, key)) * scaling);
+                            round_bf16(score + bias.get(t - s).copied().unwrap_or(0.0))
+                        }
+                    }
+                })
+                .collect();
+            // The sink is one extra logit with a zero value: it only absorbs probability mass.
+            let sink = sinks[i * heads + head];
+            let max = weights.iter().copied().fold(sink, f32::max);
+            weights.iter_mut().for_each(|w| *w = (*w - max).exp());
+            let total = weights.iter().sum::<f32>() + (sink - max).exp();
+            for (weight, s) in weights.iter().zip(first..=t) {
+                let value = &v[(s - cached_from) * kv_dim + kv * dim..][..dim];
+                let p = if bf16 { round_bf16(weight / total) } else { weight / total };
+                out.iter_mut().zip(value).for_each(|(o, x)| *o += p * x);
+            }
+            round_all(bf16, out);
+            let gate = &gate[unit * dim..][..dim];
+            out.iter_mut().zip(gate).for_each(|(o, g)| *o *= sigmoid(*g));
+            round_all(bf16, out);
+        };
+        let keys = position + tokens - window_start(position + tokens - 1);
+        match tokens * keys * q_dim < PARALLEL_MIN_WORK {
+            true => out.chunks_mut(dim).enumerate().for_each(attend),
+            false => out.par_chunks_mut(dim).enumerate().for_each(attend),
+        }
+        timing::since(Stage::Attention, attention_started);
+        time(Stage::AttentionOutput, || {
+            let mut projected = apply_many(self.gpu.as_ref(), &[(&layer.wo, &out)]).remove(0);
+            round_all(bf16, &mut projected);
+            projected
+        })
+    }
+
+    /// Routes each token to its top experts and sums their weighted outputs.
+    fn experts(&self, layer: &Layer, x: &Seq) -> Seq {
+        let cfg = &self.cfg;
+        let (h, top_k) = (cfg.hidden_size, cfg.num_experts_per_tok);
+
+        // tokens_of[expert] lists the (token, weight) pairs routed to it.
+        let mut tokens_of: Vec<Vec<(usize, f32)>> = vec![Vec::new(); cfg.n_routed_experts];
+        let scores = layer.router.apply(x);
+        if layer.traced {
+            trace::record("router_logits", &scores);
+        }
+        for (t, scores) in scores.chunks_exact(cfg.n_routed_experts).enumerate() {
+            let scores: Vec<f32> = scores.iter().map(|s| sigmoid(*s)).collect();
+            let mut order: Vec<usize> = (0..scores.len()).collect();
+            order.sort_by(|&a, &b| (scores[b] + layer.router_bias[b]).total_cmp(&(scores[a] + layer.router_bias[a])));
+            let chosen = &order[..top_k];
+            let total: f32 = chosen.iter().map(|&e| scores[e]).sum::<f32>() + 1e-20;
+            for &e in chosen {
+                tokens_of[e].push((t, scores[e] / total * cfg.route_scale));
+            }
+        }
+
+        let contributions = match self.activations {
+            Activations::Float | Activations::FloatBf16 => self.expert_outputs_float(layer, x, &tokens_of),
+            Activations::Quantised => self.expert_outputs_quantised(layer, x, &tokens_of),
+        };
+        let mut out = vec![0.0f32; x.len()];
+        for (t, contribution) in contributions {
+            out[t * h..][..h].iter_mut().zip(contribution).for_each(|(o, c)| *o += c);
+        }
+        round_all(self.bf16(), &mut out);
+        out
+    }
+
+    /// Expert outputs with f32 activations, as transformers computes them. Returns `(token, output)` pairs,
+    /// already scaled by the routing weight.
+    fn expert_outputs_float(&self, layer: &Layer, x: &Seq, tokens_of: &[Vec<(usize, f32)>]) -> Vec<(usize, Vec<f32>)> {
+        let cfg = &self.cfg;
+        let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
+        let softcap = |x: f32, cap: f32| (x / cap).tanh() * cap;
+        // The bfloat16 imitation rounds the weights too, since transformers stores the dequantised experts in
+        // bfloat16, and every product and the activation after them.
+        let bf16 = self.bf16();
+        let r = |v: f32| if bf16 { round_bf16(v) } else { v };
+        tokens_of
+            .par_iter()
+            .enumerate()
+            .filter(|(_, tokens)| !tokens.is_empty())
+            .flat_map_iter(|(expert, tokens)| {
+                // One token, as in token-by-token decoding: multiply straight from the stored weights.
+                if let ([(t, weight)], false) = (&tokens[..], bf16) {
+                    let (t, weight) = (*t, *weight);
+                    let x = &x[t * h..][..h];
+                    let acts: Vec<f32> = (0..inter)
+                        .into_par_iter()
+                        .with_min_len(64)
+                        .map(|unit| {
+                            let gate = layer.experts.gate_up.dot_row(expert, 2 * unit, x);
+                            let up = layer.experts.gate_up.dot_row(expert, 2 * unit + 1, x);
+                            softcap(gate, cfg.mlp_gate_softcap) * sigmoid(gate) * softcap(up, cfg.mlp_up_softcap)
+                        })
+                        .collect();
+                    let out: Vec<f32> = (0..h)
+                        .into_par_iter()
+                        .with_min_len(64)
+                        .map(|r| layer.experts.down.dot_row(expert, r, &acts) * weight)
+                        .collect();
+                    return vec![(t, out)];
+                }
+                // Several tokens: decode each weight row once and apply it to every token routed here.
+                let mut row = vec![0.0f32; h];
+                let mut acts = vec![0.0f32; tokens.len() * inter];
+                for unit in 0..inter {
+                    layer.experts.decode_gate_row(expert, unit, &mut row);
+                    round_all(bf16, &mut row);
+                    let gates: Vec<f32> = tokens.iter().map(|&(t, _)| r(dot(&row, &x[t * h..][..h]))).collect();
+                    layer.experts.decode_up_row(expert, unit, &mut row);
+                    round_all(bf16, &mut row);
+                    for (i, (&(t, _), gate)) in tokens.iter().zip(gates).enumerate() {
+                        let up = r(dot(&row, &x[t * h..][..h]));
+                        acts[i * inter + unit] =
+                            r(softcap(gate, cfg.mlp_gate_softcap) * sigmoid(gate) * softcap(up, cfg.mlp_up_softcap));
+                    }
+                }
+                let mut outs = vec![vec![0.0f32; h]; tokens.len()];
+                let mut row = vec![0.0f32; inter];
+                for row_index in 0..h {
+                    layer.experts.down.decode_row(expert, row_index, &mut row);
+                    round_all(bf16, &mut row);
+                    for (i, (out, &(_, weight))) in outs.iter_mut().zip(tokens).enumerate() {
+                        out[row_index] = r(dot(&row, &acts[i * inter..][..inter])) * weight;
+                    }
+                }
+                tokens.iter().map(|&(t, _)| t).zip(outs).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Expert outputs with the activations quantised as in training: each expert input is rounded to the format
+    /// of the weights it meets (NVFP4 or MXFP8), and each result to bfloat16, following vLLM's reference.
+    ///
+    /// Tokens routed to the same expert are processed in tiles, but every token takes the same arithmetic
+    /// whether it arrives alone or in a tile, so the rounding does not depend on how the sequence was split
+    /// across calls.
+    fn expert_outputs_quantised(
+        &self,
+        layer: &Layer,
+        x: &Seq,
+        tokens_of: &[Vec<(usize, f32)>],
+    ) -> Vec<(usize, Vec<f32>)> {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let softcap = |x: f32, cap: f32| (x / cap).tanh() * cap;
+        let experts = &layer.experts;
+
+        enum Input {
+            Nvfp4(Nvfp4Activation),
+            Mxfp8(Vec<f32>),
+        }
+        let quantise = |mut values: Vec<f32>| {
+            values.iter_mut().for_each(|v| *v = round_bf16(*v));
+            match experts.gate_up.is_nvfp4() {
+                true => Input::Nvfp4(quantize_nvfp4(&values)),
+                false => {
+                    requantize_mxfp8(&mut values);
+                    Input::Mxfp8(values)
+                }
+            }
+        };
+        // One expert matrix applied to a tile of inputs: every weight row is read once for the whole tile.
+        // Returns one output vector per input.
+        let apply = |matrix: &ExpertMatrix, expert: usize, inputs: &[&Input]| -> Vec<Vec<f32>> {
+            let mut nvfp4 = Vec::new();
+            let mut mxfp8 = Vec::new();
+            for input in inputs {
+                match input {
+                    Input::Nvfp4(x) => nvfp4.push(x),
+                    Input::Mxfp8(x) => mxfp8.push(x.as_slice()),
+                }
+            }
+            let scratch = || vec![0.0f32; if mxfp8.is_empty() { 0 } else { matrix.cols }];
+            let dots = |decoded: &mut Vec<f32>, row: usize| -> [f32; TOKEN_TILE] {
+                let mut out = [0.0f32; TOKEN_TILE];
+                if mxfp8.is_empty() {
+                    matrix.dot_row_quantized_many(expert, row, &nvfp4, &mut out[..nvfp4.len()]);
+                } else {
+                    matrix.decode_row(expert, row, decoded);
+                    dot_f32_row_many(decoded, &mxfp8, &mut out[..mxfp8.len()]);
+                }
+                out.map(round_bf16)
+            };
+            let rows = (0..matrix.rows).into_par_iter().with_min_len(64);
+            // A lone input, as in token-by-token decoding, needs no regrouping of the per-row results.
+            if inputs.len() == 1 {
+                return vec![rows.map_init(scratch, |decoded, row| dots(decoded, row)[0]).collect()];
+            }
+            let per_row: Vec<[f32; TOKEN_TILE]> = rows.map_init(scratch, dots).collect();
+            (0..inputs.len()).map(|i| per_row.iter().map(|row| row[i]).collect()).collect()
+        };
+
+        // A token's input is quantised once and shared by all the experts it is routed to.
+        let inputs: Vec<Input> = x.par_chunks_exact(h).map(|x| quantise(x.to_vec())).collect();
+
+        // The CPU route, for experts `first_expert` onwards.
+        let on_cpu = |first_expert: usize, tokens_of: &[Vec<(usize, f32)>]| -> Vec<(usize, Vec<f32>)> {
+            tokens_of
+                .par_iter()
+                .enumerate()
+                .filter(|(_, tokens)| !tokens.is_empty())
+                .flat_map_iter(|(index, tokens)| {
+                    let expert = first_expert + index;
+                    let mut outputs = Vec::with_capacity(tokens.len());
+                    for tile in tokens.chunks(TOKEN_TILE) {
+                        let tile_inputs: Vec<&Input> = tile.iter().map(|&(t, _)| &inputs[t]).collect();
+                        let gate_up = apply(&experts.gate_up, expert, &tile_inputs);
+                        // The routing weight goes in before the second quantisation.
+                        let acts: Vec<Input> = gate_up
+                            .iter()
+                            .zip(tile)
+                            .map(|(gate_up, &(_, weight))| {
+                                let act = gate_up.as_chunks::<2>().0.iter().map(|&[gate, up]| {
+                                    softcap(gate, cfg.mlp_gate_softcap)
+                                        * sigmoid(gate)
+                                        * softcap(up, cfg.mlp_up_softcap)
+                                        * weight
+                                });
+                                quantise(act.collect())
+                            })
+                            .collect();
+                        let down = apply(&experts.down, expert, &acts.iter().collect::<Vec<_>>());
+                        outputs.extend(tile.iter().map(|&(t, _)| t).zip(down));
+                    }
+                    outputs
+                })
+                .collect()
+        };
+
+        // Enough tokens, a GPU and NVFP4 weights: the GPU takes the first experts and the CPU the rest, at the
+        // same time. Both give the same results, so the split only affects speed. On the GPU both matrices run
+        // there, with the activation function and the second quantisation in between done here.
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = &self.gpu
+            && inputs.len() >= GPU_MIN_TOKENS
+            && let Some((gate_up_values, gate_up_scales, gate_up_outer)) = experts.gate_up.nvfp4_parts()
+            && let Some((down_values, down_scales, down_outer)) = experts.down.nvfp4_parts()
+        {
+            let nvfp4 = |input: &'_ Input| -> Option<Nvfp4Activation> {
+                match input {
+                    Input::Nvfp4(x) => Some(x.clone()),
+                    Input::Mxfp8(_) => None,
+                }
+            };
+            let activations: Vec<Nvfp4Activation> = inputs.iter().filter_map(nvfp4).collect();
+            let activations: Vec<&Nvfp4Activation> = activations.iter().collect();
+            // The GPU's experts: as many from the front as hold its share of the routed tokens.
+            let total: usize = tokens_of.iter().map(Vec::len).sum();
+            let mut taken = 0;
+            let split = tokens_of
+                .iter()
+                .position(|tokens| {
+                    taken += tokens.len();
+                    taken as f32 > GPU_EXPERT_SHARE * total as f32
+                })
+                .unwrap_or(tokens_of.len());
+            // In expert order, then token order: the order the CPU route produces its outputs in.
+            let routed: Vec<(usize, usize, f32)> = tokens_of[..split]
+                .iter()
+                .enumerate()
+                .flat_map(|(expert, tokens)| tokens.iter().map(move |&(t, weight)| (expert, t, weight)))
+                .collect();
+            let on_gpu = || -> Result<Vec<(usize, Vec<f32>)>> {
+                let mut outputs = Vec::with_capacity(routed.len());
+                for batch in routed.chunks(GPU_PAIR_BATCH) {
+                    let pairs: Vec<_> = batch.iter().map(|&(expert, t, _)| (expert, t, gate_up_outer[expert])).collect();
+                    let gate_up = gpu.experts(&ExpertJob {
+                        values: gate_up_values,
+                        scales: gate_up_scales,
+                        rows: experts.gate_up.rows,
+                        cols: experts.gate_up.cols,
+                        activations: &activations,
+                        pairs: &pairs,
+                    })?;
+                    let acts: Vec<Nvfp4Activation> = gate_up
+                        .par_chunks_exact(experts.gate_up.rows)
+                        .zip(batch)
+                        .filter_map(|(gate_up, &(_, _, weight))| {
+                            let act = gate_up.as_chunks::<2>().0.iter().map(|&[gate, up]| {
+                                softcap(gate, cfg.mlp_gate_softcap) * sigmoid(gate) * softcap(up, cfg.mlp_up_softcap) * weight
+                            });
+                            nvfp4(&quantise(act.collect()))
+                        })
+                        .collect();
+                    let acts: Vec<&Nvfp4Activation> = acts.iter().collect();
+                    let pairs: Vec<_> =
+                        batch.iter().enumerate().map(|(i, &(expert, _, _))| (expert, i, down_outer[expert])).collect();
+                    let down = gpu.experts(&ExpertJob {
+                        values: down_values,
+                        scales: down_scales,
+                        rows: experts.down.rows,
+                        cols: experts.down.cols,
+                        activations: &acts,
+                        pairs: &pairs,
+                    })?;
+                    let tokens = batch.iter().map(|&(_, t, _)| t);
+                    outputs.extend(tokens.zip(down.chunks_exact(experts.down.rows).map(<[f32]>::to_vec)));
+                }
+                Ok(outputs)
+            };
+            let (gpu_outputs, mut cpu_outputs) = std::thread::scope(|scope| {
+                let gpu_work = scope.spawn(on_gpu);
+                let cpu_outputs = on_cpu(split, &tokens_of[split..]);
+                (gpu_work.join().expect("GPU thread panicked"), cpu_outputs)
+            });
+            match gpu_outputs {
+                Ok(mut outputs) => {
+                    outputs.append(&mut cpu_outputs);
+                    return outputs;
+                }
+                Err(error) => gpu_failed(&error),
+            }
+        }
+        on_cpu(0, tokens_of)
+    }
+}
+
+/// Where the heavy matrix products run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// The GPU for large batches when there is one, otherwise the CPU.
+    #[default]
+    Auto,
+    Cpu,
+    /// As `Auto`, but failing to set up the GPU is an error.
+    Metal,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    pub activations: Activations,
+    pub backend: Backend,
+}
+
+#[cfg(target_os = "macos")]
+fn open_gpu(checkpoint: &Checkpoint, backend: Backend) -> Result<Option<Gpu>> {
+    match backend {
+        Backend::Cpu => Ok(None),
+        Backend::Auto => Ok(Gpu::new(&checkpoint.maps()).ok()),
+        Backend::Metal => Gpu::new(&checkpoint.maps()).map(Some).context("setting up Metal"),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_gpu(_checkpoint: &Checkpoint, backend: Backend) -> Result<Option<Gpu>> {
+    ensure!(backend != Backend::Metal, "the Metal backend is only available on macOS");
+    Ok(None)
+}
+
+/// Reports a GPU failure once; the caller carries on with the CPU, which gives the same results.
+#[cfg(target_os = "macos")]
+fn gpu_failed(error: &anyhow::Error) {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| eprintln!("Metal backend failed, continuing on the CPU: {error:#}"));
+}
+
+/// Which arithmetic the expert layers use for their inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Activations {
+    /// f32 throughout: the model as transformers defines it, without its bfloat16 rounding.
+    Float,
+    /// As `Float`, but rounding to bfloat16 wherever transformers does when it runs the model in bfloat16. Only
+    /// useful for checking against transformers' outputs.
+    FloatBf16,
+    /// Rounded to the expert weights' own format, as the model was trained and as SGLang and vLLM serve it.
+    #[default]
+    Quantised,
+}
+
+fn round_bf16(x: f32) -> f32 {
+    bf16::from_f32(x).to_f32()
+}
+
+/// Rounds every value to bfloat16 when `on`; otherwise leaves them alone.
+fn round_all(on: bool, values: &mut [f32]) {
+    if on {
+        values.iter_mut().for_each(|v| *v = round_bf16(*v));
+    }
+}
+
+impl KvConv<'_> {
+    fn apply(
+        &self,
+        x: &Seq,
+        dynamic_input: &Seq,
+        channels: usize,
+        cfg: &TextConfig,
+        history: &mut Vec<f32>,
+        bf16: bool,
+    ) -> Seq {
+        let k = cfg.sconv_kernel_size;
+        match self {
+            KvConv::Static(weight) => static_conv(x, weight, channels, k, history),
+            KvConv::Dynamic { static_w, proj } => {
+                // Taps are per channel (static) plus per token and key/value head (dynamic); tap `lag` reaches
+                // `lag` tokens back.
+                let mut taps = proj.apply(dynamic_input);
+                round_all(bf16, &mut taps);
+                let head_dim = channels / cfg.num_key_value_heads;
+                let scale = 1.0 / ((2 * k + 1) as f32).sqrt();
+                let (context, seen) = with_history(history, x, channels, k);
+                let mut out = vec![0.0f32; x.len()];
+                for (i, out) in out.chunks_exact_mut(channels).enumerate() {
+                    let t = seen + i;
+                    for lag in 0..k.min(t + 1) {
+                        let past = &context[(t - lag) * channels..][..channels];
+                        for (c, (o, p)) in out.iter_mut().zip(past).enumerate() {
+                            let tap = static_w[lag * channels + c] + taps[i * proj.rows + (c / head_dim) * k + lag];
+                            *o += tap * p;
+                        }
+                    }
+                    let current = &context[t * channels..][..channels];
+                    out.iter_mut().zip(current).for_each(|(o, c)| *o = (*o + c) * scale);
+                }
+                out
+            }
+        }
+    }
+}
+
+impl Controller<'_> {
+    /// `(1 - forget) * hidden + gain * message`, with both gates read from the normed pair through a low rank.
+    fn merge(&self, hidden: &Seq, message: &Seq, h: usize, eps: f32, bf16: bool) -> Seq {
+        let merged = per_token(hidden.len() / h, |t| {
+            let (hidden, message) = (&hidden[t * h..][..h], &message[t * h..][..h]);
+            let mut pair = [hidden, message].concat();
+            let (a, b) = pair.split_at_mut(h);
+            rms_norm(a, None, eps);
+            rms_norm(b, None, eps);
+            round_all(bf16, &mut pair);
+            let mut low = self.down.apply_one(&pair);
+            round_all(bf16, &mut low);
+            let (forget, gain) = (self.forget.apply_one(&low), self.gain.apply_one(&low));
+            (0..h).map(|i| (1.0 - forget[i].tanh()) * hidden[i] + gain[i].tanh() * message[i]).collect::<Vec<f32>>()
+        });
+        merged.concat()
+    }
+}
+
+/// Row-major dense matrix in bfloat16, borrowed from the checkpoint and applied as `y = W x`.
+pub(crate) struct Mat<'a> {
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) bytes: &'a [u8],
+}
+
+impl Mat<'_> {
+    /// Applies the matrix to every vector of a sequence.
+    pub(crate) fn apply(&self, xs: &[f32]) -> Seq {
+        apply_many(None, &[(self, xs)]).remove(0)
+    }
+
+    /// Applies the matrix to one vector on the calling thread.
+    pub(crate) fn apply_one(&self, x: &[f32]) -> Vec<f32> {
+        self.bytes.chunks_exact(self.cols * 2).map(|row| dot_bf16_row(row, x)).collect()
+    }
+}
+
+/// Applies each matrix to its sequence. The products share one parallel region, split into row ranges, because
+/// waking the thread pool separately for every matrix costs more than the smaller products themselves.
+///
+/// Tokens go through in tiles: each weight row is widened once and applied to every token of the tile, so a long
+/// sequence reads the weights once per tile instead of once per token. A lone token skips the widening; the two
+/// routes give the same result bit for bit.
+///
+/// With a GPU and enough tokens the whole batch goes there instead; the results are identical.
+pub(crate) fn apply_many(gpu: Option<&Gpu>, jobs: &[(&Mat, &[f32])]) -> Vec<Seq> {
+    #[cfg(target_os = "macos")]
+    if let Some(gpu) = gpu
+        && jobs.iter().any(|(m, xs)| xs.len() / m.cols >= GPU_MIN_TOKENS)
+        && jobs.iter().all(|(m, _)| m.cols % 16 == 0)
+    {
+        let dense: Vec<DenseJob> =
+            jobs.iter().map(|(m, xs)| DenseJob { weights: m.bytes, rows: m.rows, cols: m.cols, xs }).collect();
+        match gpu.dense(&dense) {
+            Ok(outs) => return outs,
+            Err(error) => gpu_failed(&error),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = gpu;
+    let mut outs: Vec<Seq> = jobs.iter().map(|(m, xs)| vec![0.0f32; xs.len() / m.cols * m.rows]).collect();
+    let work: usize = jobs.iter().map(|(m, xs)| xs.len() * m.rows).sum();
+
+    // One task per (matrix, tile of tokens, range of rows); it owns that range of each token's output.
+    let mut tasks = Vec::new();
+    for ((m, xs), out) in jobs.iter().zip(&mut outs) {
+        let mut ranges: Vec<_> = out.chunks_exact_mut(m.rows).map(|out| out.chunks_mut(TASK_ROWS)).collect();
+        for (tile, ranges) in xs.chunks(DENSE_TILE * m.cols).zip(ranges.chunks_mut(DENSE_TILE)) {
+            for range in 0..m.rows.div_ceil(TASK_ROWS) {
+                let outs: Vec<&mut [f32]> = ranges.iter_mut().map(|r| r.next().expect("a range per token")).collect();
+                tasks.push((*m, tile, range * TASK_ROWS, outs));
+            }
+        }
+    }
+    let run = |(m, xs, first, mut outs): (&Mat, &[f32], usize, Vec<&mut [f32]>)| {
+        let rows = m.bytes[first * m.cols * 2..].chunks_exact(m.cols * 2).take(outs[0].len());
+        if let [out] = &mut outs[..] {
+            out.iter_mut().zip(rows).for_each(|(o, row)| *o = dot_bf16_row(row, xs));
+            return;
+        }
+        let xs: Vec<&[f32]> = xs.chunks_exact(m.cols).collect();
+        let mut widened = vec![0.0f32; m.cols];
+        let mut dots = vec![0.0f32; xs.len()];
+        for (r, row) in rows.enumerate() {
+            decode_bf16_row(row, &mut widened);
+            dot_f32_row_many(&widened, &xs, &mut dots);
+            outs.iter_mut().zip(&dots).for_each(|(out, dot)| out[r] = *dot);
+        }
+    };
+    match work < PARALLEL_MIN_WORK {
+        true => tasks.into_iter().for_each(run),
+        false => tasks.into_par_iter().for_each(run),
+    }
+    outs
+}
+
+/// Learned-query attention over the normed residual blocks plus the block in progress; one output per query.
+fn attn_res(queries: &[f32], blocks: &[&Seq], partial: &Seq, h: usize) -> Vec<Seq> {
+    let scale = (h as f32).powf(-0.5);
+    // One token's outputs for all queries, back to back.
+    let read = |t: usize| -> Vec<f32> {
+        let states: Vec<Vec<f32>> = blocks
+            .iter()
+            .copied()
+            .chain([partial])
+            .map(|state| {
+                let mut x = state[t * h..][..h].to_vec();
+                rms_norm(&mut x, None, RESIDUAL_NORM_EPS);
+                x
+            })
+            .collect();
+        let mut out = vec![0.0f32; queries.len()];
+        for (query, out) in queries.chunks_exact(h).zip(out.chunks_exact_mut(h)) {
+            let logits: Vec<f32> = states.iter().map(|s| dot(query, s) * scale).collect();
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+            let total: f32 = weights.iter().sum();
+            for (weight, state) in weights.iter().zip(&states) {
+                out.iter_mut().zip(state).for_each(|(o, s)| *o += weight / total * s);
+            }
+        }
+        out
+    };
+    let per_token = per_token(partial.len() / h, read);
+    (0..queries.len() / h)
+        .map(|q| per_token.iter().flat_map(|token| token[q * h..][..h].iter().copied()).collect())
+        .collect()
+}
+
+/// Runs `work` for each token, across threads once there are enough tokens to be worth waking the pool.
+fn per_token<T: Send>(tokens: usize, work: impl Fn(usize) -> T + Sync + Send) -> Vec<T> {
+    match tokens < PARALLEL_MIN_TOKENS {
+        true => (0..tokens).map(work).collect(),
+        false => (0..tokens).into_par_iter().map(work).collect(),
+    }
+}
+
+/// Prepends the convolution's remembered inputs to `x` and remembers the most recent of the result.
+/// Returns the joined context and how many remembered vectors lead it.
+fn with_history(history: &mut Vec<f32>, x: &[f32], channels: usize, k: usize) -> (Vec<f32>, usize) {
+    let seen = history.len() / channels;
+    let context = [history.as_slice(), x].concat();
+    let keep = (k - 1 + MAX_ROLLBACK).min(context.len() / channels) * channels;
+    *history = context[context.len() - keep..].to_vec();
+    (context, seen)
+}
+
+/// Causal depthwise convolution with a residual: `(conv(x) + x) / sqrt(kernel + 1)`. `weight` is
+/// `[channels, kernel]` with the last tap on the current token. `history` carries the inputs of earlier calls.
+fn static_conv(x: &[f32], weight: &[f32], channels: usize, k: usize, history: &mut Vec<f32>) -> Seq {
+    let scale = 1.0 / ((k + 1) as f32).sqrt();
+    let (context, seen) = with_history(history, x, channels, k);
+    let mut out = vec![0.0f32; x.len()];
+    for (i, out) in out.chunks_exact_mut(channels).enumerate() {
+        let t = seen + i;
+        for lag in 0..k.min(t + 1) {
+            let past = &context[(t - lag) * channels..][..channels];
+            for (c, (o, p)) in out.iter_mut().zip(past).enumerate() {
+                *o += weight[c * k + (k - 1 - lag)] * p;
+            }
+        }
+        let current = &context[t * channels..][..channels];
+        out.iter_mut().zip(current).for_each(|(o, c)| *o = (*o + c) * scale);
+    }
+    out
+}
+
+pub(crate) fn rms_norm(x: &mut [f32], weight: Option<&[f32]>, eps: f32) {
+    let mean_square = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let scale = 1.0 / (mean_square + eps).sqrt();
+    match weight {
+        Some(weight) => x.iter_mut().zip(weight).for_each(|(v, w)| *v *= scale * w),
+        None => x.iter_mut().for_each(|v| *v *= scale),
+    }
+}
+
+/// Scales a vector down to `threshold` when its L2 norm is larger.
+fn l2_clip(x: &mut [f32], threshold: f32) {
+    let norm = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let scale = (threshold / (norm + 1e-6)).min(1.0);
+    x.iter_mut().for_each(|v| *v *= scale);
+}
+
+fn add(a: &[f32], b: &[f32]) -> Seq {
+    a.iter().zip(b).map(|(a, b)| a + b).collect()
+}
+
+pub(crate) fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    const LANES: usize = 16;
+    let (a_chunks, a_rest) = a.as_chunks::<LANES>();
+    let (b_chunks, b_rest) = b.as_chunks::<LANES>();
+    let mut acc = [0.0f32; LANES];
+    for (a, b) in a_chunks.iter().zip(b_chunks) {
+        for i in 0..LANES {
+            acc[i] += a[i] * b[i];
+        }
+    }
+    acc.iter().sum::<f32>() + a_rest.iter().zip(b_rest).map(|(a, b)| a * b).sum::<f32>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_conv_is_causal_and_ends_on_the_current_token() {
+        // One channel, kernel 2, taps [previous, current] = [10, 1].
+        let out = static_conv(&[1.0, 2.0, 3.0], &[10.0, 1.0], 1, 2, &mut Vec::new());
+        let scale = 1.0 / 3f32.sqrt();
+        let expected = [(1.0 + 1.0) * scale, (10.0 + 2.0 + 2.0) * scale, (20.0 + 3.0 + 3.0) * scale];
+        assert_eq!(out, expected);
+
+        // Fed one token at a time, the history carries the earlier inputs across calls.
+        let mut history = Vec::new();
+        let stepped: Vec<f32> =
+            [1.0, 2.0, 3.0].iter().flat_map(|x| static_conv(&[*x], &[10.0, 1.0], 1, 2, &mut history)).collect();
+        assert_eq!(stepped, expected);
+        // All three inputs are still remembered: the one the kernel needs, and more for taking tokens back.
+        assert_eq!(history, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn attn_res_with_zero_query_averages_normed_states() {
+        let (a, b) = (vec![3.0, 0.0], vec![0.0, 5.0]);
+        let out = attn_res(&[0.0, 0.0], &[&a], &b, 2).remove(0);
+        // Each state norms to RMS 1, i.e. [sqrt(2), 0] and [0, sqrt(2)]; a zero query weights them equally.
+        let half = 2f32.sqrt() / 2.0;
+        assert!((out[0] - half).abs() < 1e-5 && (out[1] - half).abs() < 1e-5, "{out:?}");
+    }
+
+    #[test]
+    fn l2_clip_only_shrinks() {
+        let mut long = [3.0, 4.0];
+        l2_clip(&mut long, 1.0);
+        assert!((long[0] - 0.6).abs() < 1e-5 && (long[1] - 0.8).abs() < 1e-5);
+        let mut short = [0.3, 0.4];
+        l2_clip(&mut short, 1.0);
+        assert_eq!(short, [0.3, 0.4]);
+    }
+}
