@@ -19,9 +19,14 @@ mod server;
 #[derive(Parser)]
 #[command(about = "Inference engine for Inkling 2 Mini")]
 struct Cli {
-    /// Model directory. Defaults to $RUSTLING_MODEL, then the Hugging Face cache.
+    /// Model directory, or a model name to find in the Hugging Face cache. Defaults to $RUSTLING_MODEL, then
+    /// thinkingmachines/Inkling-2-Mini.
     #[arg(long, global = true)]
     model: Option<PathBuf>,
+    /// How many times to run the looped layers, for a variable-loop checkpoint
+    /// (thinkingmachines/TML-d24-varloop-research, trained with 1 to 5). Fewer is faster and less capable.
+    #[arg(long, global = true)]
+    passes: Option<usize>,
     #[command(subcommand)]
     command: Command,
 }
@@ -204,9 +209,22 @@ impl From<ActivationsArg> for Activations {
     }
 }
 
+/// The `--passes` override, for [`load_config`].
+static PASSES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+
+/// The model's config with the command line's pass count applied.
+fn load_config(model_dir: &std::path::Path) -> Result<Config> {
+    let config = Config::load(model_dir)?;
+    match PASSES.get().copied().flatten() {
+        Some(passes) => config.with_passes(passes),
+        None => Ok(config),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let model_dir = resolve_model_dir(cli.model.as_deref())?;
+    PASSES.set(cli.passes).expect("set once");
     match cli.command {
         Command::Inspect => inspect(&model_dir),
         Command::Expert { layer, expert } => expert_stats(&model_dir, layer, expert),
@@ -224,6 +242,7 @@ fn main() -> Result<()> {
                 max_tokens: run.max_tokens,
                 stop_on_loop: !run.allow_loops,
                 draft_confidence: run.draft.then_some(run.draft_confidence),
+                passes: cli.passes,
             };
             server::serve(&model_dir, options)
         }
@@ -233,7 +252,7 @@ fn main() -> Result<()> {
 }
 
 fn inspect(model_dir: &std::path::Path) -> Result<()> {
-    let config = Config::load(model_dir)?;
+    let config = load_config(model_dir)?;
     let text = &config.text_config;
     println!("model      {} at {}", config.model_type, model_dir.display());
     println!("decoder    {} layers, hidden {}, vocab {}", text.num_hidden_layers, text.hidden_size, text.vocab_size);
@@ -380,7 +399,7 @@ fn stop_note(stop: Stop, limits: Limits) -> Option<String> {
 }
 
 fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, top: bool, timing: bool) -> Result<()> {
-    let config = Config::load(model_dir)?;
+    let config = load_config(model_dir)?;
     let checkpoint = Checkpoint::open(model_dir)?;
     let prompter = Prompter::load(model_dir)?;
     let started = Instant::now();
@@ -465,7 +484,7 @@ fn chat(model_dir: &std::path::Path, system: Option<&str>, run: &RunArgs) -> Res
     const DIM: &str = "\x1b[2m";
     const RESET: &str = "\x1b[0m";
 
-    let config = Config::load(model_dir)?;
+    let config = load_config(model_dir)?;
     let checkpoint = Checkpoint::open(model_dir)?;
     let prompter = Prompter::load(model_dir)?;
     let model = Model::load(&config, &checkpoint, run.model())?;
@@ -575,7 +594,7 @@ fn compare(model_dir: &std::path::Path, golden: &std::path::Path, activations: A
     let (shape, states) = f32s("hidden_states")?;
     let (_, logits) = f32s("logits")?;
 
-    let config = Config::load(model_dir)?;
+    let config = load_config(model_dir)?;
     let checkpoint = Checkpoint::open(model_dir)?;
     let model = Model::load(&config, &checkpoint, Options { activations, backend: Backend::Cpu })?;
     let forward = model.forward(&ids, &mut model.new_state(), true)?;
@@ -643,7 +662,7 @@ fn probe(model_dir: &std::path::Path, golden: &std::path::Path, activations: Act
     let ids: Vec<u32> =
         golden.tensor("input_ids")?.data().as_chunks::<4>().0.iter().map(|b| i32::from_le_bytes(*b) as u32).collect();
 
-    let config = Config::load(model_dir)?;
+    let config = load_config(model_dir)?;
     let checkpoint = Checkpoint::open(model_dir)?;
     let model = Model::load(&config, &checkpoint, Options { activations, backend: Backend::Cpu })?;
     rustling::trace::start();

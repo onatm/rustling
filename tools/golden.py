@@ -13,6 +13,10 @@
     uv run tools/golden.py hidden "Hi there"  # hidden state after each of the 48 layer visits, plus logits
     uv run tools/golden.py layer0 "Hi there"  # intermediate tensors of the first layer, for debugging a port
 
+Set RUSTLING_MODEL to dump another checkpoint, and `--passes` to pick a variable-loop checkpoint's pass count:
+
+    RUSTLING_MODEL=thinkingmachines/TML-d24-varloop-research uv run tools/golden.py hidden "Hi there" --name varloop2 --passes 2
+
 `hidden` loads the full model. transformers dequantizes the experts on load, so it needs roughly 52 GB of
 memory in bfloat16; expect heavy swapping on anything smaller than a 64 GB machine.
 
@@ -108,7 +112,7 @@ def prompts() -> None:
     print(f"wrote {len(cases)} cases to {path}")
 
 
-def hidden(text: str, name: str, reasoning_effort: str) -> None:
+def hidden(text: str, name: str, reasoning_effort: str, passes: int | None = None) -> None:
     import torch
     from safetensors.torch import save_file
     from transformers import AutoModelForMultimodalLM, AutoTokenizer
@@ -117,6 +121,13 @@ def hidden(text: str, name: str, reasoning_effort: str) -> None:
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     model = AutoModelForMultimodalLM.from_pretrained(MODEL, dtype=torch.bfloat16)
     model.eval()
+    if passes is not None:
+        # A variable-loop checkpoint can run its looped layers a chosen number of times. Set after loading: the
+        # checkpoint's own `loop_config` overrides a value passed to `from_pretrained`.
+        for module in model.modules():
+            config = getattr(module, "config", None)
+            if hasattr(config, "loop_num_passes"):
+                config.loop_num_passes = passes
 
     messages = [{"role": "user", "content": text}]
     inputs = tokenizer.apply_chat_template(
@@ -127,6 +138,10 @@ def hidden(text: str, name: str, reasoning_effort: str) -> None:
 
     # hidden_states[0] is the normed embedding; entries 1..=48 are the outputs of each layer visit in execution order
     states = torch.stack([h[0].float() for h in out.hidden_states])
+    if passes is not None:
+        core = model.config.text_config.loop_layer_index_end - model.config.text_config.loop_layer_index_start
+        expected = model.config.text_config.num_hidden_layers + (passes - 1) * core + 1
+        assert states.shape[0] == expected, f"asked for {passes} passes but got {states.shape[0] - 1} layer visits"
     tensors = {
         "input_ids": inputs["input_ids"][0].to(torch.int32),
         "hidden_states": states,  # [visits + 1, tokens, hidden]
@@ -192,6 +207,7 @@ if __name__ == "__main__":
     hidden_parser.add_argument("text")
     hidden_parser.add_argument("--name", default="default")
     hidden_parser.add_argument("--reasoning-effort", default="none")
+    hidden_parser.add_argument("--passes", type=int, help="loop passes, for a variable-loop checkpoint")
     layer0_parser = commands.add_parser("layer0")
     layer0_parser.add_argument("text")
     layer0_parser.add_argument("--name", default="default")
@@ -202,4 +218,4 @@ if __name__ == "__main__":
     elif args.command == "layer0":
         layer0(args.text, args.name, args.reasoning_effort)
     else:
-        hidden(args.text, args.name, args.reasoning_effort)
+        hidden(args.text, args.name, args.reasoning_effort, args.passes)

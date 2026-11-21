@@ -31,7 +31,25 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-const MODEL_NAME: &str = "inkling-2-mini";
+/// The name the API reports for the model: the checkpoint's own, lower-cased, with the pass count when one was
+/// chosen. A Hugging Face cache directory is `models--<owner>--<name>/snapshots/<revision>`.
+fn model_name(model_dir: &Path, passes: Option<usize>) -> String {
+    let from_cache = model_dir.ancestors().filter_map(|dir| dir.file_name()?.to_str()).find_map(|name| {
+        name.strip_prefix("models--").and_then(|rest| rest.rsplit("--").next())
+    });
+    let own = model_dir.file_name().and_then(|name| name.to_str());
+    let name = from_cache.or(own).unwrap_or("model").to_lowercase();
+    match passes {
+        Some(passes) => format!("{name}-{passes}-passes"),
+        None => name,
+    }
+}
+
+#[derive(Clone)]
+struct App {
+    jobs: std_mpsc::Sender<Job>,
+    model: std::sync::Arc<str>,
+}
 
 /// How many of its own replies the server remembers the reasoning of; see [`Memory`].
 const REMEMBERED_REPLIES: usize = 64;
@@ -47,6 +65,8 @@ pub struct ServerOptions {
     pub stop_on_loop: bool,
     /// Generate with the draft model, proposing only runs it is at least this confident of.
     pub draft_confidence: Option<f32>,
+    /// Overrides how many times the looped layers run, for a variable-loop checkpoint.
+    pub passes: Option<usize>,
 }
 
 /// The fields of a chat completion request that the server acts on. Unknown fields are ignored.
@@ -119,6 +139,7 @@ pub fn serve(model_dir: &Path, options: ServerOptions) -> Result<()> {
     let (jobs, queue) = std_mpsc::channel::<Job>();
     let (ready, loaded) = std_mpsc::channel::<Result<()>>();
     let address = format!("{}:{}", options.host, options.port);
+    let model: std::sync::Arc<str> = model_name(model_dir, options.passes).into();
     let model_dir: PathBuf = model_dir.to_owned();
     std::thread::Builder::new().name("model".into()).spawn(move || worker(&model_dir, options, queue, ready))?;
     loaded.recv().context("the model thread stopped while loading")??;
@@ -129,7 +150,7 @@ pub fn serve(model_dir: &Path, options: ServerOptions) -> Result<()> {
             .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
             .route("/v1/models", get(models))
             .route("/v1/chat/completions", post(chat_completions))
-            .with_state(jobs);
+            .with_state(App { jobs, model });
         let listener = tokio::net::TcpListener::bind(&address).await.with_context(|| format!("binding {address}"))?;
         eprintln!("listening on http://{address}/v1");
         axum::serve(listener, app)
@@ -141,8 +162,8 @@ pub fn serve(model_dir: &Path, options: ServerOptions) -> Result<()> {
     })
 }
 
-async fn models() -> Json<Value> {
-    Json(json!({ "object": "list", "data": [{ "id": MODEL_NAME, "object": "model", "owned_by": "thinkingmachines" }] }))
+async fn models(State(app): State<App>) -> Json<Value> {
+    Json(json!({ "object": "list", "data": [{ "id": &*app.model, "object": "model", "owned_by": "thinkingmachines" }] }))
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -154,7 +175,7 @@ fn unix_time() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-async fn chat_completions(State(jobs): State<std_mpsc::Sender<Job>>, body: axum::body::Bytes) -> Response {
+async fn chat_completions(State(App { jobs, model }): State<App>, body: axum::body::Bytes) -> Response {
     // Parsed by hand so a malformed body gets an OpenAI-style error instead of axum's plain text.
     let request: ChatRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
@@ -178,7 +199,7 @@ async fn chat_completions(State(jobs): State<std_mpsc::Sender<Job>>, body: axum:
     if stream {
         let chunk = move |delta: Value, finish_reason: Option<&str>| {
             json!({
-                "id": id, "object": "chat.completion.chunk", "created": created, "model": MODEL_NAME,
+                "id": id, "object": "chat.completion.chunk", "created": created, "model": &*model,
                 "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
             })
         };
@@ -248,7 +269,7 @@ async fn chat_completions(State(jobs): State<std_mpsc::Sender<Job>>, body: axum:
                     message["tool_calls"] = tool_calls.into();
                 }
                 return Json(json!({
-                    "id": id, "object": "chat.completion", "created": created, "model": MODEL_NAME,
+                    "id": id, "object": "chat.completion", "created": created, "model": &*model,
                     "choices": [{ "index": 0, "message": message, "finish_reason": finish_reason }],
                     "usage": usage.json(),
                 }))
@@ -262,7 +283,12 @@ async fn chat_completions(State(jobs): State<std_mpsc::Sender<Job>>, body: axum:
 /// Loads the model, reports readiness, then serves jobs one at a time until every sender is gone.
 fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Job>, ready: std_mpsc::Sender<Result<()>>) {
     let loaded = (|| -> Result<_> {
-        Ok((Config::load(model_dir)?, Checkpoint::open(model_dir)?, Prompter::load(model_dir)?))
+        let config = Config::load(model_dir)?;
+        let config = match options.passes {
+            Some(passes) => config.with_passes(passes)?,
+            None => config,
+        };
+        Ok((config, Checkpoint::open(model_dir)?, Prompter::load(model_dir)?))
     })();
     let (config, checkpoint, prompter) = match loaded {
         Ok(loaded) => loaded,
@@ -514,6 +540,13 @@ fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reported_model_name_comes_from_the_checkpoint() {
+        let cached = Path::new("/home/u/.cache/huggingface/hub/models--thinkingmachines--TML-d24-varloop-research/snapshots/657b53");
+        assert_eq!(model_name(cached, Some(2)), "tml-d24-varloop-research-2-passes");
+        assert_eq!(model_name(Path::new("/models/Inkling-2-Mini"), None), "inkling-2-mini");
+    }
 
     #[test]
     fn remembered_reasoning_is_put_back() {

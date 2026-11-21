@@ -100,7 +100,7 @@ impl<'a> Draft<'a> {
         let taps = cfg.target_layer_ids.len();
         ensure!(
             cfg.target_layer_ids.last() == Some(&text.visits().len()),
-            "the draft's last tap must be the model's final state"
+            "the draft reads the model at fixed layer visits, so it only works at the checkpoint's own pass count"
         );
 
         let vec = |name: &str, len: usize| -> Result<Vec<f32>> {

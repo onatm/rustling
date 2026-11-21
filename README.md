@@ -21,7 +21,8 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | OpenAI-compatible HTTP server: chat completions, streaming, tool calls (`src/server.rs`) | done |
 | DSpark draft model: proposes several tokens at a time for the main model to check (`src/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, no gain on prose |
 | Quantised expert activations with an integer dot-product kernel, as the model was trained | done and the default; about 10 tokens/s. `--activations float` gives the transformers arithmetic |
-| Metal for single-token generation, MXFP8 layers on the GPU | later |
+| Variable-loop checkpoint with a chosen pass count (`--passes`) | done; 16 tokens/s at 1 pass, 12 at 2, 9 at 3 |
+| Metal for single-token generation | measured and set aside: per-dispatch overhead eats the gain |
 | Vision tower | later |
 
 ## Usage
@@ -40,6 +41,27 @@ cargo run --release -- generate "Write a function that reverses a list." --draft
 cargo run --release -- generate "Hello" --timing   # where the forward pass spends its time
 cargo run --release -- generate "Hello" --backend cpu   # default is auto: Metal for batches of 32+ tokens
 ```
+
+## Variable-loop checkpoint
+
+`thinkingmachines/TML-d24-varloop-research` has the same architecture as Inkling 2 Mini but was trained to run
+its looped layers anywhere from 1 to 5 times. Fewer passes are faster and less capable:
+
+```sh
+hf download thinkingmachines/TML-d24-varloop-research --exclude mtp.safetensors
+cargo run --release -- --model thinkingmachines/TML-d24-varloop-research --passes 2 chat
+```
+
+| Passes | Layer visits | Tokens/s (M1 Max) | SWE-bench Verified | GPQA Diamond |
+|---|---|---|---|---|
+| 1 | 24 | 16.2 | 56.3% | 69.6% |
+| 2 | 36 | 11.8 | 76.5% | 79.2% |
+| 3 | 48 | 9.2 | 78.7% | 84.2% |
+| 4 | 60 | 7.5 | 79.3% | 81.9% |
+
+The benchmark columns are Thinking Machines' published figures for this checkpoint. They describe it as a research
+model and recommend Inkling 2 Mini for real use; at 3 passes Mini scores higher on most of their benchmarks.
+`--passes` works on every command, and the draft model only works at the checkpoint's own count of 3.
 
 ## Draft model
 

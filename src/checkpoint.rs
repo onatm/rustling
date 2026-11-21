@@ -252,14 +252,20 @@ impl Experts<'_> {
     }
 }
 
-/// Finds the model directory: an explicit path, `$RUSTLING_MODEL`, or the newest snapshot in the Hugging Face cache.
+/// The model whose snapshot is used when none is named.
+const DEFAULT_MODEL: &str = "thinkingmachines/Inkling-2-Mini";
+
+/// Finds the model directory. `explicit` (or else `$RUSTLING_MODEL`) is a directory, or a Hugging Face model name
+/// such as `thinkingmachines/TML-d24-varloop-research` to look up in the local Hugging Face cache. With neither,
+/// Inkling 2 Mini from the cache.
 pub fn resolve_model_dir(explicit: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = explicit {
-        return Ok(path.to_path_buf());
-    }
-    if let Some(path) = std::env::var_os("RUSTLING_MODEL") {
-        return Ok(PathBuf::from(path));
-    }
+    let named = explicit.map(Path::to_path_buf).or_else(|| std::env::var_os("RUSTLING_MODEL").map(PathBuf::from));
+    let name = match named {
+        Some(path) if path.is_dir() => return Ok(path),
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => DEFAULT_MODEL.to_owned(),
+    };
+    ensure!(name.split('/').count() == 2, "{name} is neither a directory nor a model name like {DEFAULT_MODEL}");
     let hub = match std::env::var_os("HF_HUB_CACHE") {
         Some(path) => PathBuf::from(path),
         None => match std::env::var_os("HF_HOME") {
@@ -267,9 +273,9 @@ pub fn resolve_model_dir(explicit: Option<&Path>) -> Result<PathBuf> {
             None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".cache/huggingface/hub"),
         },
     };
-    let snapshots = hub.join("models--thinkingmachines--Inkling-2-Mini/snapshots");
+    let snapshots = hub.join(format!("models--{}/snapshots", name.replace('/', "--")));
     let newest = std::fs::read_dir(&snapshots)
-        .with_context(|| format!("no model given and nothing at {}", snapshots.display()))?
+        .with_context(|| format!("{name} is not in the Hugging Face cache; fetch it with `hf download {name}`"))?
         .filter_map(|entry| entry.ok())
         .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())
         .with_context(|| format!("no snapshots in {}", snapshots.display()))?;
