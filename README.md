@@ -166,11 +166,34 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 }'
 ```
 
-It serves `POST /v1/chat/completions`, `GET /v1/models` and `GET /health`. Requests may set `temperature`,
+It serves `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models` and `GET /health`. Requests may set `temperature`,
 `top_p`, `top_k`, `seed`, `max_tokens`, `stop`, `tools`, `reasoning_effort` and `stream`; the command's own
 sampling flags are the defaults. Reasoning comes back as `reasoning_content`.
 
 One request runs at a time and the rest queue. Text input only.
+
+`/v1/responses` is OpenAI's Responses API as far as a coding agent uses it: the whole conversation comes with
+every request (nothing is stored), tools are functions or free-form, and the reply streams as reasoning, text
+and tool-call items. Hosted tools such as web search are ignored. It is what the Codex CLI needs:
+
+```toml
+# ~/.codex/config.toml
+[model_providers.rustling]
+name = "Rustling"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+stream_idle_timeout_ms = 1800000   # a long prompt sends nothing while it is processed
+stream_max_retries = 0
+request_max_retries = 0
+
+[profiles.rustling]
+model_provider = "rustling"
+model = "inkling-2-mini"
+```
+
+```sh
+codex exec --profile rustling "Read the README and summarise this project."
+```
 
 Each request is logged: its size, how much of the prompt was reused and how long the rest took (with progress
 every few seconds for a long one), and the reply's length and speed. A prompt is processed in chunks, and a
