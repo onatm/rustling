@@ -24,7 +24,7 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | DSpark draft model: proposes several tokens at a time for the main model to check (`src/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, no gain on prose |
 | Quantised expert activations with an integer dot-product kernel, as the model was trained | done and the default; about 10 tokens/s. `--activations float` gives the transformers arithmetic |
 | Variable-loop checkpoint with a chosen pass count (`--passes`) | done; 16 tokens/s at 1 pass, 12 at 2, 9 at 3 |
-| GGUF conversions (Q4_K, Q5_0, Q6_K, Q8_0 blocks), multiplied in integer arithmetic (`src/ggml.rs`) | done, CPU only; Q4_K_M at about 13 tokens/s against 9 for the checkpoint |
+| GGUF conversions (Q4_K, Q5_0, Q6_K, Q8_0 blocks), multiplied in integer arithmetic (`src/ggml.rs`) | done, CPU only; Q4_K_M at about 15 tokens/s against 10 for the checkpoint |
 | Context window limit (`--context`) | done |
 | Metal for single-token generation | measured and set aside: per-dispatch overhead eats the gain |
 | Vision tower | later |
@@ -81,7 +81,7 @@ rustling --model ~/models/Inkling-2-Mini-Q4_K_M.gguf serve
 - **Companion files**: the config, tokenizer and chat template still come from the published checkpoint, so that
   must be downloaded too, without its weights: `hf download thinkingmachines/Inkling-2-Mini --include '*.json'
   '*.jinja'`. `$RUSTLING_BASE_MODEL` names a different one.
-- **Speed**: about 13 tokens/s on an M1 Max against 9 for the checkpoint, because every matrix is 4 to 8 bits per
+- **Speed**: about 15 tokens/s on an M1 Max against 10 for the checkpoint, because every matrix is 4 to 8 bits per
   weight where the checkpoint keeps the attention weights in 16.
 - **Arithmetic**: the input of each quantised matrix is rounded to 8 bits per value, in blocks of 32, and the
   product is taken in integers, as ggml does on a CPU. Results do not depend on batching.
@@ -148,6 +148,9 @@ It serves `POST /v1/chat/completions`, `GET /v1/models` and `GET /health`. Reque
 sampling flags are the defaults. Reasoning comes back as `reasoning_content`.
 
 One request runs at a time and the rest queue. Text input only.
+
+Before it accepts requests the server reads the whole weight file and runs one token through the model, so the
+first request is not the one that waits for the disk.
 
 ### Reusing processed prompts
 

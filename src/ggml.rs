@@ -74,6 +74,10 @@ impl Format {
     pub fn dot_row(self, row: &[u8], x: &[f32], scratch: &mut Vec<f32>) -> f32 {
         match self {
             Format::Bf16 => quant::dot_bf16_row(row, x),
+            // SAFETY: any four bytes are a valid f32; only an aligned middle part is used.
+            Format::F32 if unsafe { row.align_to::<f32>() }.0.is_empty() => {
+                quant::dot_f32_row(unsafe { row.align_to::<f32>() }.1, x)
+            }
             _ => {
                 scratch.resize(x.len(), 0.0);
                 self.decode_row(row, scratch);

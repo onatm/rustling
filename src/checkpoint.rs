@@ -169,6 +169,17 @@ impl Checkpoint {
         Ok(Self { files: vec![mmap], tensors, gguf: true })
     }
 
+    /// Reads every byte of the weights once, so that they are in memory before the first request needs them.
+    /// Returns how many bytes that was.
+    pub fn read_through(&self) -> usize {
+        use rayon::prelude::*;
+        let touch = |chunk: &[u8]| chunk.iter().step_by(4096).fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        for map in &self.files {
+            std::hint::black_box(map.par_chunks(1 << 24).map(touch).reduce(|| 0, u8::wrapping_add));
+        }
+        self.files.iter().map(|map| map.len()).sum()
+    }
+
     /// Whether the weights come from a GGUF conversion.
     pub fn is_gguf(&self) -> bool {
         self.gguf

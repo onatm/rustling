@@ -47,3 +47,27 @@ fn a_gguf_conversion_predicts_what_the_checkpoint_does() {
     // Q4_K_M measured 0.80 here, with or without rounding the activations to bytes.
     assert!(share > 0.7, "only {agree} of {} predictions agree", ids.len());
 }
+
+/// How fast the cores can read weights at all, which bounds generation: every token streams most of the file.
+/// `cargo test --release --test gguf bandwidth -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bandwidth() {
+    use rayon::prelude::*;
+    let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| DEFAULT_GGUF.to_owned());
+    let weights = Checkpoint::open(&resolve_model(Some(Path::new(&named))).unwrap()).unwrap();
+    let map = weights.maps()[0];
+    let span = &map[1 << 30..5 << 30];
+    let sum = |chunk: &[u8]| chunk.as_chunks::<8>().0.iter().fold(0u64, |s, b| s.wrapping_add(u64::from_le_bytes(*b)));
+    for threads in [1, 4, 8, 10] {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let total: u64 = pool.install(|| span.par_chunks(1 << 20).map(sum).reduce(|| 0, u64::wrapping_add));
+            std::hint::black_box(total);
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        eprintln!("{threads} threads: {:.0} GB/s", span.len() as f64 / best / 1e9);
+    }
+}

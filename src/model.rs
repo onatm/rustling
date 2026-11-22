@@ -57,6 +57,10 @@ pub(crate) enum Gpu {}
 /// Fewer tokens than this are handled on the calling thread in the cheap per-token steps.
 const PARALLEL_MIN_TOKENS: usize = 8;
 
+/// Attention goes across threads, a head each, from this many products of a query value with a key value. A
+/// lone token reaches it with about fifty tokens of context.
+const ATTENTION_MIN_WORK: usize = 1 << 17;
+
 /// Rows per parallel task in a matrix product.
 const TASK_ROWS: usize = 128;
 
@@ -329,6 +333,14 @@ impl<'a> Model<'a> {
         })
     }
 
+    /// Gets the model ready to answer at full speed: runs one token through every layer and the output weights,
+    /// which starts the thread pool and brings the weights that generation reads into memory. Without it the
+    /// first request pays for both.
+    pub fn warm_up(&self) -> Result<()> {
+        let last = self.forward(&[0], &mut self.new_state(), false)?.last;
+        self.logits(&last).map(drop)
+    }
+
     /// Whether to imitate transformers' bfloat16 rounding.
     fn bf16(&self) -> bool {
         self.activations == Activations::FloatBf16
@@ -375,7 +387,14 @@ impl<'a> Model<'a> {
         Ok(x)
     }
 
+    /// Runs on a thread of the pool. From outside it, every one of the hundreds of parallel steps in a forward
+    /// pass would be handed over and waited for separately, which costs more than the steps themselves when
+    /// generating token by token.
     fn run(&self, ids: &[u32], state: &mut State, trace: bool, taps: &[usize]) -> Result<Forward> {
+        in_pool(|| self.run_in_pool(ids, state, trace, taps))
+    }
+
+    fn run_in_pool(&self, ids: &[u32], state: &mut State, trace: bool, taps: &[usize]) -> Result<Forward> {
         let cfg = &self.cfg;
         let (h, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
         let (start, end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
@@ -411,7 +430,7 @@ impl<'a> Model<'a> {
                 let out = self.layer(l, hidden, blocks, messages.as_ref(), &mut state.visits[visit], state.position);
                 // A block boundary files the layer's input as a finished block.
                 if l % cfg.n_layers_per_attn_res_block == 0 {
-                    blocks.push(std::mem::take(hidden));
+                    blocks.push(residual_normed(std::mem::take(hidden), h));
                 }
                 *hidden = out;
                 if trace {
@@ -447,7 +466,7 @@ impl<'a> Model<'a> {
     /// Soft-capped logits over the usable vocabulary for one final state.
     pub fn logits(&self, state: &[f32]) -> Result<Vec<f32>> {
         let started = std::time::Instant::now();
-        let logits = self.project(state);
+        let logits = in_pool(|| self.project(state));
         timing::since(Stage::Logits, started);
         logits
     }
@@ -528,6 +547,8 @@ impl<'a> Model<'a> {
         let (h, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
         let layer = &self.layers[l];
         let mut block_refs: Vec<&Seq> = blocks.iter().collect();
+        let starts_block = l % cfg.n_layers_per_attn_res_block == 0;
+        let normed_input = starts_block.then(|| residual_normed(input.clone(), h));
         let gates = layer.controllers.as_ref().zip(messages);
         let bf16 = self.bf16();
 
@@ -576,8 +597,8 @@ impl<'a> Model<'a> {
         }
 
         // The first layer of a block starts a fresh residual; the block's input becomes a source instead.
-        let residual = if l % cfg.n_layers_per_attn_res_block == 0 {
-            block_refs.push(input);
+        let residual = if let Some(normed_input) = &normed_input {
+            block_refs.push(normed_input);
             attn
         } else {
             add(input, &attn)
@@ -764,7 +785,7 @@ impl<'a> Model<'a> {
             round_all(bf16, out);
         };
         let keys = position + tokens - window_start(position + tokens - 1);
-        match tokens * keys * q_dim < PARALLEL_MIN_WORK {
+        match tokens * keys * q_dim < ATTENTION_MIN_WORK {
             true => out.chunks_mut(dim).enumerate().for_each(attend),
             false => out.par_chunks_mut(dim).enumerate().for_each(attend),
         }
@@ -1258,6 +1279,14 @@ fn capped_swiglu(gate: &mut [f32], up: &mut [f32], gate_cap: f32, up_cap: f32, w
     }
 }
 
+/// Runs `work` on a thread of the pool, or here when this already is one.
+fn in_pool<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    match rayon::current_thread_index() {
+        Some(_) => work(),
+        None => rayon::scope(|_| work()),
+    }
+}
+
 fn round_bf16(x: f32) -> f32 {
     bf16::from_f32(x).to_f32()
 }
@@ -1321,8 +1350,10 @@ impl Controller<'_> {
             round_all(bf16, &mut pair);
             let mut low = self.down.apply_one(&pair);
             round_all(bf16, &mut low);
-            let (forget, gain) = (self.forget.apply_one(&low), self.gain.apply_one(&low));
-            (0..h).map(|i| (1.0 - forget[i].tanh()) * hidden[i] + gain[i].tanh() * message[i]).collect::<Vec<f32>>()
+            let (mut forget, mut gain) = (self.forget.apply_one(&low), self.gain.apply_one(&low));
+            accel::tanh_in_place(&mut forget);
+            accel::tanh_in_place(&mut gain);
+            (0..h).map(|i| (1.0 - forget[i]) * hidden[i] + gain[i] * message[i]).collect::<Vec<f32>>()
         });
         merged.concat()
     }
@@ -1460,20 +1491,16 @@ pub(crate) fn apply_many(gpu: Option<&Gpu>, jobs: &[(&Mat, &[f32])]) -> Vec<Seq>
 }
 
 /// Learned-query attention over the normed residual blocks plus the block in progress; one output per query.
+///
+/// `blocks` are finished blocks, already normed with [`residual_normed`], which a block is once for all the reads
+/// that follow; `partial` is normed here.
 fn attn_res(queries: &[f32], blocks: &[&Seq], partial: &Seq, h: usize) -> Vec<Seq> {
     let scale = (h as f32).powf(-0.5);
     // One token's outputs for all queries, back to back.
     let read = |t: usize| -> Vec<f32> {
-        let states: Vec<Vec<f32>> = blocks
-            .iter()
-            .copied()
-            .chain([partial])
-            .map(|state| {
-                let mut x = state[t * h..][..h].to_vec();
-                rms_norm(&mut x, None, RESIDUAL_NORM_EPS);
-                x
-            })
-            .collect();
+        let mut current = partial[t * h..][..h].to_vec();
+        rms_norm(&mut current, None, RESIDUAL_NORM_EPS);
+        let states: Vec<&[f32]> = blocks.iter().map(|block| &block[t * h..][..h]).chain([&current[..]]).collect();
         let mut out = vec![0.0f32; queries.len()];
         for (query, out) in queries.chunks_exact(h).zip(out.chunks_exact_mut(h)) {
             let logits: Vec<f32> = states.iter().map(|s| dot(query, s) * scale).collect();
@@ -1481,7 +1508,7 @@ fn attn_res(queries: &[f32], blocks: &[&Seq], partial: &Seq, h: usize) -> Vec<Se
             let weights: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
             let total: f32 = weights.iter().sum();
             for (weight, state) in weights.iter().zip(&states) {
-                out.iter_mut().zip(state).for_each(|(o, s)| *o += weight / total * s);
+                out.iter_mut().zip(*state).for_each(|(o, s)| *o += weight / total * s);
             }
         }
         out
@@ -1490,6 +1517,12 @@ fn attn_res(queries: &[f32], blocks: &[&Seq], partial: &Seq, h: usize) -> Vec<Se
     (0..queries.len() / h)
         .map(|q| per_token.iter().flat_map(|token| token[q * h..][..h].iter().copied()).collect())
         .collect()
+}
+
+/// A finished residual block as [`attn_res`] reads it: each token's state normed.
+fn residual_normed(mut block: Seq, h: usize) -> Seq {
+    block.chunks_exact_mut(h).for_each(|x| rms_norm(x, None, RESIDUAL_NORM_EPS));
+    block
 }
 
 /// Runs `work` for each token, across threads once there are enough tokens to be worth waking the pool.
@@ -1531,7 +1564,7 @@ fn static_conv(x: &[f32], weight: &[f32], channels: usize, k: usize, history: &m
 }
 
 pub(crate) fn rms_norm(x: &mut [f32], weight: Option<&[f32]>, eps: f32) {
-    let mean_square = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let mean_square = dot(x, x) / x.len() as f32;
     let scale = 1.0 / (mean_square + eps).sqrt();
     match weight {
         Some(weight) => x.iter_mut().zip(weight).for_each(|(v, w)| *v *= scale * w),
@@ -1541,7 +1574,7 @@ pub(crate) fn rms_norm(x: &mut [f32], weight: Option<&[f32]>, eps: f32) {
 
 /// Scales a vector down to `threshold` when its L2 norm is larger.
 fn l2_clip(x: &mut [f32], threshold: f32) {
-    let norm = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let norm = dot(x, x).sqrt();
     let scale = (threshold / (norm + 1e-6)).min(1.0);
     x.iter_mut().for_each(|v| *v *= scale);
 }
@@ -1590,7 +1623,7 @@ mod tests {
 
     #[test]
     fn attn_res_with_zero_query_averages_normed_states() {
-        let (a, b) = (vec![3.0, 0.0], vec![0.0, 5.0]);
+        let (a, b) = (residual_normed(vec![3.0, 0.0], 2), vec![0.0, 5.0]);
         let out = attn_res(&[0.0, 0.0], &[&a], &b, 2).remove(0);
         // Each state norms to RMS 1, i.e. [sqrt(2), 0] and [0, sqrt(2)]; a zero query weights them equally.
         let half = 2f32.sqrt() / 2.0;

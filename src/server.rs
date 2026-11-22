@@ -328,9 +328,19 @@ fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Jo
         },
         _ => None,
     };
+    // Bring the weights into memory and run a token through the model, so the first request is not the slow one.
+    let started = std::time::Instant::now();
+    let bytes = checkpoint.read_through();
+    if let Err(error) = model.warm_up() {
+        return drop(ready.send(Err(error.context("warming up"))));
+    }
     let backend = if model.uses_gpu() { "Metal for large batches" } else { "CPU" };
     let drafting = if draft.is_some() { ", with the draft model" } else { "" };
-    eprintln!("model loaded ({backend}{drafting})");
+    eprintln!(
+        "model loaded ({backend}{drafting}); read {:.1} GB and warmed up in {:.1}s",
+        bytes as f64 / 1e9,
+        started.elapsed().as_secs_f32()
+    );
     let _ = ready.send(Ok(()));
 
     let mut session = match &draft {
