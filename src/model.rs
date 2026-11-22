@@ -57,6 +57,11 @@ const FAST_PROMPT_CHUNK: usize = 2048;
 /// Prompt tokens per pass otherwise: enough to share each read of the weights, with memory still bounded.
 const PROMPT_CHUNK: usize = 512;
 
+/// Batches of at least this many tokens take the fast attention, which pays off much sooner than the GPU does: the
+/// last stretch of a long prompt, after the part a cached one covered, is often a couple of hundred tokens.
+#[cfg(target_os = "macos")]
+const FAST_ATTENTION_MIN_TOKENS: usize = 32;
+
 /// The most weights (tokens' heads times keys) the fast attention holds at once, which bounds its memory to a
 /// quarter of a gigabyte however long the context.
 #[cfg(target_os = "macos")]
@@ -86,6 +91,9 @@ const ATTENTION_MIN_WORK: usize = 1 << 17;
 /// and values fit in a core's cache, so the context is read once per block.
 const ATTENTION_BLOCK: usize = 32;
 const ATTENTION_KEYS: usize = 64;
+
+/// How many tokens' keys and values a sliding-window layer lets pile up beyond its window before dropping them.
+const STALE_BATCH: usize = 128;
 
 /// Rows per parallel task in a matrix product.
 const TASK_ROWS: usize = 128;
@@ -184,7 +192,7 @@ impl State {
         let floats: usize = self
             .visits
             .iter()
-            .map(|v| v.keys.len() + v.values.len() + v.convs.iter().map(Vec::len).sum::<usize>())
+            .map(|v| v.keys.iter().chain(&v.values).chain(&v.convs).map(Vec::len).sum::<usize>())
             .sum();
         floats * size_of::<f32>()
     }
@@ -194,11 +202,13 @@ impl State {
         let fresh = model.new_state();
         self.visits.len() == fresh.visits.len()
             && self.visits.iter().zip(&fresh.visits).all(|(mine, theirs)| {
-                let kv_dim = theirs.conv_channels[0];
+                // Every key head holds the same tokens.
+                let held = (self.position.saturating_sub(mine.first)) * theirs.conv_channels[0] / theirs.keys.len();
                 mine.conv_channels == theirs.conv_channels
                     && mine.first <= self.position
-                    && mine.keys.len() == (self.position - mine.first) * kv_dim
-                    && mine.values.len() == mine.keys.len()
+                    && mine.keys.len() == theirs.keys.len()
+                    && mine.values.len() == theirs.values.len()
+                    && mine.keys.iter().chain(&mine.values).all(|head| head.len() == held)
             })
     }
 
@@ -208,9 +218,10 @@ impl State {
         assert!(tokens <= MAX_ROLLBACK && tokens <= self.position, "cannot take back {tokens} tokens");
         self.position -= tokens;
         for visit in &mut self.visits {
-            let kv_dim = visit.keys.len() / (self.position + tokens - visit.first);
-            visit.keys.truncate(visit.keys.len() - tokens * kv_dim);
-            visit.values.truncate(visit.values.len() - tokens * kv_dim);
+            for head in visit.keys.iter_mut().chain(&mut visit.values) {
+                let dim = head.len() / (self.position + tokens - visit.first);
+                head.truncate(head.len() - tokens * dim);
+            }
             for (history, channels) in visit.convs.iter_mut().zip(visit.conv_channels) {
                 history.truncate(history.len() - tokens * channels);
             }
@@ -224,10 +235,11 @@ pub const MAX_ROLLBACK: usize = 16;
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct VisitState {
-    /// Keys and values of earlier tokens, `kv_dim` each, starting at position `first`. Sliding-window visits
-    /// drop whatever has left the window.
-    keys: Vec<f32>,
-    values: Vec<f32>,
+    /// Keys and values of earlier tokens, starting at position `first`: one table per key head, `head_dim` per
+    /// token, so that attention reads each head's as one run of memory. Sliding-window visits drop what has
+    /// left the window.
+    keys: Vec<Vec<f32>>,
+    values: Vec<Vec<f32>>,
     first: usize,
     /// The recent inputs of the key, value, post-attention and post-MLP convolutions: the `kernel - 1` they
     /// need, and up to [`MAX_ROLLBACK`] more so recent tokens can be taken back.
@@ -402,7 +414,9 @@ impl<'a> Model<'a> {
         let cfg = &self.cfg;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
         let conv_channels = [kv_dim, kv_dim, cfg.hidden_size, cfg.hidden_size];
-        let visits = cfg.visits().iter().map(|_| VisitState { conv_channels, ..Default::default() }).collect();
+        let heads = vec![Vec::new(); cfg.num_key_value_heads];
+        let fresh = VisitState { keys: heads.clone(), values: heads, conv_channels, ..Default::default() };
+        let visits = cfg.visits().iter().map(|_| fresh.clone()).collect();
         State { position: 0, visits }
     }
 
@@ -739,12 +753,18 @@ impl<'a> Model<'a> {
 
         // Sliding layers see the last `sliding_window_size` tokens; full layers see everything.
         let window_start = |t: usize| if layer.local { (t + 1).saturating_sub(cfg.sliding_window_size) } else { 0 };
-        let stale = window_start(position).saturating_sub(state.first).min(state.keys.len() / kv_dim);
-        state.keys.drain(..stale * kv_dim);
-        state.values.drain(..stale * kv_dim);
-        state.first += stale;
-        state.keys.extend(k);
-        state.values.extend(v);
+        // Dropping from the front moves everything kept, megabytes per visit, so it waits until a batch of
+        // tokens has left the window; until then they sit unread at the front.
+        let stale = window_start(position).saturating_sub(state.first).min(state.keys[0].len() / dim);
+        if stale >= STALE_BATCH {
+            state.keys.iter_mut().chain(&mut state.values).for_each(|head| drop(head.drain(..stale * dim)));
+            state.first += stale;
+        }
+        for (table, new) in [(&mut state.keys, &k), (&mut state.values, &v)] {
+            for (kv, head) in table.iter_mut().enumerate() {
+                new.chunks_exact(kv_dim).for_each(|token| head.extend_from_slice(&token[kv * dim..][..dim]));
+            }
+        }
         let (k, v, cached_from) = (&state.keys, &state.values, state.first);
 
         rel.chunks_exact_mut(heads * d_rel).enumerate().for_each(|(i, rel)| {
@@ -786,12 +806,13 @@ impl<'a> Model<'a> {
             // The sink is one extra logit with a zero value: it only absorbs probability mass.
             let sink = sinks[i * heads + head];
             let keys = t + 1 - first;
-            let base = (first - cached_from) * kv_dim + kv * dim;
+            let (k, v) = (&k[kv], &v[kv]);
+            let base = (first - cached_from) * dim;
             if bf16 {
                 // The reference's steps one by one, each landing on bfloat16.
                 let mut weights: Vec<f32> = (first..=t)
                     .map(|s| {
-                        let key = &k[(s - cached_from) * kv_dim + kv * dim..][..dim];
+                        let key = &k[(s - cached_from) * dim..][..dim];
                         // The product, the scaling and the bias are three bfloat16 results in transformers.
                         let score = round_bf16(round_bf16(dot(query, key)) * scaling);
                         round_bf16(score + bias.get(t - s).copied().unwrap_or(0.0))
@@ -801,7 +822,7 @@ impl<'a> Model<'a> {
                 weights.iter_mut().for_each(|w| *w = (*w - max).exp());
                 let total = weights.iter().sum::<f32>() + (sink - max).exp();
                 for (weight, s) in weights.iter().zip(first..=t) {
-                    let value = &v[(s - cached_from) * kv_dim + kv * dim..][..dim];
+                    let value = &v[(s - cached_from) * dim..][..dim];
                     let p = round_bf16(weight / total);
                     out.iter_mut().zip(value).for_each(|(o, x)| *o += p * x);
                 }
@@ -809,7 +830,7 @@ impl<'a> Model<'a> {
                 let mut weights: Vec<f32> = (0..keys)
                     .map(|j| {
                         // Key `j` is `keys - 1 - j` positions back.
-                        let key = &k[base + j * kv_dim..][..dim];
+                        let key = &k[base + j * dim..][..dim];
                         dot(query, key) * scaling + bias.get(keys - 1 - j).copied().unwrap_or(0.0)
                     })
                     .collect();
@@ -818,7 +839,7 @@ impl<'a> Model<'a> {
                 let total = weights.iter().sum::<f32>() + (sink - max).exp();
                 for (j, weight) in weights.iter().enumerate() {
                     let p = weight / total;
-                    out.iter_mut().zip(&v[base + j * kv_dim..][..dim]).for_each(|(o, x)| *o += p * x);
+                    out.iter_mut().zip(&v[base + j * dim..][..dim]).for_each(|(o, x)| *o += p * x);
                 }
             }
             round_all(bf16, out);
@@ -865,7 +886,8 @@ impl<'a> Model<'a> {
                     }
                 }
             };
-            let at = |s: usize| (s - cached_from) * kv_dim + kv * dim;
+            let (k, v) = (&k[kv], &v[kv]);
+            let at = |s: usize| (s - cached_from) * dim;
             stretches(&mut |row, i, head, first, keys| {
                 let query = &q[i * q_dim + head * dim..][..dim];
                 let weights = &mut weights[row];
@@ -898,7 +920,7 @@ impl<'a> Model<'a> {
         // weights with the keys and values, done by a tuned routine. Several times faster with a long context,
         // and equal to the loops above only to rounding.
         #[cfg(target_os = "macos")]
-        let fast = self.gpu.as_ref().is_some_and(Gpu::fast) && tokens >= FAST_MIN_TOKENS && !bf16 && !tracing;
+        let fast = self.gpu.as_ref().is_some_and(Gpu::fast) && tokens >= FAST_ATTENTION_MIN_TOKENS && !bf16 && !tracing;
         #[cfg(not(target_os = "macos"))]
         let fast = false;
         #[cfg(target_os = "macos")]
@@ -907,23 +929,22 @@ impl<'a> Model<'a> {
             // A stretch of tokens at a time, as many as keep the weights within bounds.
             let longest = position + tokens - window_start(position);
             let stretch = (FAST_ATTENTION_WEIGHTS / (group * longest)).clamp(1, tokens);
-            let (mut queries, mut weights, mut attended) = (Vec::new(), Vec::new(), Vec::new());
             for i0 in (0..tokens).step_by(stretch) {
                 let count = stretch.min(tokens - i0);
                 // Every key any of these tokens can see; a row uses its own part of them.
                 let lowest = window_start(position + i0);
                 let keys = position + i0 + count - lowest;
                 let rows = count * group;
-                queries.resize(rows * dim, 0.0f32);
-                weights.resize(rows * keys, 0.0f32);
-                attended.resize(rows * dim, 0.0f32);
-                for kv in 0..kv_heads {
-                    let from = (lowest - cached_from) * kv_dim + kv * dim;
+                // One key head's share: its query heads' outputs for these tokens, before the gate.
+                let attend = |kv: usize| -> Vec<f32> {
+                    let from = (lowest - cached_from) * dim;
+                    let mut queries = vec![0.0f32; rows * dim];
                     for (i, queries) in queries.chunks_exact_mut(group * dim).enumerate() {
                         queries.copy_from_slice(&q[(i0 + i) * q_dim + kv * group * dim..][..group * dim]);
                     }
+                    let mut weights = vec![0.0f32; rows * keys];
                     let mine = Rows { values: &queries, rows, cols: dim, stride: dim };
-                    let context = Rows { values: &k[from..], rows: keys, cols: dim, stride: kv_dim };
+                    let context = Rows { values: &k[kv][from..], rows: keys, cols: dim, stride: dim };
                     accel::multiply(mine, context, true, scaling, &mut weights);
                     weights.par_chunks_exact_mut(keys).enumerate().for_each(|(row, weights)| {
                         let (i, head) = (i0 + row / group, kv * group + row % group);
@@ -946,9 +967,19 @@ impl<'a> Model<'a> {
                         let total = weights.iter().sum::<f32>() + (sink - max).exp();
                         weights.iter_mut().for_each(|w| *w /= total);
                     });
+                    let mut attended = vec![0.0f32; rows * dim];
                     let mine = Rows { values: &weights, rows, cols: keys, stride: keys };
-                    let context = Rows { values: &v[from..], rows: keys, cols: dim, stride: kv_dim };
+                    let context = Rows { values: &v[kv][from..], rows: keys, cols: dim, stride: dim };
                     accel::multiply(mine, context, false, 1.0, &mut attended);
+                    attended
+                };
+                // A few tokens make products too small for the routine to spread over the cores itself, so the
+                // key heads go a core each; a long batch fills the cores from inside one product.
+                let attended: Vec<Vec<f32>> = match count < FAST_MIN_TOKENS {
+                    true => (0..kv_heads).into_par_iter().map(attend).collect(),
+                    false => (0..kv_heads).map(attend).collect(),
+                };
+                for (kv, attended) in attended.iter().enumerate() {
                     for (row, attended) in attended.chunks_exact(dim).enumerate() {
                         let unit = (i0 + row / group) * heads + kv * group + row % group;
                         let gate = &gate[unit * dim..][..dim];
@@ -1958,5 +1989,50 @@ mod tests {
         let mut short = [0.3, 0.4];
         l2_clip(&mut short, 1.0);
         assert_eq!(short, [0.3, 0.4]);
+    }
+
+    /// Token-by-token speed with a long context, without paying to process one: the state is filled with made-up
+    /// keys and values, which cost attention the same as real ones.
+    /// `cargo test --release --lib decode_at_long_context -- --ignored --nocapture`; `CONTEXT` sets the length.
+    #[test]
+    #[ignore]
+    fn decode_at_long_context() {
+        use crate::checkpoint::resolve_model;
+        let context: usize = std::env::var("CONTEXT").ok().and_then(|v| v.parse().ok()).unwrap_or(12_000);
+        let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M".to_owned());
+        let path = resolve_model(Some(std::path::Path::new(&named))).unwrap();
+        let weights = Checkpoint::open(&path).unwrap();
+        let config = Config::load(&path).unwrap();
+        for backend in [Backend::Cpu, Backend::MetalFast] {
+            let model = Model::load(&config, &weights, Options { activations: Activations::Float, backend }).unwrap();
+            let cfg = model.config().clone();
+            let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+            let mut state = model.new_state();
+            state.position = context;
+            for (visit, held) in cfg.visits().iter().zip(&mut state.visits) {
+                let kept = if cfg.is_local(visit.layer) { context.min(cfg.sliding_window_size - 1) } else { context };
+                let values = |seed: usize| -> Vec<Vec<f32>> {
+                    let head = |kv: usize| (0..kept * kv_dim / cfg.num_key_value_heads)
+                        .map(|i| (((i * 2_654_435_761 + seed + kv) >> 7) % 2001) as f32 / 1000.0 - 1.0)
+                        .collect();
+                    (0..cfg.num_key_value_heads).map(head).collect()
+                };
+                (held.keys, held.values, held.first) = (values(visit.index), values(visit.index + 99), context - kept);
+            }
+            model.forward(&[17], &mut state, false).unwrap();
+            crate::timing::take();
+            let started = std::time::Instant::now();
+            let tokens = 20;
+            for token in 0..tokens {
+                model.forward(&[100 + token], &mut state, false).unwrap();
+            }
+            let each = started.elapsed().as_secs_f64() * 1000.0 / tokens as f64;
+            let stages: Vec<String> = crate::timing::take()
+                .iter()
+                .filter(|(_, seconds)| *seconds > 0.0)
+                .map(|(stage, seconds)| format!("{stage:?} {:.1}", seconds * 1000.0 / tokens as f64))
+                .collect();
+            eprintln!("{backend:?} at {context} tokens: {each:.1} ms per token without logits ({})", stages.join(", "));
+        }
     }
 }

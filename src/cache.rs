@@ -24,8 +24,14 @@ use crate::session::{Session, Snapshot};
 
 /// A header shorter than this is not worth a snapshot of its own.
 const MIN_HEADER_TOKENS: usize = 64;
-/// A snapshot must save at least this many tokens over the one before it.
+/// A snapshot must save at least this many tokens over the one before it, and at least a sixteenth of its own
+/// length: a snapshot of a long prompt takes a gigabyte, which a few seconds of processing do not justify.
 const MIN_GAIN_TOKENS: usize = 32;
+
+/// Whether a snapshot at `boundary` saves enough over one at `have` to be worth its memory.
+fn worth(boundary: usize, have: usize) -> bool {
+    boundary >= have + MIN_GAIN_TOKENS.max(boundary / 16)
+}
 
 const FILE_NAME: &str = "prompt-cache.bin";
 
@@ -93,21 +99,21 @@ pub fn plan(snapshots: &[&[u32]], live: &[u32], prompt: &[u32], header: Option<u
     let shared = snapshots.iter().chain([&live]).map(common).max().unwrap_or(0);
 
     let mut boundaries = Vec::new();
+    let shared = Some(shared).filter(|&shared| worth(shared, start));
+    // Of two snapshots close together only one is worth the memory, and that is the shared point: prompts have
+    // been seen to part there, where the header is only a guess. A client that ends its system prompt with the
+    // date or the working directory shares everything up to that and nothing after.
+    let near = |header: usize| shared.is_some_and(|shared| !worth(header.max(shared), header.min(shared)));
     if let Some(header) = header
         && header >= MIN_HEADER_TOKENS
-        && header >= start + MIN_GAIN_TOKENS
         && header <= prompt.len()
+        && worth(header, start)
+        && !near(header)
     {
         boundaries.push(header);
     }
-    if shared >= start + MIN_GAIN_TOKENS {
-        boundaries.push(shared);
-    }
+    boundaries.extend(shared);
     boundaries.sort_unstable();
-    boundaries.dedup();
-    // Two snapshots a few tokens apart are not worth the memory; keep the later.
-    let spaced = |i: usize| boundaries.get(i + 1).is_none_or(|next| next - boundaries[i] >= MIN_GAIN_TOKENS);
-    let boundaries = (0..boundaries.len()).filter(|&i| spaced(i)).map(|i| boundaries[i]).collect();
     Plan { source, start, boundaries }
 }
 
@@ -227,6 +233,13 @@ impl PromptCache {
         let path = dir.join(FILE_NAME);
         let Ok(file) = File::open(&path) else { return Ok(cache) };
         let mut scratch = vec![0u8; 1 << 16];
+        // The fingerprint comes first in the file and is checked on its own: a file made with something else
+        // may not even have snapshots of the same layout.
+        let made_with: Result<(String, _), _> = postcard::from_io((BufReader::new(file), &mut scratch));
+        if !made_with.is_ok_and(|(made_with, _)| made_with == fingerprint) {
+            return Ok(cache);
+        }
+        let file = File::open(&path).with_context(|| format!("reopening {}", path.display()))?;
         let (saved, _): (Saved, _) = postcard::from_io((BufReader::new(file), &mut scratch))
             .with_context(|| format!("reading {}; delete it to start with an empty cache", path.display()))?;
         if saved.fingerprint != fingerprint {
@@ -293,6 +306,25 @@ mod tests {
         assert_eq!(plan(&[], &live, &prompt, None), Plan { source: Source::Scratch, start: 0, boundaries: vec![120] });
         // With that snapshot on hand, a third time costs nothing.
         assert_eq!(plan(&[&prompt], &live, &prompt, None), Plan { source: Source::Snapshot(0), start: 120, boundaries: vec![] });
+    }
+
+    #[test]
+    fn a_long_header_is_not_kept_beside_a_shared_point_just_before_it() {
+        // Two sessions of a coding agent: twelve thousand tokens of system prompt that differ only in the
+        // working directory near the end.
+        let first: Vec<u32> = ids(0..11_750).into_iter().chain(20_000..20_250).collect();
+        let second: Vec<u32> = ids(0..11_750).into_iter().chain(30_000..30_250).collect();
+        let plan_for = |snapshots: &[&[u32]]| plan(snapshots, &[], &second, Some(11_960));
+        // With nothing on hand the header is the only guess.
+        assert_eq!(plan_for(&[]).boundaries, vec![11_960]);
+        // Having seen the first session, the point where the two part is kept and the header, 210 tokens on, is not.
+        assert_eq!(plan_for(&[&first]), Plan { source: Source::Scratch, start: 0, boundaries: vec![11_750] });
+        // And a third session starts from there without adding anything.
+        let shared = ids(0..11_750);
+        assert_eq!(plan_for(&[&first, &shared]), Plan { source: Source::Snapshot(1), start: 11_750, boundaries: vec![] });
+        // A shared point well before the header leaves both worth having.
+        let early: Vec<u32> = ids(0..4_000).into_iter().chain(40_000..40_100).collect();
+        assert_eq!(plan_for(&[&early]).boundaries, vec![4_000, 11_960]);
     }
 
     #[test]

@@ -89,7 +89,8 @@ rustling --model ~/models/Inkling-2-Mini-Q4_K_M.gguf serve
   must be downloaded too, without its weights: `hf download thinkingmachines/Inkling-2-Mini --include '*.json'
   '*.jinja'`. `$RUSTLING_BASE_MODEL` names a different one.
 - **Speed**: about 15 tokens/s on an M1 Max against 10 for the checkpoint, because every matrix is 4 to 8 bits per
-  weight where the checkpoint keeps the attention weights in 16.
+  weight where the checkpoint keeps the attention weights in 16. With 12,000 tokens of context it is about
+  11.5 tokens/s: each new token attends to all of them in the eight full-attention layer visits.
 - **Arithmetic**: the input of each quantised matrix is rounded to 8 bits per value, in blocks of 32, and the
   product is taken in integers, as ggml does on a CPU. Results do not depend on batching.
 - **Accuracy**: a conversion is a lossy copy. On a passage of prose, Q4_K_M and the checkpoint agreed on the most
@@ -190,9 +191,17 @@ prompt tokens were reused. Three things are kept:
 - any point where a new prompt stops agreeing with an earlier one, so the part they share is processed once more
   at most.
 
-These snapshots are large, roughly 0.4 MB per token up to 1,024 tokens and 64 KB per token beyond. `--cache-gb`
-(default 4) bounds their total, dropping the least recently used first. `--cache-dir <dir>` saves them on
+These snapshots are large, roughly 0.4 MB per token up to 1,024 tokens and 64 KB per token beyond, so a
+12,000-token prompt takes over a gigabyte. A snapshot is only taken where it saves at least a sixteenth of its
+own length over the one before it, and of a header and a shared point close together only the shared point is
+kept. `--cache-gb` (default 4) bounds their total, dropping the least recently used first. `--cache-dir <dir>` saves them on
 shutdown and loads them at start; a cache made with a different model, pass count or arithmetic is ignored.
+
+A coding agent's opening prompt is the case this is for. opencode sends about 12,000 tokens of instructions
+and tool declarations that end with the date and the working directory. The first session pays for all of it
+(about 130 s on an M1 Max with `--backend metal-fast` and a Q4_K_M conversion), a session in a second directory
+pays once more and leaves a snapshot where the two part, and from then on a new session in any directory reuses
+11,759 tokens and starts in about 5 s. With `--cache-dir` that survives a restart.
 
 Clients usually drop the assistant's reasoning when they send the history back. The server restores it for
 replies it generated, which is what lets the next turn match the conversation it kept.

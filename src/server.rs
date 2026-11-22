@@ -355,8 +355,9 @@ fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Jo
         None => Session::new(&model).with_window(options.context),
     };
     // What snapshots depend on: one made with another model, pass count or arithmetic must not be reused.
+    // The leading number changes with the layout of a saved state.
     let fingerprint = format!(
-        "{}|{} bytes|{} visits|{:?}|{}|draft {}",
+        "state 2|{}|{} bytes|{} visits|{:?}|{}|draft {}",
         model_dir.display(),
         checkpoint.maps().iter().map(|map| map.len()).sum::<usize>(),
         config.text_config.visits().len(),
