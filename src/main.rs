@@ -491,11 +491,12 @@ fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, top: bool, t
     if draft.is_some() {
         let drafting = session.drafting();
         eprintln!(
-            "draft: {} of {} proposed tokens accepted over {} rounds ({:.1} tokens per round)",
+            "draft: {} of {} proposed tokens accepted over {} rounds ({:.1} tokens per round); rested for {} tokens",
             drafting.accepted,
             drafting.proposed,
             drafting.rounds,
-            (generated.len() as f32 - 1.0) / drafting.rounds.max(1) as f32
+            (drafting.rounds + drafting.accepted) as f32 / drafting.rounds.max(1) as f32,
+            drafting.rested
         );
     }
     eprintln!(

@@ -21,7 +21,7 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | Multi-turn chat that reuses the conversation's state, with a stop on repeating output (`src/session.rs`) | done |
 | OpenAI-compatible HTTP server: chat completions, streaming, tool calls (`src/server.rs`) | done |
 | Processed prompts reused across conversations and restarts (`src/cache.rs`) | done |
-| DSpark draft model: proposes several tokens at a time for the main model to check (`src/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, no gain on prose |
+| DSpark draft model: proposes several tokens at a time for the main model to check (`src/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, and it rests where it would slow things down |
 | Quantised expert activations with an integer dot-product kernel, as the model was trained | done and the default; about 10 tokens/s. `--activations float` gives the transformers arithmetic |
 | Variable-loop checkpoint with a chosen pass count (`--passes`) | done; 16 tokens/s at 1 pass, 12 at 2, 9 at 3 |
 | GGUF conversions (Q4_K, Q5_0, Q6_K, Q8_0 blocks), multiplied in integer arithmetic (`src/ggml.rs`) | done, CPU only; Q4_K_M at about 15 tokens/s against 10 for the checkpoint |
@@ -132,6 +132,13 @@ without the draft, and with `--temperature 0` it is identical. Only the speed ch
 on how predictable the text is: a code prompt went from 8.7 to 11.7 tokens/s on an M1 Max, a prose prompt from
 9.35 to 9.5. The draft stops proposing where its own confidence in the run falls below `--draft-confidence`
 (default 0.8), because checking a wrong guess is expensive on a CPU.
+
+The draft also rests when it is not paying for itself. A round costs the draft's own work plus the checking of
+every proposal, about half a token's time each on an M1 Max, so every eight rounds the accepted tokens are
+weighed against that cost. When they fall short, the next 32 tokens are generated one at a time, then the draft
+gets another try; each further losing try doubles the rest, up to 512 tokens. On a Q4_K_M conversion this took
+two prompts that drafting had slowed from 14.0 and 14.9 tokens/s to 13.1 and 12.9 back to 14.2 and 14.7, and a
+highly repetitive one still went from 14.5 to 16.4.
 
 ## Server
 

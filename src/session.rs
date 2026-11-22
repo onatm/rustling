@@ -51,6 +51,65 @@ pub struct Drafting {
     pub rounds: usize,
     pub proposed: usize,
     pub accepted: usize,
+    /// Tokens generated one at a time while the draft was resting because it had not been paying for itself.
+    pub rested: usize,
+}
+
+/// What a round of drafting costs beyond generating one token, in units of the time one token takes without a
+/// draft: the draft's own work, and each proposed token the main model then checks. Measured on an M1 Max, where
+/// the two came to 0.39 and 0.61 for the checkpoint and 0.55 and 0.50 for a Q4_K_M conversion.
+const ROUND_COST: f32 = 0.45;
+const PROPOSED_COST: f32 = 0.55;
+/// Drafting is judged over this many rounds at a time.
+const TRIAL_ROUNDS: usize = 8;
+/// How many tokens the draft rests for after a losing trial. Each further losing trial doubles it, up to the
+/// limit, so text the draft cannot predict costs only an occasional trial.
+const FIRST_REST: usize = 32;
+const LONGEST_REST: usize = 512;
+
+/// Decides when drafting is worth its cost. A round gains the tokens it had accepted and pays for the draft's
+/// work and for checking every proposal, accepted or not; when a trial of rounds comes out behind, the draft
+/// rests for a while and generation goes one token at a time. The rule counts tokens rather than measuring time,
+/// so the same run always switches at the same places.
+#[derive(Debug, Clone, Copy)]
+struct Pacing {
+    /// Tokens' worth of time gained in the current trial.
+    gain: f32,
+    rounds: usize,
+    /// Tokens left to generate before the next trial.
+    resting: usize,
+    next_rest: usize,
+}
+
+impl Pacing {
+    fn new() -> Self {
+        Self { gain: 0.0, rounds: 0, resting: 0, next_rest: FIRST_REST }
+    }
+
+    fn is_resting(&self) -> bool {
+        self.resting > 0
+    }
+
+    /// Records a token generated while resting.
+    fn rested(&mut self) {
+        self.resting -= 1;
+    }
+
+    /// Records a round in which `accepted` of `proposed` tokens stood.
+    fn round(&mut self, proposed: usize, accepted: usize) {
+        self.gain += accepted as f32 - ROUND_COST - PROPOSED_COST * proposed as f32;
+        self.rounds += 1;
+        if self.rounds < TRIAL_ROUNDS {
+            return;
+        }
+        if self.gain < 0.0 {
+            self.resting = self.next_rest;
+            self.next_rest = (self.next_rest * 2).min(LONGEST_REST);
+        } else {
+            self.next_rest = FIRST_REST;
+        }
+        (self.gain, self.rounds) = (0.0, 0);
+    }
 }
 
 /// Limits on one call to [`Session::generate`].
@@ -237,18 +296,26 @@ impl<'m, 'a> Session<'m, 'a> {
         };
 
         let hidden = self.model.config().hidden_size;
+        // Each reply is judged afresh: what the draft could not predict in the last one says little about this.
+        let mut pacing = Pacing::new();
         let mut logits = self.logits()?;
         let mut next = sampler.sample(&logits);
         loop {
             if let Some(stop) = emit(&mut generated, next, &logits)? {
                 return Ok((generated, stop));
             }
-            let Some((draft, draft_state)) = &mut self.draft else {
+            if self.draft.is_none() || pacing.is_resting() {
+                // One token at a time. With a resting draft this still keeps the draft's context up to date.
                 self.extend(&[next])?;
                 logits = self.logits()?;
                 next = sampler.sample(&logits);
+                if self.draft.is_some() {
+                    pacing.rested();
+                    self.drafting.rested += 1;
+                }
                 continue;
-            };
+            }
+            let (draft, draft_state) = self.draft.as_mut().expect("checked above");
 
             // One round: the draft proposes what follows `next`, and the main model runs `next` and the
             // proposals as one batch. Its output after each token says whether the following proposal stands.
@@ -259,6 +326,7 @@ impl<'m, 'a> Session<'m, 'a> {
             self.drafting.proposed += proposal.len();
 
             // `kept` counts the batch tokens that stay in the context: `next`, then each accepted proposal.
+            let accepted_before = self.drafting.accepted;
             let mut kept = 1;
             let mut stop = None;
             // With a confident draft most of the batch gets checked, so all its logits are computed together.
@@ -283,6 +351,8 @@ impl<'m, 'a> Session<'m, 'a> {
                     None => next = sampler.sample(&logits),
                 }
             }
+
+            pacing.round(proposal.len(), self.drafting.accepted - accepted_before);
 
             // Take back the rejected tail and bring the draft's context up to date.
             self.state.truncate(batch.len() - kept);
@@ -316,6 +386,44 @@ pub fn is_looping(tokens: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_draft_that_loses_rests_for_longer_each_time() {
+        let mut pacing = Pacing::new();
+        // Rounds with nothing to propose still cost the draft's own work.
+        (0..TRIAL_ROUNDS - 1).for_each(|_| pacing.round(0, 0));
+        assert!(!pacing.is_resting(), "judged only at the end of a trial");
+        pacing.round(0, 0);
+        assert!(pacing.is_resting());
+        let rest = |pacing: &mut Pacing| {
+            let mut tokens = 0;
+            while pacing.is_resting() {
+                pacing.rested();
+                tokens += 1;
+            }
+            tokens
+        };
+        assert_eq!(rest(&mut pacing), FIRST_REST);
+        // Proposals that are mostly rejected lose as well, and the next rest is twice as long.
+        (0..TRIAL_ROUNDS).for_each(|_| pacing.round(4, 1));
+        assert_eq!(rest(&mut pacing), FIRST_REST * 2);
+        (0..20).for_each(|_| {
+            (0..TRIAL_ROUNDS).for_each(|_| pacing.round(0, 0));
+            assert!(rest(&mut pacing) <= LONGEST_REST);
+        });
+        (0..TRIAL_ROUNDS).for_each(|_| pacing.round(0, 0));
+        assert_eq!(rest(&mut pacing), LONGEST_REST);
+    }
+
+    #[test]
+    fn a_draft_that_pays_keeps_going() {
+        let mut pacing = Pacing::new();
+        (0..10 * TRIAL_ROUNDS).for_each(|_| pacing.round(4, 4));
+        assert!(!pacing.is_resting());
+        // One losing trial after a winning stretch starts from the shortest rest again.
+        (0..TRIAL_ROUNDS).for_each(|_| pacing.round(7, 0));
+        assert_eq!(pacing.resting, FIRST_REST);
+    }
 
     #[test]
     fn detects_a_repeated_phrase() {
