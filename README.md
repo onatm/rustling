@@ -135,9 +135,16 @@ The arithmetic is float throughout, where the CPU path rounds the inputs of a qu
 two agree only approximately; llama.cpp computes the same way on a GPU. Against the CPU computing in floats,
 every layer visit matches to about one part in a million.
 
-Copying from the context and the draft model are not used while tokens come from the GPU: proposals are checked
-in a batch on the CPU, and a token of such a batch now costs more than a token from the GPU. `--draft` says so
-and is ignored.
+Short batches run the same way, up to 17 tokens in one submission, each token with its own copy of the scratch
+layout and seeing the ones before it; a batch gives each token exactly what it would get alone. That is where
+tokens copied from the context are checked. A batch shares less between its tokens than on the CPU, since the
+GPU's cost is per product rather than per read of the weights: a token of a batch takes about 0.62 of a lone
+token's time with a short context and 0.66 at 15,000 tokens. Copying therefore gains less here: a reply that
+writes a function out twice went from 23.7 to 27.6 tokens/s, and the reply from a 15,000-token prompt of source
+code did not gain.
+
+The draft model is not used while tokens come from the GPU: its proposal is made on the CPU and takes longer than
+a token does. `--draft` says so and is ignored.
 
 ## Context window
 
@@ -179,8 +186,7 @@ as what follows now, up to 16 tokens when a long stretch matches, and the main m
 batch, as it checks the draft model's. A proposal costs a table lookup. llama.cpp calls this n-gram speculative
 decoding.
 
-It is on by default wherever tokens are generated on the CPU (`--no-copying` turns it off) and, like the draft
-model, changes the speed and not what is
+It is on by default (`--no-copying` turns it off) and, like the draft model, changes the speed and not what is
 generated: with `--temperature 0` the output is identical on the exact backends, and equal to rounding with
 `--backend metal-fast`. It rests in the same way when its guesses are being rejected. With a 15,000-token prompt
 of source code on a Q4_K_M conversion and an M1 Max, a reply that reasons and then writes out part of that code

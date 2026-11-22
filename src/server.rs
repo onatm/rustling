@@ -994,9 +994,10 @@ fn handle(
     };
     let copied = match drafted.copied_proposed > drafted_before.copied_proposed {
         true => format!(
-            "; copied: {} of {} proposed tokens accepted",
+            "; copied: {} of {} proposed tokens accepted in {} rounds",
             drafted.copied_accepted - drafted_before.copied_accepted,
-            drafted.copied_proposed - drafted_before.copied_proposed
+            drafted.copied_proposed - drafted_before.copied_proposed,
+            drafted.copied_rounds - drafted_before.copied_rounds
         ),
         false => String::new(),
     };

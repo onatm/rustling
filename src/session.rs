@@ -75,6 +75,7 @@ pub struct Drafting {
     /// Tokens proposed by copying from the context ([`crate::lookup`]), and how many of them stood.
     pub copied_proposed: usize,
     pub copied_accepted: usize,
+    pub copied_rounds: usize,
 }
 
 /// What a round of drafting costs beyond generating one token, in units of the time one token takes without a
@@ -82,6 +83,9 @@ pub struct Drafting {
 /// the two came to 0.39 and 0.61 for the checkpoint and 0.55 and 0.50 for a Q4_K_M conversion.
 const ROUND_COST: f32 = 0.45;
 const PROPOSED_COST: f32 = 0.55;
+/// The same when tokens and batches both run on the GPU, where a batch shares less between its tokens: a token
+/// of a batch took 0.62 of a lone token's time with a short context and 0.66 at 15,000 tokens.
+const PROPOSED_COST_ON_GPU: f32 = 0.65;
 /// Drafting is judged over this many rounds at a time.
 const TRIAL_ROUNDS: usize = 8;
 /// How many tokens the draft rests for after a losing trial. Each further losing trial doubles it, up to the
@@ -97,6 +101,8 @@ const LONGEST_REST: usize = 128;
 /// so the same run always switches at the same places.
 #[derive(Debug, Clone, Copy)]
 struct Pacing {
+    /// What checking one proposed token costs, in tokens' worth of time.
+    proposed_cost: f32,
     /// Tokens' worth of time gained in the current trial.
     gain: f32,
     rounds: usize,
@@ -106,8 +112,8 @@ struct Pacing {
 }
 
 impl Pacing {
-    fn new() -> Self {
-        Self { gain: 0.0, rounds: 0, resting: 0, next_rest: FIRST_REST }
+    fn new(proposed_cost: f32) -> Self {
+        Self { proposed_cost, gain: 0.0, rounds: 0, resting: 0, next_rest: FIRST_REST }
     }
 
     fn is_resting(&self) -> bool {
@@ -121,7 +127,7 @@ impl Pacing {
 
     /// Records a round in which `accepted` of `proposed` tokens stood, and whose proposal took `cost` to make.
     fn round(&mut self, proposed: usize, accepted: usize, cost: f32) {
-        self.gain += accepted as f32 - cost - PROPOSED_COST * proposed as f32;
+        self.gain += accepted as f32 - cost - self.proposed_cost * proposed as f32;
         self.rounds += 1;
         if self.rounds < TRIAL_ROUNDS {
             return;
@@ -342,7 +348,7 @@ impl<'m, 'a> Session<'m, 'a> {
             }
         };
         self.last = forward.last[forward.last.len() - hidden..].to_vec();
-        self.ahead = forward.logits;
+        self.ahead = forward.logits.and_then(|mut logits| logits.pop());
         self.context.extend_from_slice(ids);
         Ok(())
     }
@@ -385,11 +391,12 @@ impl<'m, 'a> Session<'m, 'a> {
         let hidden = self.model.config().hidden_size;
         // Each reply is judged afresh: what could not be predicted in the last one says little about this. The
         // draft and copying are judged apart, since text that defeats one may suit the other.
-        let mut pacing = Pacing::new();
-        let mut copying = Pacing::new();
-        // Proposals are checked in a batch on the CPU, which only pays while single tokens are computed there too.
+        let proposed_cost = if self.model.decodes_on_gpu() { PROPOSED_COST_ON_GPU } else { PROPOSED_COST };
+        let mut pacing = Pacing::new(proposed_cost);
+        let mut copying = Pacing::new(proposed_cost);
+        // A draft's proposal is made on the CPU, which costs more than a token does once tokens come from the GPU.
         let proposing = !self.model.decodes_on_gpu();
-        let mut lookup = Lookup::new(if proposing { &self.context } else { &[] });
+        let mut lookup = Lookup::new(&self.context);
         let mut logits = self.logits()?;
         let mut next = sampler.sample(&logits);
         loop {
@@ -401,7 +408,7 @@ impl<'m, 'a> Session<'m, 'a> {
             // One round: something proposes what follows `next`, and the main model runs `next` and the
             // proposals as one batch. Its output after each token says whether the following proposal stands.
             // Copying is tried first: it costs nothing to propose, and where it applies it reaches further.
-            let copied = if proposing && self.copying && !copying.is_resting() { lookup.propose() } else { &[][..] };
+            let copied = if self.copying && !copying.is_resting() { lookup.propose() } else { &[][..] };
             let (proposal, from_draft) = match &self.draft {
                 _ if !copied.is_empty() => (copied.to_vec(), false),
                 Some((draft, draft_state)) if proposing && !pacing.is_resting() => (draft.propose(draft_state, next, self.model)?, true),
@@ -420,7 +427,7 @@ impl<'m, 'a> Session<'m, 'a> {
                 continue;
             }
             let batch: Vec<u32> = std::iter::once(next).chain(proposal.iter().copied()).collect();
-            let forward = match &self.draft {
+            let mut forward = match &self.draft {
                 Some((draft, _)) => self.model.forward_tapped(&batch, &mut self.state, draft.taps())?,
                 None => self.model.forward(&batch, &mut self.state, false)?,
             };
@@ -429,7 +436,10 @@ impl<'m, 'a> Session<'m, 'a> {
             let mut kept = 1;
             let mut stop = None;
             // With a confident draft most of the batch gets checked, so all its logits are computed together.
-            let batch_logits = self.model.logits_many(&forward.last)?;
+            let batch_logits = match forward.logits.take() {
+                Some(logits) => logits,
+                None => self.model.logits_many(&forward.last)?,
+            };
             for (i, position_logits) in batch_logits.into_iter().enumerate() {
                 logits = position_logits;
                 match proposal.get(i).map(|&proposed| (proposed, sampler.verify(&logits, proposed))) {
@@ -462,6 +472,7 @@ impl<'m, 'a> Session<'m, 'a> {
                     copying.passed(kept);
                 }
                 false => {
+                    self.drafting.copied_rounds += 1;
                     self.drafting.copied_proposed += proposal.len();
                     self.drafting.copied_accepted += accepted;
                     copying.round(proposal.len(), accepted, 0.0);
@@ -507,7 +518,7 @@ mod tests {
 
     #[test]
     fn a_draft_that_loses_rests_for_longer_each_time() {
-        let mut pacing = Pacing::new();
+        let mut pacing = Pacing::new(PROPOSED_COST);
         // Rounds with nothing to propose still cost the draft's own work.
         (0..TRIAL_ROUNDS - 1).for_each(|_| pacing.round(0, 0, ROUND_COST));
         assert!(!pacing.is_resting(), "judged only at the end of a trial");
@@ -535,7 +546,7 @@ mod tests {
 
     #[test]
     fn a_draft_that_pays_keeps_going() {
-        let mut pacing = Pacing::new();
+        let mut pacing = Pacing::new(PROPOSED_COST);
         (0..10 * TRIAL_ROUNDS).for_each(|_| pacing.round(4, 4, ROUND_COST));
         assert!(!pacing.is_resting());
         // One losing trial after a winning stretch starts from the shortest rest again.

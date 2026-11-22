@@ -188,9 +188,9 @@ pub struct Forward {
     pub last: Seq,
     /// The hidden state entering each visit asked for with [`Model::forward_tapped`], in visit order.
     pub taps: Vec<Seq>,
-    /// The logits after the last token, when the pass computed them along the way: [`Model::logits`] of the
-    /// last state, to the path's own rounding.
-    pub logits: Option<Vec<f32>>,
+    /// The logits after each token, when the pass computed them along the way: [`Model::logits`] of each state
+    /// in `last`, to the path's own rounding.
+    pub logits: Option<Vec<Vec<f32>>>,
 }
 
 /// Everything the tokens seen so far left behind for the tokens to come.
@@ -588,17 +588,18 @@ impl<'a> Model<'a> {
     /// generating token by token.
     fn run(&self, ids: &[u32], state: &mut State, trace: bool, taps: &[usize]) -> Result<Forward> {
         #[cfg(target_os = "macos")]
-        if let ([id], false) = (ids, trace)
-            && let Some(forward) = self.decode(*id, state, taps)?
+        if !trace
+            && (1..=decode::MAX_BATCH).contains(&ids.len())
+            && let Some(forward) = self.decode(ids, state, taps)?
         {
             return Ok(forward);
         }
         in_pool(|| self.run_in_pool(ids, state, trace, taps))
     }
 
-    /// Whether single tokens are generated on the GPU. A token then costs less than its share of a batch on the
-    /// CPU, which is where proposed tokens are checked, so proposing tokens (by copying, or from a draft model)
-    /// cannot gain anything.
+    /// Whether tokens are generated on the GPU, singly and in the short batches that check proposed tokens. A
+    /// token then costs less than a draft model's proposal takes to make on the CPU, so a draft cannot gain
+    /// anything; proposals that cost nothing to make, copied from the context, still can.
     pub fn decodes_on_gpu(&self) -> bool {
         #[cfg(target_os = "macos")]
         return self.gpu.as_ref().is_some_and(Gpu::fast) && self.layers[0].experts.gate_up.ggml().is_some();
@@ -606,10 +607,10 @@ impl<'a> Model<'a> {
         false
     }
 
-    /// One token on the GPU, when the model is set up for it: a GGUF file on the fast backend. Nothing
-    /// otherwise, or when the GPU fails, and the caller takes the CPU path with the state untouched.
+    /// A token or a short batch on the GPU, when the model is set up for it: a GGUF file on the fast backend.
+    /// Nothing otherwise, or when the GPU fails, and the caller takes the CPU path with the state untouched.
     #[cfg(target_os = "macos")]
-    fn decode(&self, id: u32, state: &mut State, taps: &[usize]) -> Result<Option<Forward>> {
+    fn decode(&self, ids: &[u32], state: &mut State, taps: &[usize]) -> Result<Option<Forward>> {
         let Some(gpu) = self.gpu.as_ref().filter(|_| self.decodes_on_gpu() && !float_reference()) else { return Ok(None) };
         let decoder = self.decoder.get_or_init(|| match decode::Decoder::new(self, gpu) {
             Ok(decoder) => Some(std::sync::Mutex::new(decoder)),
@@ -619,12 +620,15 @@ impl<'a> Model<'a> {
             }
         });
         let Some(decoder) = decoder else { return Ok(None) };
-        let embedded = self.embed(id)?;
+        let mut embedded = Vec::with_capacity(ids.len() * self.cfg.hidden_size);
+        for &id in ids {
+            embedded.extend(self.embed(id)?);
+        }
         let started = std::time::Instant::now();
-        let result = decoder.lock().expect("decoder lock").token(self, gpu, state, &embedded, taps);
+        let result = decoder.lock().expect("decoder lock").tokens(self, gpu, state, &embedded, taps);
         timing::since(Stage::Token, started);
         match result {
-            Ok(token) => Ok(Some(Forward { hidden: Vec::new(), last: token.last, taps: token.taps, logits: Some(token.logits) })),
+            Ok(tokens) => Ok(Some(Forward { hidden: Vec::new(), last: tokens.last, taps: tokens.taps, logits: Some(tokens.logits) })),
             Err(error) => {
                 gpu_failed(&error);
                 Ok(None)

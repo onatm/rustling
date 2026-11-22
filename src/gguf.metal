@@ -207,6 +207,10 @@ struct RowParams {
     uint together;
     // Floats from one matrix's input to the next: 0 when they all take the same vector.
     uint x_stride;
+    // Floats from one token's inputs and outputs to the next, in a batch (the grid's third dimension), and
+    // whether each token has its own order.
+    uint token_stride;
+    uint own_order;
 };
 
 // Grid row `y` multiplies matrix `order[y]` of the stack, so the matrices can be chosen by an earlier kernel.
@@ -216,12 +220,15 @@ struct RowParams {
                      device float* out [[buffer(2)]],                                           \
                      const device uint* order [[buffer(3)]],                                    \
                      constant RowParams& p [[buffer(4)]],                                       \
-                     uint2 group [[threadgroup_position_in_grid]],                              \
+                     uint3 group [[threadgroup_position_in_grid]],                              \
                      ushort lane [[thread_index_in_threadgroup]]) {                             \
         uint lanes = 32 / p.together;                                                           \
         uint mine = lane / lanes;                                                               \
         uint r = group.x * p.together + mine;                                                   \
-        const device float* xs = x + group.y * p.x_stride;                                      \
+        uint shift = group.z * p.token_stride;                                                  \
+        const device float* xs = x + shift + group.y * p.x_stride;                              \
+        order += p.own_order != 0 ? shift : 0;                                                  \
+        out += shift;                                                                           \
         float sum = 0.0f;                                                                       \
         if (r < p.rows) {                                                                       \
             const device uchar* row = weights + ulong(order[group.y]) * p.stride + ulong(r) * (row_bytes); \

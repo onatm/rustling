@@ -622,9 +622,10 @@ impl Gpu {
         Ok(Kernels(names.iter().map(build).collect::<Result<_>>()?))
     }
 
-    /// Runs `steps` in order as one submission and waits for it. `keys` is how many keys a sliding layer and a
-    /// full layer see, for the grids that depend on it. Returns the seconds the GPU spent.
-    pub(crate) fn run(&self, kernels: &[&Kernels], steps: &[Step], buffers: &[Shared], keys: [usize; 2]) -> Result<f64> {
+    /// Runs `steps` in order as one submission and waits for it, every grid `tokens` deep. `keys` is how many
+    /// keys a sliding layer and a full layer see at most, for the grids that depend on it. Returns the seconds
+    /// the GPU spent.
+    pub(crate) fn run(&self, kernels: &[&Kernels], steps: &[Step], buffers: &[Shared], keys: [usize; 2], tokens: usize) -> Result<f64> {
         let pipelines: Vec<&Pipeline> = kernels.iter().flat_map(|kernels| &kernels.0).collect();
         let commands = self.queue.commandBuffer().context("creating a command buffer")?;
         let encoder = commands.computeCommandEncoder().context("creating a compute encoder")?;
@@ -642,7 +643,7 @@ impl Gpu {
                     encoder.setBytes_length_atIndex(pointer, step.params.len(), step.buffers.len());
                 }
             }
-            let size = |width: usize, height: usize| MTLSize { width, height, depth: 1 };
+            let size = |width: usize, height: usize| MTLSize { width, height, depth: tokens };
             match step.grid {
                 Grid::Threads(width, height) => encoder.dispatchThreads_threadsPerThreadgroup(size(width, height), wide),
                 Grid::Groups(width, height) => encoder.dispatchThreadgroups_threadsPerThreadgroup(size(width, height), wide),
@@ -755,9 +756,9 @@ mod tests {
         buffers[2].words_mut().copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
 
         for (count, rows) in [(300usize, 1usize), (3000, 1), (300, 2304)] {
-            let step = || Step { kernel: 4, buffers: vec![(0, 0), (0, 0), (1, 0), (2, 0)], params: word(&[rows, 64, 256, 1, 0]), grid: Grid::Groups(rows, 1) };
+            let step = || Step { kernel: 4, buffers: vec![(0, 0), (0, 0), (1, 0), (2, 0)], params: word(&[rows, 64, 256, 1, 0, 0, 0]), grid: Grid::Groups(rows, 1) };
             let steps: Vec<Step> = (0..count).map(|_| step()).collect();
-            let best = (0..3).map(|_| gpu.run(&[&kernels], &steps, &buffers, [0, 0]).unwrap()).fold(f64::MAX, f64::min);
+            let best = (0..3).map(|_| gpu.run(&[&kernels], &steps, &buffers, [0, 0], 1).unwrap()).fold(f64::MAX, f64::min);
             eprintln!("{count} dispatches of {rows} short rows: {:.2} ms ({:.1} us each)", best * 1e3, best * 1e6 / count as f64);
         }
 
@@ -804,11 +805,11 @@ mod tests {
                         .map(|(_, &(kernel, buffer, offset, rows, cols, stride, matrices))| Step {
                             kernel,
                             buffers: vec![(buffer, offset), (0, 0), (1, 0), (2, 0)],
-                            params: word(&[rows, cols, stride, together, cols]),
+                            params: word(&[rows, cols, stride, together, cols, 0, 0]),
                             grid: Grid::Groups(rows.div_ceil(together), matrices),
                         })
                         .collect();
-                    let best = (0..3).map(|_| gpu.run(&[&kernels], &steps, &buffers, [0, 0]).unwrap()).fold(f64::MAX, f64::min);
+                    let best = (0..3).map(|_| gpu.run(&[&kernels], &steps, &buffers, [0, 0], 1).unwrap()).fold(f64::MAX, f64::min);
                     format!("{:.1}", best * 1e3)
                 })
                 .collect();

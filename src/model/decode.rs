@@ -23,6 +23,8 @@ use crate::gpu::{Gpu, Grid, Kernels, Shared, Step};
 const SLACK: usize = 64;
 /// Tokens the full layers' tables hold at first; they double when a conversation outgrows them.
 const FIRST_CAPACITY: usize = 8192;
+/// The most tokens one submission takes: a token and as many proposals as can be taken back after it.
+pub(crate) const MAX_BATCH: usize = super::MAX_ROLLBACK + 1;
 
 // Buffers, by their place in the list.
 const SCRATCH: usize = 0;
@@ -67,14 +69,17 @@ fn row_kernel(format: Format) -> Result<usize> {
 enum Word {
     Count(usize),
     Real(f32),
+    /// Floats from one token's copy of the scratch layout to the next, known once the layout is complete.
+    TokenStride,
 }
 
-fn words(values: &[Word]) -> Vec<u8> {
+fn words(values: &[Word], token_stride: usize) -> Vec<u8> {
     values
         .iter()
         .flat_map(|word| match *word {
             Word::Count(count) => (count as u32).to_le_bytes(),
             Word::Real(real) => real.to_le_bytes(),
+            Word::TokenStride => (token_stride as u32).to_le_bytes(),
         })
         .collect()
 }
@@ -95,14 +100,14 @@ struct VisitSlots {
     local: bool,
 }
 
-/// What one token left behind.
-pub(crate) struct Token {
-    /// The final normed state.
+/// What a batch of tokens left behind.
+pub(crate) struct Tokens {
+    /// The final normed state of each token, one after another.
     pub last: Vec<f32>,
-    /// The hidden state entering each of the visits asked for.
+    /// For each of the visits asked for, the hidden state entering it for each token.
     pub taps: Vec<Vec<f32>>,
-    /// The soft-capped logits over the usable vocabulary.
-    pub logits: Vec<f32>,
+    /// Each token's soft-capped logits over the usable vocabulary.
+    pub logits: Vec<Vec<f32>>,
 }
 
 pub(crate) struct Decoder {
@@ -116,6 +121,8 @@ pub(crate) struct Decoder {
     /// Tokens the full layers' tables hold.
     capacity: usize,
     ring: usize,
+    /// Floats from one token's copy of the scratch layout to the next.
+    token_stride: usize,
     /// The state version the tables match, and how many tokens they hold of it.
     mirrored: Option<(u64, usize)>,
     /// Seconds the GPU spent on the last token.
@@ -126,7 +133,8 @@ pub(crate) struct Decoder {
 struct Builder<'m, 'a> {
     model: &'m Model<'a>,
     gpu: &'m Gpu,
-    steps: Vec<Step>,
+    /// The kernels so far, their parameters still to be packed.
+    steps: Vec<(usize, Vec<(usize, usize)>, Vec<Word>, Grid)>,
     constants: Vec<f32>,
     weights: Vec<Shared>,
     first_weight: usize,
@@ -159,8 +167,10 @@ impl<'m, 'a> Builder<'m, 'a> {
         Ok((self.first_weight + self.weights.len() - 1, offset))
     }
 
+    /// Appends a kernel. Every kernel's parameters end with the token stride.
     fn step(&mut self, kernel: usize, buffers: Vec<(usize, usize)>, params: &[Word], grid: Grid) {
-        self.steps.push(Step { kernel, buffers, params: words(params), grid });
+        let params = params.iter().copied().chain([Word::TokenStride]).collect();
+        self.steps.push((kernel, buffers, params, grid));
     }
 
     /// `matrices` products of a stack's matrices, chosen by `order`, with inputs `x_stride` floats apart.
@@ -185,9 +195,20 @@ impl<'m, 'a> Builder<'m, 'a> {
             work if work >= 1024 => 4,
             _ => 1,
         };
-        let params = [rows, cols, rows * row_bytes, together, x_stride].map(Word::Count);
+        // An order in the scratch buffer is each token's own.
+        let own_order = usize::from(order.0 == SCRATCH);
+        let params = [
+            Word::Count(rows),
+            Word::Count(cols),
+            Word::Count(rows * row_bytes),
+            Word::Count(together),
+            Word::Count(x_stride),
+            Word::TokenStride,
+            Word::Count(own_order),
+        ];
         let buffers = vec![weights, (SCRATCH, x * 4), (SCRATCH, out * 4), order];
-        self.step(row_kernel(format)?, buffers, &params, Grid::Groups(rows.div_ceil(together), matrices));
+        // Not through `step`: the stride is not last here.
+        self.steps.push((row_kernel(format)?, buffers, params.to_vec(), Grid::Groups(rows.div_ceil(together), matrices)));
         Ok(out)
     }
 
@@ -495,10 +516,15 @@ impl Decoder {
         builder.step(SOFT_CAP, vec![(SCRATCH, logits * 4)], &params, Grid::Threads(vocab, 1));
 
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let token_stride = builder.used;
+        let steps = std::mem::take(&mut builder.steps)
+            .into_iter()
+            .map(|(kernel, buffers, params, grid)| Step { kernel, buffers, params: words(&params, token_stride), grid })
+            .collect();
         let mut buffers = vec![
-            gpu.shared(builder.used * 4)?,
+            gpu.shared(MAX_BATCH * token_stride * 4)?,
             gpu.shared(builder.constants.len() * 4)?,
-            gpu.shared(cfg.num_attention_heads * capacity * 4)?,
+            gpu.shared(MAX_BATCH * cfg.num_attention_heads * capacity * 4)?,
         ];
         buffers[CONSTANTS].floats_mut()[..builder.constants.len()].copy_from_slice(&builder.constants);
         for visit in &builder.visits {
@@ -512,7 +538,7 @@ impl Decoder {
                 gpu.kernels(include_str!("../gguf.metal"), &ROW_KERNELS)?,
                 gpu.kernels(include_str!("../decode.metal"), &STEP_KERNELS)?,
             ],
-            steps: builder.steps,
+            steps,
             buffers,
             visits: builder.visits,
             embed,
@@ -520,6 +546,7 @@ impl Decoder {
             logits,
             capacity,
             ring,
+            token_stride,
             mirrored: None,
             gpu_seconds: 0.0,
         })
@@ -557,22 +584,29 @@ impl Decoder {
         }
     }
 
-    /// Runs one token and adds it to `state`.
-    pub(crate) fn token(&mut self, model: &Model, gpu: &Gpu, state: &mut State, embedded: &[f32], taps: &[usize]) -> Result<Token> {
+    /// Runs a batch of tokens, each seeing the ones before it, and adds them to `state`. `embedded` holds their
+    /// embeddings one after another.
+    pub(crate) fn tokens(&mut self, model: &Model, gpu: &Gpu, state: &mut State, embedded: &[f32], taps: &[usize]) -> Result<Tokens> {
         let cfg = &model.cfg;
-        let (h, k) = (cfg.hidden_size, cfg.sconv_kernel_size);
+        let (h, k, stride) = (cfg.hidden_size, cfg.sconv_kernel_size, self.token_stride);
+        let count = embedded.len() / h;
+        ensure!((1..=MAX_BATCH).contains(&count), "a batch of {count} tokens");
         let position = state.position;
-        if position >= self.capacity {
-            *self = Self::with_capacity(model, gpu, (position + 1).next_power_of_two().max(2 * self.capacity))?;
+        if position + count > self.capacity {
+            *self = Self::with_capacity(model, gpu, (position + count).next_power_of_two().max(2 * self.capacity))?;
         }
         self.mirror(model, state);
 
-        let tau = 1.0 + cfg.log_scaling_alpha * ((position + 1) as f32 / cfg.log_scaling_n_floor).max(1.0).ln();
         let scratch = &mut self.buffers[SCRATCH];
-        scratch.words_mut()[0] = position as u32;
+        for t in 0..count {
+            scratch.words_mut()[t * stride] = (position + t) as u32;
+            let floats = scratch.floats_mut();
+            floats[t * stride + 1] =
+                1.0 + cfg.log_scaling_alpha * ((position + t + 1) as f32 / cfg.log_scaling_n_floor).max(1.0).ln();
+            floats[t * stride + self.embed..][..h].copy_from_slice(&embedded[t * h..][..h]);
+        }
+        // What the convolutions saw before the batch, where the first token's copy of the layout expects it.
         let floats = scratch.floats_mut();
-        floats[1] = tau;
-        floats[self.embed..][..h].copy_from_slice(embedded);
         for (slots, visit) in self.visits.iter().zip(&state.visits) {
             for ((history, at), channels) in visit.convs.iter().zip(slots.histories).zip(visit.conv_channels) {
                 // The most recent inputs, ending where the kernel expects the latest.
@@ -581,26 +615,31 @@ impl Decoder {
             }
         }
 
-        let keys = [(position + 1).min(cfg.sliding_window_size), position + 1];
-        self.gpu_seconds = gpu.run(&[&self.kernels[0], &self.kernels[1]], &self.steps, &self.buffers, keys)?;
+        let end = position + count;
+        let keys = [end.min(cfg.sliding_window_size), end];
+        self.gpu_seconds = gpu.run(&[&self.kernels[0], &self.kernels[1]], &self.steps, &self.buffers, keys, count)?;
 
         let floats = self.buffers[SCRATCH].floats();
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
-        for (slots, visit) in self.visits.iter().zip(&mut state.visits) {
-            let conv_inputs: [&[f32]; 4] = std::array::from_fn(|c| &floats[slots.conv_inputs[c]..][..visit.conv_channels[c]]);
-            let (keys, values) = (&floats[slots.keys..][..kv_dim], &floats[slots.values..][..kv_dim]);
-            visit.push(cfg, slots.local, position, keys, values, conv_inputs);
+        for t in 0..count {
+            let mine = &floats[t * stride..][..stride];
+            for (slots, visit) in self.visits.iter().zip(&mut state.visits) {
+                let conv_inputs: [&[f32]; 4] = std::array::from_fn(|c| &mine[slots.conv_inputs[c]..][..visit.conv_channels[c]]);
+                let (keys, values) = (&mine[slots.keys..][..kv_dim], &mine[slots.values..][..kv_dim]);
+                visit.push(cfg, slots.local, position + t, keys, values, conv_inputs);
+            }
         }
-        state.position += 1;
-        // The tables hold this token already, so they match the state as it now is.
+        state.position = end;
+        // The tables hold these tokens already, so they match the state as it now is.
         let version = next_version();
-        state.track = super::Track { version, anchor: version, kept: state.position };
-        self.mirrored = Some((version, state.position));
+        state.track = super::Track { version, anchor: version, kept: end };
+        self.mirrored = Some((version, end));
 
-        Ok(Token {
-            last: floats[self.last..][..h].to_vec(),
-            taps: taps.iter().map(|&visit| floats[self.visits[visit].input..][..h].to_vec()).collect(),
-            logits: floats[self.logits..][..cfg.unpadded_vocab_size].to_vec(),
+        let of_each = |at: usize, len: usize| -> Vec<&[f32]> { (0..count).map(|t| &floats[t * stride + at..][..len]).collect() };
+        Ok(Tokens {
+            last: of_each(self.last, h).concat(),
+            taps: taps.iter().map(|&visit| of_each(self.visits[visit].input, h).concat()).collect(),
+            logits: of_each(self.logits, cfg.unpadded_vocab_size).into_iter().map(<[f32]>::to_vec).collect(),
         })
     }
 
@@ -625,7 +664,7 @@ impl Decoder {
             if steps.is_empty() {
                 continue;
             }
-            let run = || gpu.run(&[&self.kernels[0], &self.kernels[1]], &steps, &self.buffers, keys).unwrap();
+            let run = || gpu.run(&[&self.kernels[0], &self.kernels[1]], &steps, &self.buffers, keys, 1).unwrap();
             let best = (0..3).map(|_| run()).fold(f64::MAX, f64::min);
             profile.push((*name, steps.len(), best * 1e3));
         }
@@ -647,11 +686,58 @@ mod tests {
     use crate::config::Config;
     use crate::model::{Activations, Backend, FLOAT_REFERENCE, Options};
 
+    /// The float reference is a switch for the whole process, and the tests are heavy enough on the GPU that
+    /// their timings mean nothing side by side, so they take turns.
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn my_turn() -> std::sync::MutexGuard<'static, ()> {
+        TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A batch must give each of its tokens exactly what it gets alone after the ones before it: at the start
+    /// of a conversation, where the convolutions run out of history, and across the point where the sliding
+    /// layers' rings wrap. `cargo test --release --lib decode::tests::a_batch -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn a_batch_matches_tokens_one_at_a_time() {
+        let _turn = my_turn();
+        let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
+        let weights = Checkpoint::open(&path).unwrap();
+        let config = Config::load(&path).unwrap();
+        let options = Options { activations: Activations::Float, backend: Backend::MetalFast };
+        let model = Model::load(&config, &weights, options).unwrap();
+        let h = model.cfg.hidden_size;
+        let ids = |from: u32, count: u32| -> Vec<u32> { (from..from + count).map(|i| 500 + (i * 7919) % 50_000).collect() };
+        for (prompt, batches) in [(0u32, vec![2u32, 17, 5]), (1075, vec![17, 9, 17])] {
+            let (mut together, mut alone) = (model.new_state(), model.new_state());
+            for chunk in ids(0, prompt).chunks(275) {
+                model.forward(chunk, &mut together, false).unwrap();
+                model.forward(chunk, &mut alone, false).unwrap();
+            }
+            let mut from = prompt;
+            for count in batches {
+                let batch = ids(from, count);
+                from += count;
+                let started = std::time::Instant::now();
+                let all = model.forward(&batch, &mut together, false).unwrap();
+                let seconds = started.elapsed().as_secs_f64();
+                let logits = all.logits.expect("a batch from the GPU has logits");
+                for (t, &id) in batch.iter().enumerate() {
+                    let one = model.forward(&[id], &mut alone, false).unwrap();
+                    assert!(one.last[..] == all.last[t * h..][..h], "token {t} of a batch of {count} after {prompt} differs");
+                    assert!(one.logits.unwrap()[0] == logits[t], "logits of token {t} of a batch of {count} differ");
+                }
+                eprintln!("a batch of {count} at {}: {:.1} ms, {:.1} ms a token", from - count, seconds * 1e3, seconds * 1e3 / count as f64);
+            }
+        }
+    }
+
     /// Where a token's time goes with a long conversation behind it.
     /// `CONTEXT=15000 cargo test --release --lib decode::tests::profile -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn profile_at_long_context() {
+        let _turn = my_turn();
         let context: usize = std::env::var("CONTEXT").ok().and_then(|v| v.parse().ok()).unwrap_or(15_000);
         let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
@@ -677,6 +763,7 @@ mod tests {
     #[test]
     #[ignore]
     fn keeps_its_tables_in_step_with_the_state() {
+        let _turn = my_turn();
         let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M".to_owned());
         let path = resolve_model(Some(std::path::Path::new(&named))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
@@ -700,10 +787,10 @@ mod tests {
         let mut single = |state: &mut State, id: u32, what: &str| {
             let mut copy = state.clone();
             refilled.forget();
-            let expected = refilled.token(&model, gpu, &mut copy, &model.embed(id).unwrap(), &[]).unwrap();
+            let expected = refilled.tokens(&model, gpu, &mut copy, &model.embed(id).unwrap(), &[]).unwrap();
             let actual = model.forward(&[id], state, false).unwrap();
             assert!(actual.last == expected.last, "{what}: the token differs from one computed on refilled tables");
-            assert!(actual.logits.as_deref() == Some(&expected.logits[..]), "{what}: logits differ");
+            assert!(actual.logits == Some(expected.logits), "{what}: logits differ");
             checked += 1;
         };
 
@@ -747,6 +834,7 @@ mod tests {
     #[test]
     #[ignore]
     fn matches_the_cpu_in_floats() {
+        let _turn = my_turn();
         let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M".to_owned());
         let path = resolve_model(Some(std::path::Path::new(&named))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
@@ -767,9 +855,9 @@ mod tests {
         for (t, &id) in ids.iter().enumerate() {
             let expected = model.forward(&[id], &mut on_cpu, true).unwrap();
             let started = std::time::Instant::now();
-            let token = decoder.token(&model, gpu, &mut on_gpu, &model.embed(id).unwrap(), &[]).unwrap();
+            let token = decoder.tokens(&model, gpu, &mut on_gpu, &model.embed(id).unwrap(), &[]).unwrap();
             let last = token.last;
-            let logits_apart = apart(&token.logits, &model.logits(&expected.last).unwrap());
+            let logits_apart = apart(&token.logits[0], &model.logits(&expected.last).unwrap());
             let seconds = started.elapsed().as_secs_f64();
             let visits = decoder.visit_outputs(h);
             let by_visit: Vec<f64> = visits.iter().zip(&expected.hidden).map(|(a, b)| apart(a, b)).collect();

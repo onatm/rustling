@@ -524,7 +524,10 @@ fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, top: bool, t
     }
     let drafting = session.drafting();
     if drafting.copied_proposed > 0 {
-        eprintln!("copied: {} of {} proposed tokens accepted", drafting.copied_accepted, drafting.copied_proposed);
+        eprintln!(
+            "copied: {} of {} proposed tokens accepted in {} rounds",
+            drafting.copied_accepted, drafting.copied_proposed, drafting.copied_rounds
+        );
     }
     if draft.is_some() {
         eprintln!(

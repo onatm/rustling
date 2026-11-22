@@ -4,7 +4,9 @@
 // submission, with nothing handed back to the CPU in between.
 //
 // Vectors live in one scratch buffer and constants in another; a kernel is given each of its operands as a
-// buffer binding at the operand's offset. Kernels that need a sum over a vector run a group of 32 threads to a
+// buffer binding at the operand's offset. Several tokens run at once as a batch: each has its own copy of the
+// scratch layout, `token_stride` floats after the one before, and the grid's third dimension says which token a
+// thread works for. Kernels that need a sum over a vector run a group of 32 threads to a
 // vector, each thread taking every 32nd element.
 
 #include <metal_stdlib>
@@ -18,12 +20,18 @@ struct Token {
     float tau;
 };
 
+// The token a thread works for: `which` tokens on from the one bound.
+static inline const device Token* token_at(const device Token* first, uint which, uint token_stride) {
+    return (const device Token*)((const device float*)first + which * token_stride);
+}
+
 struct NormParams {
     uint n;
     uint weighted;
     float eps;
     // Groups of 32 threads to a vector.
     uint width;
+    uint token_stride;
 };
 
 // out = in * weight / sqrt(mean(in^2) + eps), for each vector of `n`. One group of `32 * width` threads per
@@ -33,12 +41,13 @@ kernel void rms_norm(const device float* in [[buffer(0)]],
                      device float* out [[buffer(1)]],
                      const device float* weight [[buffer(2)]],
                      constant NormParams& p [[buffer(3)]],
-                     uint2 group [[threadgroup_position_in_grid]],
+                     uint3 group [[threadgroup_position_in_grid]],
                      uint lane [[thread_index_in_threadgroup]],
                      ushort simd_lane [[thread_index_in_simdgroup]],
                      ushort simd_group [[simdgroup_index_in_threadgroup]]) {
     threadgroup float partial[32];
-    const device packed_float4* x = (const device packed_float4*)(in + group.x * p.n);
+    uint shift = group.z * p.token_stride;
+    const device packed_float4* x = (const device packed_float4*)(in + shift + group.x * p.n);
     uint threads = 32 * p.width;
     float4 squares = 0.0f;
     for (uint i = lane; i < p.n / 4; i += threads) squares += float4(x[i]) * float4(x[i]);
@@ -48,7 +57,7 @@ kernel void rms_norm(const device float* in [[buffer(0)]],
     float total = 0.0f;
     for (uint g = 0; g < p.width; g++) total += partial[g];
     float scale = 1.0f / sqrt(total / float(p.n) + p.eps);
-    device packed_float4* to = (device packed_float4*)(out + group.x * p.n);
+    device packed_float4* to = (device packed_float4*)(out + shift + group.x * p.n);
     const device packed_float4* w = (const device packed_float4*)weight;
     for (uint i = lane; i < p.n / 4; i += threads) {
         to[i] = float4(x[i]) * scale * (p.weighted != 0 ? float4(w[i]) : float4(1.0f));
@@ -60,6 +69,7 @@ struct ClipParams {
     uint scaled;
     float threshold;
     uint long_range;
+    uint token_stride;
 };
 
 // Each vector of `n`: times a learned scale, shrunk to the threshold when its length exceeds it, then times the
@@ -69,18 +79,20 @@ kernel void scale_clip(const device float* in [[buffer(0)]],
                        const device float* scale [[buffer(2)]],
                        const device Token* token [[buffer(3)]],
                        constant ClipParams& p [[buffer(4)]],
-                       uint2 group [[threadgroup_position_in_grid]],
+                       uint3 group [[threadgroup_position_in_grid]],
                        ushort lane [[thread_index_in_threadgroup]]) {
     uint base = group.x * p.n;
+    uint shifted = group.z * p.token_stride + base;
     float sum = 0.0f;
     for (uint i = lane; i < p.n; i += 32) {
-        float v = in[base + i] * (p.scaled != 0 ? scale[base + i] : 1.0f);
+        float v = in[shifted + i] * (p.scaled != 0 ? scale[base + i] : 1.0f);
         sum += v * v;
     }
     float norm = sqrt(simd_sum(sum));
-    float factor = min(p.threshold / (norm + 1e-6f), 1.0f) * (p.long_range != 0 ? token->tau : 1.0f);
+    float tau = token_at(token, group.z, p.token_stride)->tau;
+    float factor = min(p.threshold / (norm + 1e-6f), 1.0f) * (p.long_range != 0 ? tau : 1.0f);
     for (uint i = lane; i < p.n; i += 32) {
-        out[base + i] = in[base + i] * (p.scaled != 0 ? scale[base + i] : 1.0f) * factor;
+        out[shifted + i] = in[shifted + i] * (p.scaled != 0 ? scale[base + i] : 1.0f) * factor;
     }
 }
 
@@ -90,6 +102,7 @@ struct ReadParams {
     float eps;
     // Groups of 32 threads to a query.
     uint width;
+    uint token_stride;
 };
 
 static inline float4 block_values(uint which, uint i, const device packed_float4* b0, const device packed_float4* b1,
@@ -120,13 +133,21 @@ kernel void residual_read(const device float* queries [[buffer(0)]],
                           const device packed_float4* b3 [[buffer(6)]],
                           const device packed_float4* b4 [[buffer(7)]],
                           constant ReadParams& p [[buffer(8)]],
-                          uint2 group [[threadgroup_position_in_grid]],
+                          uint3 group [[threadgroup_position_in_grid]],
                           uint lane [[thread_index_in_threadgroup]],
                           ushort simd_lane [[thread_index_in_simdgroup]],
                           ushort simd_group [[simdgroup_index_in_threadgroup]]) {
     // Per group of 32 threads: the square of the block in progress, then the query's product with it and with
     // each finished block.
     threadgroup float partials[32 * 7];
+    // In four-float steps, as the blocks are bound.
+    uint shift = group.z * p.token_stride / 4;
+    partial += shift;
+    b0 += shift;
+    b1 += shift;
+    b2 += shift;
+    b3 += shift;
+    b4 += shift;
     const device packed_float4* query = (const device packed_float4*)(queries + group.x * p.h);
     uint threads = 32 * p.width;
     float4 square = 0.0f, current = 0.0f;
@@ -163,7 +184,7 @@ kernel void residual_read(const device float* queries [[buffer(0)]],
         logits[s] = exp(logits[s] - highest);
         total += logits[s];
     }
-    device packed_float4* to = (device packed_float4*)(out + group.x * p.h);
+    device packed_float4* to = (device packed_float4*)(out + group.z * p.token_stride + group.x * p.h);
     for (uint i = lane; i < p.h / 4; i += threads) {
         float4 value = logits[p.blocks] / total * normed * float4(partial[i]);
         for (uint s = 0; s < p.blocks; s++) value += logits[s] / total * block_values(s, i, b0, b1, b2, b3, b4);
@@ -177,7 +198,9 @@ kernel void merge(const device float* hidden [[buffer(0)]],
                   const device float* forget [[buffer(2)]],
                   const device float* gain [[buffer(3)]],
                   device float* out [[buffer(4)]],
-                  uint i [[thread_position_in_grid]]) {
+                  constant uint& token_stride [[buffer(5)]],
+                  uint3 id [[thread_position_in_grid]]) {
+    uint i = id.z * token_stride + id.x;
     out[i] = (1.0f - tanh(forget[i])) * hidden[i] + tanh(gain[i]) * message[i];
 }
 
@@ -189,12 +212,14 @@ struct ConvParams {
     uint dynamic;
     float scale;
     uint add;
+    uint token_stride;
 };
 
 // The short causal convolution with its residual: (sum over taps + x) * scale, plus `residual` when asked.
-// `history` holds the inputs of the `kernel_size - 1` tokens before, oldest first. The static form's weights
-// are [channel][tap] with the last tap on the current token; the dynamic form's are [lag][channel] plus a tap
-// per head and lag computed from the token.
+// A token's earlier inputs are those of the batch's tokens before it and then `history`, which holds the inputs
+// of the `kernel_size - 1` tokens before the batch, oldest first. The static form's weights are [channel][tap]
+// with the last tap on the current token; the dynamic form's are [lag][channel] plus a tap per head and lag
+// computed from the token.
 kernel void conv(const device float* x [[buffer(0)]],
                  const device float* history [[buffer(1)]],
                  const device float* weight [[buffer(2)]],
@@ -203,24 +228,28 @@ kernel void conv(const device float* x [[buffer(0)]],
                  device float* out [[buffer(5)]],
                  const device Token* token [[buffer(6)]],
                  constant ConvParams& p [[buffer(7)]],
-                 uint c [[thread_position_in_grid]]) {
+                 uint3 id [[thread_position_in_grid]]) {
+    uint c = id.x;
     if (c >= p.channels) return;
     uint k = p.kernel_size;
-    uint reach = min(k - 1, token->position);
+    uint shift = id.z * p.token_stride;
+    uint reach = min(k - 1, token_at(token, id.z, p.token_stride)->position);
+    float current = x[shift + c];
     float sum = 0.0f;
     for (uint lag = 0; lag <= reach; lag++) {
-        float past = lag == 0 ? x[c] : history[(k - 1 - lag) * p.channels + c];
-        float tap = p.dynamic != 0 ? weight[lag * p.channels + c] + taps[(c / p.head_dim) * k + lag]
+        float past = lag <= id.z ? x[shift - lag * p.token_stride + c] : history[(k - 1 - (lag - id.z)) * p.channels + c];
+        float tap = p.dynamic != 0 ? weight[lag * p.channels + c] + taps[shift + (c / p.head_dim) * k + lag]
                                    : weight[c * k + (k - 1 - lag)];
         sum += tap * past;
     }
-    float value = (sum + x[c]) * p.scale;
-    out[c] = p.add != 0 ? residual[c] + value : value;
+    float value = (sum + current) * p.scale;
+    out[shift + c] = p.add != 0 ? residual[shift + c] + value : value;
 }
 
 struct BiasParams {
     uint d_rel;
     uint extent;
+    uint token_stride;
 };
 
 // The attention bias of each head at each distance back: its relative state through the distance profiles.
@@ -229,11 +258,12 @@ kernel void distance_bias(const device float* rel [[buffer(0)]],
                           const device float* profiles [[buffer(1)]],
                           device float* bias [[buffer(2)]],
                           constant BiasParams& p [[buffer(3)]],
-                          uint2 id [[thread_position_in_grid]]) {
+                          uint3 id [[thread_position_in_grid]]) {
     if (id.x >= p.extent) return;
+    uint shift = id.z * p.token_stride;
     float sum = 0.0f;
-    for (uint r = 0; r < p.d_rel; r++) sum += rel[id.y * p.d_rel + r] * profiles[r * p.extent + id.x];
-    bias[id.y * p.extent + id.x] = sum;
+    for (uint r = 0; r < p.d_rel; r++) sum += rel[shift + id.y * p.d_rel + r] * profiles[r * p.extent + id.x];
+    bias[shift + id.y * p.extent + id.x] = sum;
 }
 
 struct AttentionParams {
@@ -253,6 +283,7 @@ struct AttentionParams {
     uint width;
     // Groups of 32 threads to sixteen dimensions of a head when summing values.
     uint value_width;
+    uint token_stride;
 };
 
 static inline uint keys_seen(const device Token* token, constant AttentionParams& p) {
@@ -280,7 +311,12 @@ kernel void attention_scores(const device float* queries [[buffer(0)]],
                              device float* scores [[buffer(3)]],
                              const device Token* token [[buffer(4)]],
                              constant AttentionParams& p [[buffer(5)]],
-                             uint2 id [[thread_position_in_grid]]) {
+                             uint3 id [[thread_position_in_grid]]) {
+    token = token_at(token, id.z, p.token_stride);
+    uint shift = id.z * p.token_stride;
+    queries += shift;
+    bias += shift;
+    scores += id.z * p.heads * p.stride;
     uint seen = keys_seen(token, p);
     if (id.x >= seen) return;
     const device packed_float4* key =
@@ -306,16 +342,17 @@ kernel void attention_weights(device float* scores [[buffer(0)]],
                               const device float* sinks [[buffer(1)]],
                               const device Token* token [[buffer(2)]],
                               constant AttentionParams& p [[buffer(3)]],
-                              uint2 group [[threadgroup_position_in_grid]],
+                              uint3 group [[threadgroup_position_in_grid]],
                               uint lane [[thread_index_in_threadgroup]],
                               ushort simd_lane [[thread_index_in_simdgroup]],
                               ushort simd_group [[simdgroup_index_in_threadgroup]]) {
     threadgroup float highs[32];
     threadgroup float sums[32];
+    token = token_at(token, group.z, p.token_stride);
     uint seen = keys_seen(token, p);
     uint threads = 32 * p.width;
-    device float* mine = scores + group.x * p.stride;
-    float sink = sinks[group.x];
+    device float* mine = scores + (group.z * p.heads + group.x) * p.stride;
+    float sink = sinks[group.z * p.token_stride + group.x];
     float highest = sink;
     for (uint j = lane; j < seen; j += threads) highest = max(highest, mine[j]);
     highest = simd_max(highest);
@@ -345,11 +382,15 @@ kernel void attention_values(const device float* weights [[buffer(0)]],
                              device float* out [[buffer(3)]],
                              const device Token* token [[buffer(4)]],
                              constant AttentionParams& p [[buffer(5)]],
-                             uint2 group [[threadgroup_position_in_grid]],
+                             uint3 group [[threadgroup_position_in_grid]],
                              uint lane [[thread_index_in_threadgroup]],
                              ushort simd_lane [[thread_index_in_simdgroup]],
                              ushort simd_group [[simdgroup_index_in_threadgroup]]) {
     threadgroup float partial[32 * 16];
+    token = token_at(token, group.z, p.token_stride);
+    weights += group.z * p.heads * p.stride;
+    gate += group.z * p.token_stride;
+    out += group.z * p.token_stride;
     uint seen = keys_seen(token, p);
     uint oldest = oldest_row(seen, token, p);
     uint sixteenths = p.dim / 16;
@@ -382,6 +423,7 @@ struct StoreParams {
     uint n;
     uint local;
     uint ring;
+    uint token_stride;
 };
 
 // Files this token's keys or values in the layer's table.
@@ -389,16 +431,19 @@ kernel void store(const device float* from [[buffer(0)]],
                   device float* table [[buffer(1)]],
                   const device Token* token [[buffer(2)]],
                   constant StoreParams& p [[buffer(3)]],
-                  uint i [[thread_position_in_grid]]) {
+                  uint3 id [[thread_position_in_grid]]) {
+    uint i = id.x;
     if (i >= p.n) return;
-    uint slot = p.local != 0 ? token->position % p.ring : token->position;
-    table[slot * p.n + i] = from[i];
+    uint position = token_at(token, id.z, p.token_stride)->position;
+    uint slot = p.local != 0 ? position % p.ring : position;
+    table[slot * p.n + i] = from[id.z * p.token_stride + i];
 }
 
 struct RouteParams {
     uint experts;
     uint chosen;
     float scale;
+    uint token_stride;
 };
 
 // Picks the experts: the highest sigmoid score plus bias, weighted by their scores' share. One group with a
@@ -408,11 +453,16 @@ kernel void route(const device float* logits [[buffer(0)]],
                   device uint* order [[buffer(2)]],
                   device float* weight [[buffer(3)]],
                   constant RouteParams& p [[buffer(4)]],
+                  uint3 group [[threadgroup_position_in_grid]],
                   uint lane [[thread_index_in_threadgroup]],
                   ushort simd_lane [[thread_index_in_simdgroup]],
                   ushort simd_group [[simdgroup_index_in_threadgroup]]) {
     threadgroup float ranked[256];
     threadgroup float partial[8];
+    uint shift = group.z * p.token_stride;
+    logits += shift;
+    order += shift;
+    weight += shift;
     bool real = lane < p.experts;
     float score = real ? 1.0f / (1.0f + exp(-logits[lane])) : 0.0f;
     if (real) ranked[lane] = score + bias[lane];
@@ -442,6 +492,7 @@ struct ActivationParams {
     uint units;
     float gate_cap;
     float up_cap;
+    uint token_stride;
 };
 
 // The experts' activation: softcap(gate) * sigmoid(gate) * softcap(up). Each expert's products hold its gate
@@ -449,8 +500,10 @@ struct ActivationParams {
 kernel void activation(const device float* products [[buffer(0)]],
                        device float* out [[buffer(1)]],
                        constant ActivationParams& p [[buffer(2)]],
-                       uint2 id [[thread_position_in_grid]]) {
+                       uint3 id [[thread_position_in_grid]]) {
     if (id.x >= p.units) return;
+    products += id.z * p.token_stride;
+    out += id.z * p.token_stride;
     float gate = products[id.y * 2 * p.units + id.x];
     float up = products[id.y * 2 * p.units + p.units + id.x];
     out[id.y * p.units + id.x] =
@@ -460,6 +513,7 @@ kernel void activation(const device float* products [[buffer(0)]],
 struct CombineParams {
     uint n;
     uint count;
+    uint token_stride;
 };
 
 // The chosen experts' outputs summed with their routing weights.
@@ -467,22 +521,26 @@ kernel void combine(const device float* outputs [[buffer(0)]],
                     const device float* weight [[buffer(1)]],
                     device float* out [[buffer(2)]],
                     constant CombineParams& p [[buffer(3)]],
-                    uint i [[thread_position_in_grid]]) {
+                    uint3 id [[thread_position_in_grid]]) {
+    uint i = id.x;
     if (i >= p.n) return;
+    uint shift = id.z * p.token_stride;
     float sum = 0.0f;
-    for (uint e = 0; e < p.count; e++) sum += weight[e] * outputs[e * p.n + i];
-    out[i] = sum;
+    for (uint e = 0; e < p.count; e++) sum += weight[shift + e] * outputs[shift + e * p.n + i];
+    out[shift + i] = sum;
 }
 
 struct CapParams {
     uint n;
     float cap;
+    uint token_stride;
 };
 
 // Logits squashed into (-cap, cap).
 kernel void soft_cap(device float* values [[buffer(0)]],
                      constant CapParams& p [[buffer(1)]],
-                     uint i [[thread_position_in_grid]]) {
-    if (i >= p.n) return;
+                     uint3 id [[thread_position_in_grid]]) {
+    if (id.x >= p.n) return;
+    uint i = id.z * p.token_stride + id.x;
     values[i] = tanh(values[i] / p.cap) * p.cap;
 }
