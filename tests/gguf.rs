@@ -48,6 +48,46 @@ fn a_gguf_conversion_predicts_what_the_checkpoint_does() {
     assert!(share > 0.7, "only {agree} of {} predictions agree", ids.len());
 }
 
+/// The fast path on a GGUF file gives the GPU float inputs where the CPU rounds them to bytes, and sums in another
+/// order, so the two differ; they must still predict the same tokens nearly everywhere.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_fast_path_tracks_the_cpu_on_a_gguf_file() {
+    let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| DEFAULT_GGUF.to_owned());
+    let Ok(path) = resolve_model(Some(Path::new(&named))) else {
+        eprintln!("skipping: needs {named}");
+        return;
+    };
+    let (Ok(weights), Ok(config), Ok(prompter)) = (Checkpoint::open(&path), Config::load(&path), Prompter::load(&path)) else {
+        eprintln!("skipping: weights or companion files not found");
+        return;
+    };
+    let prose = "Rivers shape the land they cross. A young river runs fast and cuts a narrow valley; further down it slows, widens and drops the sand and silt it carried, building plains that people have farmed for thousands of years. Towns grew where rivers could be forded or bridged, and many of the oldest roads follow them. A river is also a boundary, a source of power for mills and turbines, and a route for moving heavy goods cheaply. ";
+    let ids = prompter.encode(&format!("<|message_user|><|content_text|>{}<|end_message|>", prose.repeat(4))).unwrap();
+    assert!(ids.len() >= 256, "{} tokens", ids.len());
+    let hidden = config.text_config.hidden_size;
+    let load = |backend| Model::load(&config, &weights, Options { activations: Activations::Float, backend });
+    let Ok(fast) = load(Backend::MetalFast) else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let exact = load(Backend::Cpu).unwrap();
+    let on_fast = fast.forward(&ids, &mut fast.new_state(), false).unwrap().last;
+    let on_exact = exact.forward(&ids, &mut exact.new_state(), false).unwrap().last;
+    assert!(on_fast.iter().all(|v| v.is_finite()));
+    let argmax = |l: Vec<f32>| (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap();
+    let sampled: Vec<usize> = (0..ids.len()).step_by(ids.len() / 24).collect();
+    let agree = sampled
+        .iter()
+        .filter(|&&t| {
+            let (a, b) = (&on_fast[t * hidden..][..hidden], &on_exact[t * hidden..][..hidden]);
+            argmax(fast.logits(a).unwrap()) == argmax(exact.logits(b).unwrap())
+        })
+        .count();
+    eprintln!("fast against CPU over {} tokens: top-1 agreement {agree}/{}", ids.len(), sampled.len());
+    assert!(agree * 4 >= sampled.len() * 3, "top-1 agreement {agree}/{}", sampled.len());
+}
+
 /// How fast the cores can read weights at all, which bounds generation: every token streams most of the file.
 /// `cargo test --release --test gguf bandwidth -- --ignored --nocapture`.
 #[test]

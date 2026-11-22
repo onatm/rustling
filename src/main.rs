@@ -454,6 +454,10 @@ fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, top: bool, t
     let prompt_seconds = started.elapsed().as_secs_f32();
     if timing {
         print_stage_times("prompt");
+        let redone = rustling::model::GPU_EXPERTS_REDONE.load(std::sync::atomic::Ordering::Relaxed);
+        if redone > 0 {
+            eprintln!("{redone} experts were recomputed on the CPU after the GPU returned NaN");
+        }
     }
 
     let started = Instant::now();

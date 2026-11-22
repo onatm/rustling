@@ -133,6 +133,17 @@ impl PromptCache {
     /// Brings `session` to exactly `prompt`, reusing whatever is on hand, and takes the snapshots the plan calls
     /// for along the way. Returns how many of the prompt's tokens did not need processing.
     pub fn prepare(&mut self, session: &mut Session, prompt: &[u32], header: Option<usize>) -> Result<usize> {
+        self.prepare_watched(session, prompt, header, &mut |_| true)
+    }
+
+    /// [`PromptCache::prepare`], with `progress` as in [`Session::set_context_watched`].
+    pub fn prepare_watched(
+        &mut self,
+        session: &mut Session,
+        prompt: &[u32],
+        header: Option<usize>,
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<usize> {
         let tokens: Vec<&[u32]> = self.entries.iter().map(|entry| entry.snapshot.tokens()).collect();
         let plan = plan(&tokens, session.context(), prompt, header);
 
@@ -161,10 +172,10 @@ impl PromptCache {
             }
         }
         for &boundary in &plan.boundaries {
-            session.set_context(&prompt[..boundary])?;
+            session.set_context_watched(&prompt[..boundary], progress)?;
             self.insert(session.snapshot(), false);
         }
-        session.set_context(prompt)?;
+        session.set_context_watched(prompt, progress)?;
         Ok(plan.start)
     }
 

@@ -16,7 +16,7 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | NEON kernels that multiply straight from NVFP4, MXFP8 and bfloat16 weights (`src/quant.rs`) | done |
 | Batched prompt processing: tokens share each pass over the weights, with results independent of batching | done; about 30 tokens/s for a 561-token prompt |
 | Metal backend for large batches, bit-identical to the CPU (`src/gpu.rs`, `src/shaders.metal`) | done and the default; a 2,114-token prompt in 56 s against 80 s on the CPU |
-| Fast Metal path for prompts of 256 tokens or more, not bit-identical | done, opt-in with `--backend metal-fast`; the same prompt in about 38 s |
+| Fast path for prompts of 256 tokens or more, not bit-identical: tuned matrix products on the GPU and for attention | done, opt-in with `--backend metal-fast`; a 2,413-token prompt in 35 s against 85 s on the CPU, and in 24 s against 50 s for a Q4_K_M conversion |
 | Sampler: temperature, top-k, top-p, seed (`src/sampler.rs`) | done |
 | Multi-turn chat that reuses the conversation's state, with a stop on repeating output (`src/session.rs`) | done |
 | OpenAI-compatible HTTP server: chat completions, streaming, tool calls (`src/server.rs`) | done |
@@ -24,7 +24,7 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | DSpark draft model: proposes several tokens at a time for the main model to check (`src/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, and it rests where it would slow things down |
 | Quantised expert activations with an integer dot-product kernel, as the model was trained | done and the default; about 10 tokens/s. `--activations float` gives the transformers arithmetic |
 | Variable-loop checkpoint with a chosen pass count (`--passes`) | done; 16 tokens/s at 1 pass, 12 at 2, 9 at 3 |
-| GGUF conversions (Q4_K, Q5_0, Q6_K, Q8_0 blocks), multiplied in integer arithmetic (`src/ggml.rs`) | done, CPU only; Q4_K_M at about 15 tokens/s against 10 for the checkpoint |
+| GGUF conversions (Q4_K, Q5_0, Q6_K, Q8_0 blocks), multiplied in integer arithmetic (`src/ggml.rs`) | done; Q4_K_M at about 15 tokens/s against 10 for the checkpoint. The GPU only on the fast path |
 | Context window limit (`--context`) | done |
 | Metal for single-token generation | measured and set aside: per-dispatch overhead eats the gain |
 | Vision tower | later |
@@ -51,13 +51,20 @@ cargo run --release -- generate "Hello" --backend cpu   # default is auto: Metal
 | `--backend` | Long prompts (256+ tokens) | Results |
 |---|---|---|
 | `auto` (default), `metal` | GPU kernels that repeat the CPU's arithmetic step for step | identical to the CPU's |
-| `metal-fast` | weights widened to float on the GPU, then Apple's tuned matrix product | differ from the CPU's in the last bits |
+| `metal-fast` | weights widened to float on the GPU, then Apple's tuned matrix product; attention by the same kind of product on the CPU | differ from the CPU's in the last bits |
 | `cpu` | NEON kernels | the reference |
 
 Shorter batches and token-by-token generation use the exact kernels on every backend.
 
-What "differ in the last bits" leads to depends on `--activations`. With `float` nothing amplifies the
-difference and the fast path agrees with the exact one to four decimal places. With `quantised` (the default,
+The fast path takes a long prompt 2,048 tokens at a time. On an M1 Max a 2,413-token prompt took 35 s with the
+checkpoint (85 s on the CPU) and 24 s with a Q4_K_M conversion (50 s); the gain grows with the context, because
+attention is what grows. Through the server, opencode's opening request of 11,977 tokens took 126 s on Q4_K_M,
+where 10,407 tokens had taken 345 s on the CPU.
+
+What "differ in the last bits" leads to depends on `--activations`. With `float` the hidden states end up a
+percent or two apart and predict the same tokens (25 of 25 on a prose test): attention scores are sums of large
+terms that mostly cancel, so another order of summing moves them in the fifth digit, and now and then that tips
+which experts a token is routed to. With `quantised` (the default,
 and how the model was trained) the model is chaotic in this respect: a last-bit difference flips a few 4-bit
 activation codes, each flip is a large change, and over 48 layer visits the hidden states drift about a quarter
 of their size apart while still predicting mostly the same tokens (22 of 25 on a prose test). That is a property
@@ -87,8 +94,12 @@ rustling --model ~/models/Inkling-2-Mini-Q4_K_M.gguf serve
   product is taken in integers, as ggml does on a CPU. Results do not depend on batching.
 - **Accuracy**: a conversion is a lossy copy. On a passage of prose, Q4_K_M and the checkpoint agreed on the most
   likely next token at 80% of positions (`tests/gguf.rs`); the 8-bit rounding did not change that figure.
-- **Not available with GGUF**: the Metal backend, and `--activations` (the experts are no longer in the formats
-  the model's activations were trained against).
+- **Long prompts**: `--backend metal-fast` works with GGUF files too. The GPU unpacks the blocks to float for the
+  attention projections and for the experts with the most tokens, while the CPU does the remaining experts in
+  integers. Its inputs are not rounded to 8 bits, so it differs from the CPU a little more than in the last
+  bits; on a prose test the two predicted the same token at 23 of 25 positions.
+- **Not available with GGUF**: the exact Metal backend (`auto` and `cpu` are the same thing), and `--activations`
+  (the experts are no longer in the formats the model's activations were trained against).
 
 ## Context window
 
@@ -159,6 +170,10 @@ It serves `POST /v1/chat/completions`, `GET /v1/models` and `GET /health`. Reque
 sampling flags are the defaults. Reasoning comes back as `reasoning_content`.
 
 One request runs at a time and the rest queue. Text input only.
+
+Each request is logged: its size, how much of the prompt was reused and how long the rest took (with progress
+every few seconds for a long one), and the reply's length and speed. A prompt is processed in chunks, and a
+client that goes away while it is being processed stops it; what was processed is kept for the next request.
 
 Before it accepts requests the server reads the whole weight file and runs one token through the model, so the
 first request is not the one that waits for the disk.

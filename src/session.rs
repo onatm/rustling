@@ -44,6 +44,9 @@ impl Snapshot {
     }
 }
 
+/// The error from [`Session::set_context_watched`] when its caller gave up.
+pub const ABANDONED: &str = "prompt processing was abandoned";
+
 /// How the draft model has fared so far in a session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Drafting {
@@ -221,6 +224,13 @@ impl<'m, 'a> Session<'m, 'a> {
     /// Makes the context exactly `ids`. When `ids` extends the current context only the new tokens are processed;
     /// otherwise everything is recomputed. Returns how many tokens were reused.
     pub fn set_context(&mut self, ids: &[u32]) -> Result<usize> {
+        self.set_context_watched(ids, &mut |_| true)
+    }
+
+    /// [`Session::set_context`], calling `progress` with the size of the context after each chunk of a long
+    /// prompt. Returning `false` from it abandons the rest with an error; the context then holds what was
+    /// processed so far, which is a valid place to continue from.
+    pub fn set_context_watched(&mut self, ids: &[u32], progress: &mut dyn FnMut(usize) -> bool) -> Result<usize> {
         anyhow::ensure!(
             ids.len() < self.window,
             "the prompt is {} tokens, which leaves no room in a context window of {}",
@@ -239,7 +249,12 @@ impl<'m, 'a> Session<'m, 'a> {
                 0
             }
         };
-        self.extend(&ids[reused..])?;
+        // In chunks, which on the exact paths give the same states as one pass: memory stays bounded, and the
+        // caller hears of progress and can give up.
+        for chunk in ids[reused..].chunks(self.model.prompt_chunk()) {
+            self.extend(chunk)?;
+            ensure!(progress(self.context.len()) || self.context.len() == ids.len(), "{ABANDONED}");
+        }
         Ok(reused)
     }
 

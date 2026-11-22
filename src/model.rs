@@ -16,7 +16,7 @@ use crate::accel;
 use crate::checkpoint::{Checkpoint, ExpertMatrix, Experts};
 use crate::config::{Config, TextConfig};
 #[cfg(target_os = "macos")]
-use crate::gpu::{DenseJob, ExpertJob, Gpu};
+use crate::gpu::{DenseJob, ExpertJob, Gpu, Stack};
 use crate::timing::{self, Stage, time};
 use crate::trace;
 use crate::quant::{
@@ -41,6 +41,27 @@ const GPU_MIN_TOKENS: usize = 32;
 #[cfg(target_os = "macos")]
 const GPU_EXPERT_SHARE: f32 = 0.5;
 
+/// The fraction of a GGUF expert layer's work given to the GPU on the fast path, the CPU doing the rest at the
+/// same time. Measured on an M1 Max: the two get in each other's way, so the GPU alone is nearly as fast, and
+/// this split is a little faster still.
+#[cfg(target_os = "macos")]
+const GPU_FAST_EXPERT_SHARE: f32 = 0.75;
+
+/// How many experts' GPU results had to be recomputed on the CPU, for the timing report.
+pub static GPU_EXPERTS_REDONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Prompt tokens per pass on the fast path. Unpacking the weights for the GPU costs the same however many tokens
+/// follow, so long passes pay off: a 2,400-token prompt took 29 s in passes of 512 and 23 s in passes of 2,048.
+const FAST_PROMPT_CHUNK: usize = 2048;
+
+/// Prompt tokens per pass otherwise: enough to share each read of the weights, with memory still bounded.
+const PROMPT_CHUNK: usize = 512;
+
+/// The most weights (tokens' heads times keys) the fast attention holds at once, which bounds its memory to a
+/// quarter of a gigabyte however long the context.
+#[cfg(target_os = "macos")]
+const FAST_ATTENTION_WEIGHTS: usize = 1 << 26;
+
 /// Batches of at least this many tokens take the GPU's fast path when it was asked for: tuned float matrix products
 /// in place of the exact kernels. Below it the fast path's fixed costs outweigh its speed.
 #[cfg(target_os = "macos")]
@@ -60,6 +81,11 @@ const PARALLEL_MIN_TOKENS: usize = 8;
 /// Attention goes across threads, a head each, from this many products of a query value with a key value. A
 /// lone token reaches it with about fifty tokens of context.
 const ATTENTION_MIN_WORK: usize = 1 << 17;
+
+/// Tokens that attend together, and the keys they take at a time: the queries of a block and one stretch of keys
+/// and values fit in a core's cache, so the context is read once per block.
+const ATTENTION_BLOCK: usize = 32;
+const ATTENTION_KEYS: usize = 64;
 
 /// Rows per parallel task in a matrix product.
 const TASK_ROWS: usize = 128;
@@ -344,6 +370,16 @@ impl<'a> Model<'a> {
     /// Whether to imitate transformers' bfloat16 rounding.
     fn bf16(&self) -> bool {
         self.activations == Activations::FloatBf16
+    }
+
+    /// How many prompt tokens to give [`Model::forward`] at a time. Any split gives the same states on the exact
+    /// paths; this one is the fastest that keeps memory bounded.
+    pub fn prompt_chunk(&self) -> usize {
+        #[cfg(target_os = "macos")]
+        if self.gpu.as_ref().is_some_and(Gpu::fast) {
+            return FAST_PROMPT_CHUNK;
+        }
+        PROMPT_CHUNK
     }
 
     /// Whether large batches run on the GPU.
@@ -790,10 +826,160 @@ impl<'a> Model<'a> {
             out.iter_mut().zip(gate).for_each(|(o, g)| *o *= sigmoid(*g));
             round_all(bf16, out);
         };
+        // The same sums in the same order, arranged around the keys instead: a block of tokens and the query
+        // heads that share a key head take each stretch of keys and values together, so those are read once per
+        // block and not once per token and head. With a long context that reading is most of the work.
+        let attend_block = |&(block, kv): &(usize, usize)| -> Vec<f32> {
+            let (i0, i1) = (block * ATTENTION_BLOCK, ((block + 1) * ATTENTION_BLOCK).min(tokens));
+            let firsts: Vec<usize> = (i0..i1).map(|i| window_start(position + i)).collect();
+            // One row of weights per (token, head), starting as the bias of each key.
+            let mut weights: Vec<Vec<f32>> = Vec::with_capacity((i1 - i0) * group);
+            for i in i0..i1 {
+                let (t, first) = (position + i, firsts[i - i0]);
+                let keys = t + 1 - first;
+                for head in kv * group..(kv + 1) * group {
+                    let rel = &rel[(i * heads + head) * d_rel..][..d_rel];
+                    let mut bias = vec![0.0f32; keys.min(extent)];
+                    for (r, rel) in rel.iter().enumerate() {
+                        let profile = &layer.rel_proj[r * extent..][..bias.len()];
+                        bias.iter_mut().zip(profile).for_each(|(b, p)| *b += rel * p);
+                    }
+                    let mut row = vec![0.0f32; keys];
+                    bias.iter().enumerate().for_each(|(distance, value)| row[keys - 1 - distance] = *value);
+                    weights.push(row);
+                }
+            }
+            // Calls `visit(row, token, head, first key, keys)` for every stretch of keys, in key order.
+            let stretches = |visit: &mut dyn FnMut(usize, usize, usize, usize, std::ops::Range<usize>)| {
+                let (lowest, end) = (firsts[0], position + i1);
+                for stretch in (lowest..end).step_by(ATTENTION_KEYS) {
+                    for i in i0..i1 {
+                        let first = firsts[i - i0];
+                        let keys = stretch.max(first)..(stretch + ATTENTION_KEYS).min(position + i + 1);
+                        if keys.is_empty() {
+                            continue;
+                        }
+                        for g in 0..group {
+                            visit((i - i0) * group + g, i, kv * group + g, first, keys.clone());
+                        }
+                    }
+                }
+            };
+            let at = |s: usize| (s - cached_from) * kv_dim + kv * dim;
+            stretches(&mut |row, i, head, first, keys| {
+                let query = &q[i * q_dim + head * dim..][..dim];
+                let weights = &mut weights[row];
+                for s in keys {
+                    weights[s - first] = dot(query, &k[at(s)..][..dim]) * scaling + weights[s - first];
+                }
+            });
+            for (row, weights) in weights.iter_mut().enumerate() {
+                let sink = sinks[(i0 + row / group) * heads + kv * group + row % group];
+                let max = weights.iter().copied().fold(sink, f32::max);
+                weights.iter_mut().for_each(|w| *w = (*w - max).exp());
+                let total = weights.iter().sum::<f32>() + (sink - max).exp();
+                weights.iter_mut().for_each(|w| *w /= total);
+            }
+            let mut out = vec![0.0f32; (i1 - i0) * group * dim];
+            stretches(&mut |row, _, _, first, keys| {
+                let out = &mut out[row * dim..][..dim];
+                for s in keys {
+                    let p = weights[row][s - first];
+                    out.iter_mut().zip(&v[at(s)..][..dim]).for_each(|(o, x)| *o += p * x);
+                }
+            });
+            for (row, out) in out.chunks_exact_mut(dim).enumerate() {
+                let unit = (i0 + row / group) * heads + kv * group + row % group;
+                out.iter_mut().zip(&gate[unit * dim..][..dim]).for_each(|(o, g)| *o *= sigmoid(*g));
+            }
+            out
+        };
+        // A long batch on the fast path: scores and outputs are matrix products of the block's queries and
+        // weights with the keys and values, done by a tuned routine. Several times faster with a long context,
+        // and equal to the loops above only to rounding.
+        #[cfg(target_os = "macos")]
+        let fast = self.gpu.as_ref().is_some_and(Gpu::fast) && tokens >= FAST_MIN_TOKENS && !bf16 && !tracing;
+        #[cfg(not(target_os = "macos"))]
+        let fast = false;
+        #[cfg(target_os = "macos")]
+        if fast {
+            use accel::Rows;
+            // A stretch of tokens at a time, as many as keep the weights within bounds.
+            let longest = position + tokens - window_start(position);
+            let stretch = (FAST_ATTENTION_WEIGHTS / (group * longest)).clamp(1, tokens);
+            let (mut queries, mut weights, mut attended) = (Vec::new(), Vec::new(), Vec::new());
+            for i0 in (0..tokens).step_by(stretch) {
+                let count = stretch.min(tokens - i0);
+                // Every key any of these tokens can see; a row uses its own part of them.
+                let lowest = window_start(position + i0);
+                let keys = position + i0 + count - lowest;
+                let rows = count * group;
+                queries.resize(rows * dim, 0.0f32);
+                weights.resize(rows * keys, 0.0f32);
+                attended.resize(rows * dim, 0.0f32);
+                for kv in 0..kv_heads {
+                    let from = (lowest - cached_from) * kv_dim + kv * dim;
+                    for (i, queries) in queries.chunks_exact_mut(group * dim).enumerate() {
+                        queries.copy_from_slice(&q[(i0 + i) * q_dim + kv * group * dim..][..group * dim]);
+                    }
+                    let mine = Rows { values: &queries, rows, cols: dim, stride: dim };
+                    let context = Rows { values: &k[from..], rows: keys, cols: dim, stride: kv_dim };
+                    accel::multiply(mine, context, true, scaling, &mut weights);
+                    weights.par_chunks_exact_mut(keys).enumerate().for_each(|(row, weights)| {
+                        let (i, head) = (i0 + row / group, kv * group + row % group);
+                        let t = position + i;
+                        let visible = window_start(t) - lowest..t + 1 - lowest;
+                        weights[..visible.start].fill(0.0);
+                        weights[visible.end..].fill(0.0);
+                        let weights = &mut weights[visible];
+                        let rel = &rel[(i * heads + head) * d_rel..][..d_rel];
+                        let mut bias = vec![0.0f32; weights.len().min(extent)];
+                        for (r, rel) in rel.iter().enumerate() {
+                            let profile = &layer.rel_proj[r * extent..][..bias.len()];
+                            bias.iter_mut().zip(profile).for_each(|(b, p)| *b += rel * p);
+                        }
+                        weights.iter_mut().rev().zip(&bias).for_each(|(w, b)| *w += b);
+                        let sink = sinks[i * heads + head];
+                        let max = weights.iter().copied().fold(sink, f32::max);
+                        weights.iter_mut().for_each(|w| *w -= max);
+                        accel::exp_in_place(weights);
+                        let total = weights.iter().sum::<f32>() + (sink - max).exp();
+                        weights.iter_mut().for_each(|w| *w /= total);
+                    });
+                    let mine = Rows { values: &weights, rows, cols: keys, stride: keys };
+                    let context = Rows { values: &v[from..], rows: keys, cols: dim, stride: kv_dim };
+                    accel::multiply(mine, context, false, 1.0, &mut attended);
+                    for (row, attended) in attended.chunks_exact(dim).enumerate() {
+                        let unit = (i0 + row / group) * heads + kv * group + row % group;
+                        let gate = &gate[unit * dim..][..dim];
+                        let out = &mut out[unit * dim..][..dim];
+                        out.iter_mut().zip(attended).zip(gate).for_each(|((o, a), g)| *o = a * sigmoid(*g));
+                    }
+                }
+            }
+        }
         let keys = position + tokens - window_start(position + tokens - 1);
-        match tokens * keys * q_dim < ATTENTION_MIN_WORK {
-            true => out.chunks_mut(dim).enumerate().for_each(attend),
-            false => out.par_chunks_mut(dim).enumerate().for_each(attend),
+        let serial = tokens * keys * q_dim < ATTENTION_MIN_WORK;
+        if fast {
+        } else if bf16 || tracing {
+            // Step by step as the reference does it, a token and head at a time.
+            match serial {
+                true => out.chunks_mut(dim).enumerate().for_each(attend),
+                false => out.par_chunks_mut(dim).enumerate().for_each(attend),
+            }
+        } else {
+            let units: Vec<(usize, usize)> =
+                (0..tokens.div_ceil(ATTENTION_BLOCK)).flat_map(|block| (0..kv_heads).map(move |kv| (block, kv))).collect();
+            let results: Vec<Vec<f32>> = match serial {
+                true => units.iter().map(attend_block).collect(),
+                false => units.par_iter().map(attend_block).collect(),
+            };
+            for (&(block, kv), result) in units.iter().zip(&results) {
+                for (row, result) in result.chunks_exact(dim).enumerate() {
+                    let unit = (block * ATTENTION_BLOCK + row / group) * heads + kv * group + row % group;
+                    out[unit * dim..][..dim].copy_from_slice(result);
+                }
+            }
         }
         timing::since(Stage::Attention, attention_started);
         time(Stage::AttentionOutput, || {
@@ -930,9 +1116,11 @@ impl<'a> Model<'a> {
             });
             out
         };
-        tokens_of
+        // The CPU route, for the experts named.
+        let on_cpu = |chosen: &[usize]| -> Vec<(usize, Vec<f32>)> {
+          chosen
             .par_iter()
-            .enumerate()
+            .map(|&expert| (expert, &tokens_of[expert]))
             .filter(|(_, tokens)| !tokens.is_empty())
             .flat_map_iter(|(expert, tokens)| {
                 let xs: Vec<&Int8Activation> = tokens.iter().map(|(t, _)| &inputs[*t]).collect();
@@ -951,6 +1139,92 @@ impl<'a> Model<'a> {
                 outputs.map(|(out, &(t, weight))| (t, out.iter().map(|o| o * weight).collect())).collect::<Vec<_>>()
             })
             .collect()
+        };
+
+        // A long batch on the fast path: the GPU takes the first experts, unpacked to float and multiplied by a
+        // tuned product, while the CPU does the rest as above. The GPU's inputs are not rounded to bytes, so its
+        // results match the CPU's only approximately.
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = &self.gpu
+            && gpu.fast()
+            && inputs.len() >= FAST_MIN_TOKENS
+            && let (Some(gate_up_format), Some(down_format)) = (experts.gate_up.ggml(), experts.down.ggml())
+        {
+            // The GPU takes the experts with the most tokens, where one product covers the most work, up to its
+            // share; the CPU takes the many with few.
+            let total: usize = tokens_of.iter().map(Vec::len).sum();
+            let count = tokens_of.len();
+            let mut busiest: Vec<usize> = (0..count).collect();
+            busiest.sort_by_key(|&e| std::cmp::Reverse(tokens_of[e].len()));
+            let mut taken = 0;
+            let split = busiest
+                .iter()
+                .position(|&e| {
+                    taken += tokens_of[e].len();
+                    taken as f32 > GPU_FAST_EXPERT_SHARE * total as f32
+                })
+                .unwrap_or(count);
+            let (for_gpu, for_cpu) = busiest.split_at(split);
+            // Returns the outputs, and the experts whose results were not all finite (see `Gpu::experts_fast`).
+            let on_gpu = || -> Result<(Vec<(usize, Vec<f32>)>, Vec<usize>)> {
+                let mut firsts: Vec<Vec<&[f32]>> = vec![Vec::new(); count];
+                for &e in for_gpu {
+                    firsts[e] = tokens_of[e].iter().map(|&(t, _)| &x[t * h..][..h]).collect();
+                }
+                let (rows, cols) = (experts.gate_up.rows, experts.gate_up.cols);
+                let stack = Stack::Ggml(gate_up_format);
+                let gate_up = gpu.experts_fast(experts.gate_up.raw_parts(), (count, rows, cols), stack, &firsts, 0)?;
+                let acts: Vec<Vec<f32>> = gate_up
+                    .par_iter()
+                    .map(|products| {
+                        let mut acts = Vec::with_capacity(products.len() / 2);
+                        for products in products.chunks_exact(rows) {
+                            let (mut gate, mut up): (Vec<f32>, Vec<f32>) =
+                                (0..inter).map(|unit| experts.gate_up_rows(unit)).map(|(g, u)| (products[g], products[u])).unzip();
+                            capped_swiglu(&mut gate, &mut up, cfg.mlp_gate_softcap, cfg.mlp_up_softcap, 1.0);
+                            acts.extend(gate);
+                        }
+                        acts
+                    })
+                    .collect();
+                let seconds: Vec<Vec<&[f32]>> = acts.iter().map(|acts| acts.chunks_exact(inter).collect()).collect();
+                let (rows, cols) = (experts.down.rows, experts.down.cols);
+                let stack = Stack::Ggml(down_format);
+                let down = gpu.experts_fast(experts.down.raw_parts(), (count, rows, cols), stack, &seconds, 1)?;
+                // A NaN in the first product carries through the activation into the whole of the second.
+                let finite: Vec<bool> = down.par_iter().map(|products| products.iter().all(|v| v.is_finite())).collect();
+                let (mut outputs, mut failed) = (Vec::new(), Vec::new());
+                for (expert, (products, tokens)) in down.iter().zip(tokens_of).enumerate() {
+                    if !finite[expert] {
+                        failed.push(expert);
+                        continue;
+                    }
+                    for (product, &(t, weight)) in products.chunks_exact(rows).zip(tokens) {
+                        outputs.push((t, product.iter().map(|v| v * weight).collect()));
+                    }
+                }
+                Ok((outputs, failed))
+            };
+            let (gpu_outputs, mut cpu_outputs) = std::thread::scope(|scope| {
+                let gpu_work = scope.spawn(on_gpu);
+                let cpu_outputs = on_cpu(for_cpu);
+                (gpu_work.join().expect("GPU thread panicked"), cpu_outputs)
+            });
+            let mut outputs = match gpu_outputs {
+                Ok((mut outputs, failed)) => {
+                    GPU_EXPERTS_REDONE.fetch_add(failed.len(), std::sync::atomic::Ordering::Relaxed);
+                    outputs.append(&mut on_cpu(&failed));
+                    outputs
+                }
+                Err(error) => {
+                    gpu_failed(&error);
+                    on_cpu(for_gpu)
+                }
+            };
+            outputs.append(&mut cpu_outputs);
+            return outputs;
+        }
+        on_cpu(&(0..tokens_of.len()).collect::<Vec<_>>())
     }
 
     /// Expert outputs with the activations quantised as in training: each expert input is rounded to the format
@@ -1061,7 +1335,7 @@ impl<'a> Model<'a> {
             && inputs.len() >= FAST_MIN_TOKENS
         {
             let count = tokens_of.len();
-            let nvfp4 = experts.gate_up.is_nvfp4();
+            let stack = if experts.gate_up.is_nvfp4() { Stack::Nvfp4 } else { Stack::Mxfp8 };
             // An input as plain floats and the scale left out of them: NVFP4 keeps its outer scale apart so the
             // floats are exact; an MXFP8 input is already the values it stands for.
             let activation = |input: &Input| -> (Vec<f32>, f32) {
@@ -1075,7 +1349,7 @@ impl<'a> Model<'a> {
                 let firsts: Vec<Vec<&[f32]>> =
                     tokens_of.iter().map(|tokens| tokens.iter().map(|&(t, _)| unscaled[t].0.as_slice()).collect()).collect();
                 let (rows, cols) = (experts.gate_up.rows, experts.gate_up.cols);
-                let gate_up = gpu.experts_fast(experts.gate_up.raw_parts(), (count, rows, cols), nvfp4, &firsts, 0)?;
+                let gate_up = gpu.experts_fast(experts.gate_up.raw_parts(), (count, rows, cols), stack, &firsts, 0)?;
 
                 // Scale, round, activate with the routing weight, and quantise again, per (expert, token).
                 let acts: Vec<Vec<(Vec<f32>, f32)>> = gate_up
@@ -1100,11 +1374,18 @@ impl<'a> Model<'a> {
                 let seconds: Vec<Vec<&[f32]>> =
                     acts.iter().map(|acts| acts.iter().map(|(values, _)| values.as_slice()).collect()).collect();
                 let (rows, cols) = (experts.down.rows, experts.down.cols);
-                let down = gpu.experts_fast(experts.down.raw_parts(), (count, rows, cols), nvfp4, &seconds, 1)?;
+                let down = gpu.experts_fast(experts.down.raw_parts(), (count, rows, cols), stack, &seconds, 1)?;
 
                 // In expert order, then token order: the order the other routes produce their outputs in.
                 let mut outputs = Vec::new();
                 for (expert, ((products, acts), tokens)) in down.iter().zip(&acts).zip(tokens_of).enumerate() {
+                    // The GPU's product now and then returns NaN (see `Gpu::experts_fast`), which carries through
+                    // to here; such an expert is done again on the CPU.
+                    if !products.iter().all(|v| v.is_finite()) {
+                        GPU_EXPERTS_REDONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        outputs.append(&mut on_cpu(expert, &tokens_of[expert..=expert]));
+                        continue;
+                    }
                     for ((product, (_, act_scale)), &(t, _)) in products.chunks_exact(rows).zip(acts).zip(tokens) {
                         let scale = experts.down.outer_scale(expert) * act_scale;
                         outputs.push((t, product.iter().map(|v| round_bf16(v * scale)).collect()));
@@ -1229,9 +1510,9 @@ pub struct Options {
 
 #[cfg(target_os = "macos")]
 fn open_gpu(checkpoint: &Checkpoint, backend: Backend) -> Result<Option<Gpu>> {
-    // The GPU kernels read the checkpoint's own formats.
-    if checkpoint.is_gguf() {
-        ensure!(matches!(backend, Backend::Auto | Backend::Cpu), "GGUF weights run on the CPU only");
+    // The exact GPU kernels read the checkpoint's own formats, so a GGUF file has only the fast path.
+    if checkpoint.is_gguf() && backend != Backend::MetalFast {
+        ensure!(backend != Backend::Metal, "GGUF weights have no exact Metal kernels; use `metal-fast` or the CPU");
         return Ok(None);
     }
     match backend {
@@ -1458,14 +1739,22 @@ pub(crate) fn apply_many(gpu: Option<&Gpu>, jobs: &[(&Mat, &[f32])]) -> Vec<Seq>
     #[cfg(target_os = "macos")]
     if let Some(gpu) = gpu
         && jobs.iter().any(|(m, xs)| xs.len() / m.cols >= GPU_MIN_TOKENS)
-        && jobs.iter().all(|(m, _)| m.cols % 16 == 0 && m.format == Format::Bf16)
     {
-        let dense: Vec<DenseJob> =
-            jobs.iter().map(|(m, xs)| DenseJob { weights: &m.bytes, rows: m.rows, cols: m.cols, xs }).collect();
         let fast = gpu.fast() && jobs.iter().any(|(m, xs)| xs.len() / m.cols >= FAST_MIN_TOKENS);
+        // The exact kernel reads bfloat16; the fast path also unpacks a GGUF file's block formats.
+        let suits = |m: &Mat| match m.format {
+            Format::Bf16 => m.cols % 16 == 0,
+            format => fast && format.is_quantised() && m.cols % 32 == 0,
+        };
+        if jobs.iter().all(|(m, _)| suits(m)) {
+        let dense: Vec<DenseJob> = jobs
+            .iter()
+            .map(|(m, xs)| DenseJob { format: m.format, weights: &m.bytes, rows: m.rows, cols: m.cols, xs })
+            .collect();
         match if fast { gpu.dense_fast(&dense) } else { gpu.dense(&dense) } {
             Ok(outs) => return outs,
             Err(error) => gpu_failed(&error),
+        }
         }
     }
     #[cfg(not(target_os = "macos"))]

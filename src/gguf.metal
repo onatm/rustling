@@ -198,3 +198,90 @@ kernel void mv_q4k_fast(const device uchar* weights [[buffer(0)]],
     out[id.y * p.rows + row] = r.x;
     out[id.y * p.rows + row + 1] = r.y;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// The fast path for long prompts: chosen matrices of a stack are unpacked to float, for Apple's tuned matrix
+// product. Out matrix `i` is stack matrix `order[i]`. A thread unpacks 32 values; the grid is
+// (cols / 32) x (count * rows).
+
+struct WidenParams {
+    // Rows per matrix.
+    uint rows;
+    uint cols;
+    // How many matrices to unpack.
+    uint count;
+};
+
+#define WIDEN_KERNEL(name, values_per_block, block_bytes)                                                  \
+    kernel void name(const device uchar* weights [[buffer(0)]],                                            \
+                     const device uint* order [[buffer(1)]],                                               \
+                     device float* out [[buffer(2)]],                                                      \
+                     constant WidenParams& p [[buffer(3)]],                                                \
+                     uint2 id [[thread_position_in_grid]]) {                                               \
+        if (id.x >= p.cols / 32 || id.y >= p.count * p.rows) return;                                       \
+        uint slot = id.y / p.rows, row = id.y % p.rows;                                                    \
+        ulong row_bytes = ulong(p.cols / (values_per_block)) * (block_bytes);                              \
+        uint per_block = (values_per_block) / 32;                                                          \
+        const device uchar* block = weights + (ulong(order[slot]) * p.rows + row) * row_bytes              \
+            + ulong(id.x / per_block) * (block_bytes);                                                     \
+        device float* o = out + (ulong(id.y) * p.cols + id.x * 32);                                        \
+        name##_part(block, id.x % per_block, o);                                                           \
+    }
+
+static inline void widen_q8_0_part(const device uchar* block, uint part, device float* o) {
+    float d = read_half(block);
+    for (uint i = 0; i < 32; i++) {
+        o[i] = d * float(char(block[2 + i]));
+    }
+}
+
+static inline void widen_q5_0_part(const device uchar* block, uint part, device float* o) {
+    float d = read_half(block);
+    uint high = uint(block[2]) | (uint(block[3]) << 8) | (uint(block[4]) << 16) | (uint(block[5]) << 24);
+    for (uint i = 0; i < 16; i++) {
+        uint v = block[6 + i];
+        uint first = (v & 15u) | (((high >> i) & 1u) << 4);
+        uint second = (v >> 4) | (((high >> (i + 16)) & 1u) << 4);
+        o[i] = d * (float(first) - 16.0f);
+        o[i + 16] = d * (float(second) - 16.0f);
+    }
+}
+
+// Sub-block `part` of eight: its 6-bit scale and minimum, then 32 nibbles.
+static inline void widen_q4k_part(const device uchar* block, uint part, device float* o) {
+    float d = read_half(block), dmin = read_half(block + 2);
+    const device uchar* packed = block + 4;
+    uint scale, minimum;
+    if (part < 4) {
+        scale = packed[part] & 63;
+        minimum = packed[part + 4] & 63;
+    } else {
+        scale = (packed[part + 4] & 15) | ((packed[part - 4] >> 6) << 4);
+        minimum = (packed[part + 4] >> 4) | ((packed[part] >> 6) << 4);
+    }
+    float step = d * float(scale), low = dmin * float(minimum);
+    const device uchar* q = block + 16 + 32 * (part / 2);
+    uint shift = 4 * (part % 2);
+    for (uint i = 0; i < 32; i++) {
+        o[i] = step * float((q[i] >> shift) & 15u) - low;
+    }
+}
+
+// Part `part` of eight: half-block `part / 4`, and within it one of the four runs of 32 values.
+static inline void widen_q6k_part(const device uchar* block, uint part, device float* o) {
+    float d = read_half(block + 208);
+    uint half_block = part / 4, run = part % 4;
+    const device uchar* low = block + 64 * half_block + 32 * (run % 2);
+    const device uchar* high = block + 128 + 32 * half_block;
+    const device char* scales = (const device char*)(block + 192 + 8 * half_block + 2 * run);
+    uint shift = 4 * (run / 2);
+    for (uint i = 0; i < 32; i++) {
+        uint value = ((low[i] >> shift) & 15u) | (((high[i] >> (2 * run)) & 3u) << 4);
+        o[i] = d * float(scales[i / 16]) * (float(value) - 32.0f);
+    }
+}
+
+WIDEN_KERNEL(widen_q8_0, 32, 34)
+WIDEN_KERNEL(widen_q5_0, 32, 22)
+WIDEN_KERNEL(widen_q4k, 256, 144)
+WIDEN_KERNEL(widen_q6k, 256, 210)

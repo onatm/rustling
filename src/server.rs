@@ -227,7 +227,14 @@ async fn chat_completions(State(App { jobs, model }): State<App>, body: axum::bo
             if payloads.send(first.to_string()).await.is_err() {
                 return;
             }
-            while let Some(event) = received.recv().await {
+            loop {
+                // Nothing is sent while a prompt is processed, so the client leaving is watched for directly:
+                // dropping `received` is what tells the worker to stop.
+                let event = tokio::select! {
+                    _ = payloads.closed() => return,
+                    event = received.recv() => event,
+                };
+                let Some(event) = event else { return };
                 let (done, chunks) = match event {
                     Event::Started => (false, vec![]),
                     Event::Reasoning(text) => (false, vec![chunk(json!({ "reasoning_content": text }), None)]),
@@ -374,10 +381,13 @@ fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Jo
 
     let mut memory = Memory::default();
     let mut calls = 0usize;
-    for job in queue {
+    for (number, job) in queue.into_iter().enumerate() {
         let events = job.events.clone();
-        let handled = handle(&job, &options, &config, &prompter, &mut session, &mut cache, &mut memory, &mut calls);
+        let number = number + 1;
+        let handled =
+            handle(number, &job, &options, &config, &prompter, &mut session, &mut cache, &mut memory, &mut calls);
         if let Err(failure) = handled {
+            eprintln!("[{number}] failed ({}): {}", failure.status.as_u16(), failure.message);
             // The receiver may already be gone, when the failure is the client hanging up.
             let _ = events.blocking_send(Event::Failed { status: failure.status, message: failure.message });
         }
@@ -483,7 +493,13 @@ fn normalise(messages: &mut [Value], memory: &Memory) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Tokens per second, for the log.
+fn rate(tokens: usize, seconds: f32) -> f32 {
+    tokens as f32 / seconds.max(1e-3)
+}
+
 fn handle(
+    number: usize,
     job: &Job,
     options: &ServerOptions,
     config: &Config,
@@ -542,7 +558,35 @@ fn handle(
         )));
     }
     send(Event::Started)?;
-    let cached_tokens = cache.prepare(session, &ids, header)?;
+    eprintln!(
+        "[{number}] {} messages, {} tools, {} prompt tokens",
+        request.messages.len(),
+        request.tools.as_ref().and_then(Value::as_array).map_or(0, Vec::len),
+        ids.len()
+    );
+    let started = std::time::Instant::now();
+    let mut reported = started;
+    let mut watch = |processed: usize| {
+        if reported.elapsed().as_secs() >= 5 {
+            reported = std::time::Instant::now();
+            eprintln!("[{number}] prompt: {processed} of {} tokens after {:.0}s", ids.len(), started.elapsed().as_secs_f32());
+        }
+        // A client that has gone away is not worth finishing the prompt for; what was processed stays.
+        !job.events.is_closed()
+    };
+    let cached_tokens = cache.prepare_watched(session, &ids, header, &mut watch).map_err(|error| {
+        match job.events.is_closed() {
+            true => gone(),
+            false => error,
+        }
+    })?;
+    let prompt_seconds = started.elapsed().as_secs_f32();
+    let processed = ids.len() - cached_tokens;
+    eprintln!(
+        "[{number}] prompt: {cached_tokens} tokens reused, {processed} processed in {prompt_seconds:.1}s ({:.0} tokens/s)",
+        rate(processed, prompt_seconds)
+    );
+    let started = std::time::Instant::now();
 
     // Streamed text is the growth of the reply's reasoning and content; tool calls go out whole once closed.
     let mut sampler = Sampler::new(sampling, request.seed);
@@ -612,6 +656,12 @@ fn handle(
         // A loop cut short is reported like any other truncated reply.
         Stop::MaxTokens | Stop::Loop | Stop::ContextFull => "length",
     };
+    let seconds = started.elapsed().as_secs_f32();
+    eprintln!(
+        "[{number}] reply: {} tokens in {seconds:.1}s ({:.1} tokens/s), {finish_reason}",
+        generated.len(),
+        rate(generated.len(), seconds)
+    );
     let usage = Usage { prompt_tokens: ids.len(), cached_tokens, completion_tokens: generated.len() };
     send(Event::Done { finish_reason, usage })?;
     Ok(())

@@ -19,6 +19,7 @@ use objc2_metal::{
     MTLSize,
 };
 
+use crate::ggml::Format;
 use crate::quant::{E4M3, Nvfp4Activation};
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -35,6 +36,8 @@ pub struct Gpu {
     widen_bf16: Pipeline,
     widen_nvfp4: Pipeline,
     widen_mxfp8: Pipeline,
+    /// Unpacking kernels for a GGUF file's block formats: Q4_K, Q5_0, Q6_K, Q8_0.
+    widen_ggml: [Pipeline; 4],
     e4m3: Buffer,
     /// Working buffers of the fast path, reused from call to call and grown as needed; `(bytes, buffer)` by slot.
     scratch: Mutex<Vec<Option<(usize, Buffer)>>>,
@@ -51,8 +54,10 @@ pub struct Gpu {
 unsafe impl Send for Gpu {}
 unsafe impl Sync for Gpu {}
 
-/// One dense product: `rows x cols` bfloat16 weights applied to each `cols`-wide vector in `xs`.
+/// One dense product: `rows x cols` weights, bfloat16 or in a GGUF block format, applied to each `cols`-wide
+/// vector in `xs`. Only the fast path takes block formats.
 pub struct DenseJob<'a> {
+    pub format: Format,
     pub weights: &'a [u8],
     pub rows: usize,
     pub cols: usize,
@@ -70,6 +75,14 @@ pub struct ExpertJob<'a> {
     pub activations: &'a [&'a Nvfp4Activation],
     /// `(expert, index into activations, the expert's outer scale)`.
     pub pairs: &'a [(usize, usize, f32)],
+}
+
+/// How a stack of expert matrices is stored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Stack {
+    Nvfp4,
+    Mxfp8,
+    Ggml(Format),
 }
 
 /// Vectors handled by one GPU thread; `SHARE` in the shaders.
@@ -110,6 +123,18 @@ impl Gpu {
         let (dense, experts) = (pipeline("dense")?, pipeline("experts")?);
         let (widen_bf16, widen_nvfp4, widen_mxfp8) =
             (pipeline("widen_bf16")?, pipeline("widen_nvfp4")?, pipeline("widen_mxfp8")?);
+        let source = NSString::from_str(include_str!("gguf.metal"));
+        let library = device
+            .newLibraryWithSource_options_error(&source, Some(&options))
+            .map_err(|e| anyhow!("compiling the GGUF shaders: {}", e.localizedDescription()))?;
+        let pipeline = |name: &str| -> Result<Pipeline> {
+            let function =
+                library.newFunctionWithName(&NSString::from_str(name)).with_context(|| format!("no kernel {name}"))?;
+            device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|e| anyhow!("building kernel {name}: {}", e.localizedDescription()))
+        };
+        let widen_ggml = [pipeline("widen_q4k")?, pipeline("widen_q5_0")?, pipeline("widen_q6k")?, pipeline("widen_q8_0")?];
 
         let mut gpu = Self {
             e4m3: copied(&device, &E4M3[..])?,
@@ -120,6 +145,7 @@ impl Gpu {
             widen_bf16,
             widen_nvfp4,
             widen_mxfp8,
+            widen_ggml,
             scratch: Mutex::new(Vec::new()),
             fast,
             mapped: Vec::new(),
@@ -169,6 +195,7 @@ impl Gpu {
         let mut outputs = Vec::new();
         for job in jobs {
             let vectors = job.xs.len() / job.cols;
+            ensure!(job.format == Format::Bf16, "the exact dense kernel reads bfloat16");
             ensure!(job.weights.len() == job.rows * job.cols * 2 && job.xs.len() == vectors * job.cols, "bad dense job");
             ensure!(job.cols % 16 == 0, "the dense kernel takes 16 columns per step");
             let (weights, offset) = self.weights(job.weights)?;
@@ -280,13 +307,22 @@ impl Gpu {
         let mut outputs = Vec::new();
         for (index, job) in jobs.iter().enumerate() {
             let vectors = job.xs.len() / job.cols;
-            ensure!(job.weights.len() == job.rows * job.cols * 2 && job.xs.len() == vectors * job.cols, "bad dense job");
-            ensure!(job.cols % 16 == 0, "the widening kernel takes 16 columns per step");
+            let row_bytes = job.format.row_bytes(job.cols).context("rows do not make whole blocks")?;
+            ensure!(job.weights.len() == job.rows * row_bytes && job.xs.len() == vectors * job.cols, "bad dense job");
             let (weights, offset) = self.weights(job.weights)?;
-            ensure!(offset % 4 == 0, "weights are not word-aligned in the checkpoint");
             let widened = self.scratch(2 * index, job.rows * job.cols * 4)?;
-            let params = [job.rows as u32, job.cols as u32, 0];
-            self.encode(&commands, &self.widen_bf16, &[(&weights, offset), (&widened, 0)], &params, (job.cols / 8, job.rows))?;
+            if job.format == Format::Bf16 {
+                ensure!(job.cols % 16 == 0, "the widening kernel takes 16 columns per step");
+                ensure!(offset % 4 == 0, "weights are not word-aligned in the checkpoint");
+                let params = [job.rows as u32, job.cols as u32, 0];
+                let buffers = [(&weights, offset), (&widened, 0)];
+                self.encode(&commands, &self.widen_bf16, &buffers, &params, (job.cols / 8, job.rows))?;
+            } else {
+                let first = copied(&self.device, &[0u32])?;
+                let params = [job.rows as u32, job.cols as u32, 1];
+                let buffers = [(&weights, offset), (&first, 0), (&widened, 0)];
+                self.encode(&commands, self.widen_ggml(job.format)?, &buffers, &params, (job.cols / 32, job.rows))?;
+            }
             let x = copied(&self.device, job.xs)?;
             let out = self.scratch(2 * index + 1, vectors * job.rows * 4)?;
             // out = x . widened^T: one row per vector.
@@ -299,29 +335,56 @@ impl Gpu {
         Ok(outputs.into_iter().map(|(buffer, len)| read(&buffer, len)).collect())
     }
 
+    fn widen_ggml(&self, format: Format) -> Result<&Pipeline> {
+        Ok(match format {
+            Format::Q4K => &self.widen_ggml[0],
+            Format::Q5_0 => &self.widen_ggml[1],
+            Format::Q6K => &self.widen_ggml[2],
+            Format::Q8_0 => &self.widen_ggml[3],
+            other => anyhow::bail!("no kernel unpacks {other:?}"),
+        })
+    }
+
     /// Each expert of a stack applied to its own vectors, on the fast path.
     ///
-    /// `values` and `scales` hold `experts` matrices of `rows x cols`, in NVFP4 or MXFP8 as `nvfp4` says.
+    /// `values` and `scales` hold `experts` matrices of `rows x cols`, stored as `stack` says (a GGUF stack has
+    /// no separate scales).
     /// `vectors[expert]` are that expert's inputs, each `cols` wide. Returns, per expert, its results end to end
     /// (`rows` values per input). For NVFP4 that is without the expert's outer scale, which the caller applies.
     /// `slot` (0 or 1) keeps a layer's two stacks apart.
     ///
-    /// Experts get very different numbers of inputs, and one tuned product wants the same number for every matrix
-    /// in it. So the experts are sorted by how many they have and multiplied in groups of similar size, each
-    /// padded with zeros to its largest member.
+    /// Every expert gets a product of its own.
+    ///
+    /// The results must be checked: on an M1 Max, Apple's matrix product now and then returns NaN for half the
+    /// outputs of a run of inputs, from clean inputs and weights, repeatably for the same data. The callers
+    /// recompute any expert whose results are not all finite.
     pub fn experts_fast(
         &self,
         (values, scales): (&[u8], &[u8]),
         (experts, rows, cols): (usize, usize, usize),
-        nvfp4: bool,
+        stack: Stack,
         vectors: &[Vec<&[f32]>],
         slot: usize,
     ) -> Result<Vec<Vec<f32>>> {
         ensure!(vectors.len() == experts, "one list of vectors per expert");
-        // NVFP4 packs two values per byte in blocks of 16; MXFP8 is a byte per value in blocks of 32.
-        let (values_per_byte, block, widen) = if nvfp4 { (2, 16, &self.widen_nvfp4) } else { (1, 32, &self.widen_mxfp8) };
         let weights = experts * rows * cols;
-        ensure!(values.len() == weights / values_per_byte && scales.len() == weights / block, "bad expert stack");
+        // NVFP4 packs two values per byte in blocks of 16; MXFP8 is a byte per value in blocks of 32. `block` is
+        // the values one GPU thread unpacks.
+        let (block, widen) = match stack {
+            Stack::Nvfp4 => {
+                ensure!(values.len() == weights / 2 && scales.len() == weights / 16, "bad expert stack");
+                (16, &self.widen_nvfp4)
+            }
+            Stack::Mxfp8 => {
+                ensure!(values.len() == weights && scales.len() == weights / 32, "bad expert stack");
+                (32, &self.widen_mxfp8)
+            }
+            Stack::Ggml(format) => {
+                let row_bytes = format.row_bytes(cols).context("rows do not make whole blocks")?;
+                ensure!(values.len() == experts * rows * row_bytes, "bad expert stack");
+                (32, self.widen_ggml(format)?)
+            }
+        };
         ensure!(cols % 32 == 0 && vectors.iter().flatten().all(|v| v.len() == cols), "bad expert inputs");
         let mut order: Vec<usize> = (0..experts).filter(|&e| !vectors[e].is_empty()).collect();
         let mut outputs = vec![Vec::new(); experts];
@@ -330,20 +393,12 @@ impl Gpu {
         }
         order.sort_by_key(|&e| std::cmp::Reverse(vectors[e].len()));
 
-        // Groups of consecutive experts in that order, as (first position, experts, vectors each). An expert joins
-        // a group while it has at least half as many vectors as the group's first, so padding at most doubles
-        // the work.
-        let mut groups: Vec<(usize, usize, usize)> = Vec::new();
-        for (position, &expert) in order.iter().enumerate() {
-            match groups.last_mut() {
-                Some((_, count, most)) if vectors[expert].len() * 2 >= *most => *count += 1,
-                _ => groups.push((position, 1, vectors[expert].len())),
-            }
-        }
+        // One product per expert, as (position, matrices, vectors each).
+        let groups: Vec<(usize, usize, usize)> =
+            order.iter().enumerate().map(|(position, &expert)| (position, 1, vectors[expert].len())).collect();
 
         let (values_buffer, values_offset) = self.weights(values)?;
-        let (scales_buffer, scales_offset) = self.weights(scales)?;
-        ensure!(values_offset % 4 == 0, "expert weights are not word-aligned in the checkpoint");
+        ensure!(values_offset % 4 == 0 || matches!(stack, Stack::Ggml(_)), "expert weights are not word-aligned");
         // Slots after the dense ones.
         let padded: usize = groups.iter().map(|&(_, count, most)| count * most).sum();
         let widened = self.scratch(16 + slot, order.len() * rows * cols * 4)?;
@@ -370,15 +425,22 @@ impl Gpu {
 
         let commands = self.queue.commandBuffer().context("creating a command buffer")?;
         let order_buffer = copied(&self.device, &order.iter().map(|&e| e as u32).collect::<Vec<u32>>())?;
-        let buffers = [
-            (&values_buffer, values_offset),
-            (&scales_buffer, scales_offset),
-            (&self.e4m3, 0),
-            (&order_buffer, 0),
-            (&widened, 0),
-        ];
         let params = [rows as u32, cols as u32, order.len() as u32];
-        self.encode(&commands, widen, &buffers, &params, (cols / block, order.len() * rows))?;
+        let grid = (cols / block, order.len() * rows);
+        if matches!(stack, Stack::Ggml(_)) {
+            let buffers = [(&values_buffer, values_offset), (&order_buffer, 0), (&widened, 0)];
+            self.encode(&commands, widen, &buffers, &params, grid)?;
+        } else {
+            let (scales_buffer, scales_offset) = self.weights(scales)?;
+            let buffers = [
+                (&values_buffer, values_offset),
+                (&scales_buffer, scales_offset),
+                (&self.e4m3, 0),
+                (&order_buffer, 0),
+                (&widened, 0),
+            ];
+            self.encode(&commands, widen, &buffers, &params, grid)?;
+        }
         let mut offset = 0;
         for &(first, count, most) in &groups {
             self.multiply(
@@ -533,7 +595,7 @@ mod tests {
             let weights: Vec<u8> =
                 bytes(rows * cols * 2, 1).as_chunks::<2>().0.iter().flat_map(|b| [b[0], 0x3C | (b[1] & 0x83)]).collect();
             let xs = floats(vectors * cols, 2);
-            let out = gpu.dense(&[DenseJob { weights: &weights, rows, cols, xs: &xs }]).unwrap().remove(0);
+            let out = gpu.dense(&[DenseJob { format: Format::Bf16, weights: &weights, rows, cols, xs: &xs }]).unwrap().remove(0);
             for v in 0..vectors {
                 for r in 0..rows {
                     let cpu = dot_bf16_row(&weights[r * cols * 2..][..cols * 2], &xs[v * cols..][..cols]);
@@ -773,7 +835,7 @@ mod tests {
         let weights: Vec<u8> =
             bytes(rows * cols * 2, 1).as_chunks::<2>().0.iter().flat_map(|b| [b[0], 0x3C | (b[1] & 0x83)]).collect();
         let xs = floats(vectors * cols, 2);
-        let job = [DenseJob { weights: &weights, rows, cols, xs: &xs }];
+        let job = [DenseJob { format: Format::Bf16, weights: &weights, rows, cols, xs: &xs }];
         gpu.dense(&job).unwrap();
         let started = Instant::now();
         let out = gpu.dense(&job).unwrap().remove(0);
@@ -817,7 +879,7 @@ mod tests {
         let weights: Vec<u8> =
             bytes(rows * cols * 2, 5).as_chunks::<2>().0.iter().flat_map(|b| [b[0], 0x3C | (b[1] & 0x83)]).collect();
         let xs = floats(vectors * cols, 6);
-        let job = [DenseJob { weights: &weights, rows, cols, xs: &xs }];
+        let job = [DenseJob { format: Format::Bf16, weights: &weights, rows, cols, xs: &xs }];
         let (fast, exact) = (gpu.dense_fast(&job).unwrap().remove(0), gpu.dense(&job).unwrap().remove(0));
         // Compared with the size of the terms summed: a result near zero from cancellation is still that accurate.
         for v in 0..vectors {
@@ -847,7 +909,7 @@ mod tests {
         let unscaled: Vec<Vec<Vec<f32>>> =
             activations.iter().map(|list| list.iter().map(Nvfp4Activation::unscaled).collect()).collect();
         let vectors: Vec<Vec<&[f32]>> = unscaled.iter().map(|list| list.iter().map(Vec::as_slice).collect()).collect();
-        let out = gpu.experts_fast((&values, &scales), (experts, rows, cols), true, &vectors, 0).unwrap();
+        let out = gpu.experts_fast((&values, &scales), (experts, rows, cols), Stack::Nvfp4, &vectors, 0).unwrap();
         let mut decoded = vec![0.0f32; cols];
         for (expert, list) in activations.iter().enumerate() {
             assert_eq!(out[expert].len(), list.len() * rows);
@@ -876,6 +938,92 @@ mod tests {
         }
     }
 
+    /// Checks `fast` products of `x` against the rows decoded on the CPU.
+    fn assert_close(format: Format, rows: &[u8], cols: usize, x: &[f32], fast: &[f32], what: &str) {
+        let row_bytes = format.row_bytes(cols).unwrap();
+        let mut decoded = vec![0.0f32; cols];
+        for (r, (row, fast)) in rows.chunks_exact(row_bytes).zip(fast).enumerate() {
+            format.decode_row(row, &mut decoded);
+            let exact = crate::quant::dot_f32_row(&decoded, x);
+            let magnitude: f32 = decoded.iter().zip(x).map(|(w, x)| (w * x).abs()).sum();
+            assert!((fast - exact).abs() <= 1e-5 * magnitude, "{format:?} {what}, row {r}: {fast} against {exact}");
+        }
+    }
+
+    #[test]
+    fn the_fast_paths_unpack_gguf_blocks() {
+        use crate::ggml::random_row;
+        let gpu = Gpu::new(&[], true).unwrap();
+        for (f, format) in [Format::Q4K, Format::Q5_0, Format::Q6K, Format::Q8_0].into_iter().enumerate() {
+            // A dense matrix.
+            let (rows, cols, vectors) = (37, 768, 5);
+            let weights: Vec<u8> = (0..rows).flat_map(|r| random_row(format, cols, (100 * f + r) as u32)).collect();
+            let xs = floats(vectors * cols, 40 + f as u64);
+            let out = gpu.dense_fast(&[DenseJob { format, weights: &weights, rows, cols, xs: &xs }]).unwrap().remove(0);
+            for (i, x) in xs.chunks_exact(cols).enumerate() {
+                assert_close(format, &weights, cols, x, &out[i * rows..][..rows], "dense");
+            }
+
+            // A stack of experts with uneven numbers of inputs.
+            let (experts, rows, cols) = (5, 12, 512);
+            let stack: Vec<u8> =
+                (0..experts * rows).flat_map(|r| random_row(format, cols, (1000 * f + r) as u32)).collect();
+            let counts = [3usize, 0, 11, 1, 6];
+            let inputs: Vec<Vec<Vec<f32>>> = counts
+                .iter()
+                .enumerate()
+                .map(|(e, &n)| (0..n as u64).map(|i| floats(cols, 300 * e as u64 + i)).collect())
+                .collect();
+            let vectors: Vec<Vec<&[f32]>> = inputs.iter().map(|list| list.iter().map(Vec::as_slice).collect()).collect();
+            let out = gpu.experts_fast((&stack, &[]), (experts, rows, cols), Stack::Ggml(format), &vectors, 0).unwrap();
+            let matrix_bytes = rows * format.row_bytes(cols).unwrap();
+            for (expert, list) in inputs.iter().enumerate() {
+                assert_eq!(out[expert].len(), list.len() * rows);
+                for (i, x) in list.iter().enumerate() {
+                    let matrix = &stack[expert * matrix_bytes..][..matrix_bytes];
+                    assert_close(format, matrix, cols, x, &out[expert][i * rows..][..rows], "experts");
+                }
+            }
+        }
+    }
+
+    /// The expert stacks of a long prompt: a hundred matrices of the model's size and thousands of inputs.
+    /// `cargo test --release --lib the_fast_path_holds_at_full_size -- --ignored`.
+    #[test]
+    #[ignore]
+    fn the_fast_path_holds_at_full_size() {
+        use crate::ggml::random_row;
+        let gpu = Gpu::new(&[], true).unwrap();
+        let (format, experts, rows, cols) = (Format::Q4K, 100, 2304, 2304);
+        let stack: Vec<u8> = (0..experts * rows).flat_map(|r| random_row(format, cols, r as u32)).collect();
+        // The numbers of inputs one layer of a 2,048-token pass gave its busiest experts.
+        let counts: Vec<usize> = [(5, 1839), (6, 746), (4, 282), (6, 138), (9, 67), (30, 20), (40, 3)]
+            .iter()
+            .flat_map(|&(experts, inputs)| std::iter::repeat_n(inputs, experts))
+            .collect();
+        assert_eq!(counts.len(), experts);
+        let inputs: Vec<Vec<Vec<f32>>> = counts
+            .iter()
+            .enumerate()
+            .map(|(e, &n)| (0..n as u64).map(|i| floats(cols, 1000 * e as u64 + i)).collect())
+            .collect();
+        let vectors: Vec<Vec<&[f32]>> = inputs.iter().map(|list| list.iter().map(Vec::as_slice).collect()).collect();
+        let out = gpu.experts_fast((&stack, &[]), (experts, rows, cols), Stack::Ggml(format), &vectors, 0).unwrap();
+        for (expert, out) in out.iter().enumerate() {
+            let bad: Vec<usize> =
+                out.chunks_exact(rows).enumerate().filter(|(_, r)| r.iter().any(|v| !v.is_finite())).map(|(i, _)| i).collect();
+            assert!(bad.is_empty(), "expert {expert} ({} inputs): bad {:?}..{:?} ({})", counts[expert], bad.first(), bad.last(), bad.len());
+        }
+        let matrix_bytes = rows * format.row_bytes(cols).unwrap();
+        for expert in [0, 1, 49, 50, 98, 99] {
+            let list = &inputs[expert];
+            for i in [0, list.len() - 1] {
+                let matrix = &stack[expert * matrix_bytes..][..matrix_bytes];
+                assert_close(format, matrix, cols, &list[i], &out[expert][i * rows..][..rows], &format!("expert {expert}"));
+            }
+        }
+    }
+
     #[test]
     fn the_fast_mxfp8_path_matches_to_rounding() {
         let gpu = Gpu::new(&[], true).unwrap();
@@ -892,7 +1040,7 @@ mod tests {
             .map(|(e, &n)| (0..n as u64).map(|i| floats(cols, 200 * e as u64 + i)).collect())
             .collect();
         let vectors: Vec<Vec<&[f32]>> = inputs.iter().map(|list| list.iter().map(Vec::as_slice).collect()).collect();
-        let out = gpu.experts_fast((&values, &scales), (experts, rows, cols), false, &vectors, 0).unwrap();
+        let out = gpu.experts_fast((&values, &scales), (experts, rows, cols), Stack::Mxfp8, &vectors, 0).unwrap();
         let mut decoded = vec![0.0f32; cols];
         for (expert, list) in inputs.iter().enumerate() {
             assert_eq!(out[expert].len(), list.len() * rows);

@@ -440,6 +440,31 @@ mod neon {
     }
 }
 
+/// A row of pseudo-random bytes, shaped so every block is valid: the half-float scales are kept small.
+#[cfg(test)]
+pub(crate) fn random_row(format: Format, cols: usize, seed: u32) -> Vec<u8> {
+    let (_, block_bytes) = format.block();
+    let mut state = seed;
+    let mut row: Vec<u8> = (0..format.row_bytes(cols).unwrap())
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let scale_at: &[usize] = match format {
+        Format::Q4K => &[0, 2],
+        Format::Q6K => &[208],
+        _ => &[0],
+    };
+    for block in row.chunks_exact_mut(block_bytes) {
+        for &at in scale_at {
+            let scale = f16::from_f32(0.01 + block[at] as f32 * 1e-4).to_le_bytes();
+            block[at..at + 2].copy_from_slice(&scale);
+        }
+    }
+    row
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,30 +509,6 @@ mod tests {
             assert_eq!(decoded, row.values, "{format:?}");
             assert!(decoded.iter().any(|v| *v != 0.0));
         }
-    }
-
-    /// A row of pseudo-random bytes, shaped so every block is valid: the half-float scales are kept small.
-    fn random_row(format: Format, cols: usize, seed: u32) -> Vec<u8> {
-        let (_, block_bytes) = format.block();
-        let mut state = seed;
-        let mut row: Vec<u8> = (0..format.row_bytes(cols).unwrap())
-            .map(|_| {
-                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (state >> 24) as u8
-            })
-            .collect();
-        let scale_at: &[usize] = match format {
-            Format::Q4K => &[0, 2],
-            Format::Q6K => &[208],
-            _ => &[0],
-        };
-        for block in row.chunks_exact_mut(block_bytes) {
-            for &at in scale_at {
-                let scale = f16::from_f32(0.01 + block[at] as f32 * 1e-4).to_le_bytes();
-                block[at..at + 2].copy_from_slice(&scale);
-            }
-        }
-        row
     }
 
     #[test]
