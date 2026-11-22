@@ -22,6 +22,7 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | OpenAI-compatible HTTP server: chat completions, streaming, tool calls (`src/server.rs`) | done |
 | Processed prompts reused across conversations and restarts (`src/cache.rs`) | done |
 | DSpark draft model: proposes several tokens at a time for the main model to check (`src/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, and it rests where it would slow things down |
+| Copying from the context: text the reply repeats is proposed in runs and checked in one batch (`src/lookup.rs`) | done, on by default; a reply that writes out code from a 15,000-token prompt went from 9.4 to 14.8 tokens/s |
 | Quantised expert activations with an integer dot-product kernel, as the model was trained | done and the default; about 10 tokens/s. `--activations float` gives the transformers arithmetic |
 | Variable-loop checkpoint with a chosen pass count (`--passes`) | done; 16 tokens/s at 1 pass, 12 at 2, 9 at 3 |
 | GGUF conversions (Q4_K, Q5_0, Q6_K, Q8_0 blocks), multiplied in integer arithmetic (`src/ggml.rs`) | done; Q4_K_M at about 15 tokens/s against 10 for the checkpoint. The GPU only on the fast path |
@@ -129,6 +130,25 @@ cargo run --release -- --model thinkingmachines/TML-d24-varloop-research --passe
 The benchmark columns are Thinking Machines' published figures for this checkpoint. They describe it as a research
 model and recommend Inkling 2 Mini for real use; at 3 passes Mini scores higher on most of their benchmarks.
 `--passes` works on every command, and the draft model only works at the checkpoint's own count of 3.
+
+`--threads` sets the number of worker threads. On Apple silicon the default is the number of performance cores
+(8 on an M1 Max): with other work running on the machine, 8 threads were 3% to 15% faster than all 10 cores,
+because work that lands on an efficiency core holds up the rest.
+
+## Copying from the context
+
+Much of what a model writes for a coding agent is already in the conversation: the file it is editing, code it
+quotes, a path it repeats. When the last four tokens have appeared before, what followed them then is proposed
+as what follows now, up to 16 tokens when a long stretch matches, and the main model checks the proposal in one
+batch, as it checks the draft model's. A proposal costs a table lookup. llama.cpp calls this n-gram speculative
+decoding.
+
+It is on by default (`--no-copying` turns it off) and, like the draft model, changes the speed and not what is
+generated: with `--temperature 0` the output is identical on the exact backends, and equal to rounding with
+`--backend metal-fast`. It rests in the same way when its guesses are being rejected. With a 15,000-token prompt
+of source code on a Q4_K_M conversion and an M1 Max, a reply that reasons and then writes out part of that code
+went from 9.4 to 14.8 tokens/s, with 483 of 567 copied tokens accepted. With `--draft` as well, copying is tried
+first and the draft proposes where nothing can be copied.
 
 ## Draft model
 

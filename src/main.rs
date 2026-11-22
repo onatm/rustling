@@ -27,6 +27,10 @@ struct Cli {
     /// (thinkingmachines/TML-d24-varloop-research, trained with 1 to 5). Fewer is faster and less capable.
     #[arg(long, global = true)]
     passes: Option<usize>,
+    /// Worker threads. Defaults to the number of performance cores on Apple silicon, where work that lands on
+    /// an efficiency core holds up the rest, and to every core elsewhere.
+    #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..))]
+    threads: Option<u64>,
     #[command(subcommand)]
     command: Command,
 }
@@ -135,6 +139,10 @@ struct RunArgs {
     /// How sure the draft must be of a run of tokens to propose it, from 0 (always propose a full block) to 1.
     #[arg(long, default_value_t = rustling::draft::DEFAULT_MIN_CONFIDENCE)]
     draft_confidence: f32,
+    /// Do not guess at coming tokens by copying from the context. Copying speeds up replies that repeat text
+    /// already in the conversation, such as edits to a file, and rests where its guesses fail.
+    #[arg(long)]
+    no_copying: bool,
     /// Expert arithmetic: `quantised` as the model was trained, or `float` as transformers computes it.
     #[arg(long, value_enum, default_value_t = ActivationsArg::Quantised)]
     activations: ActivationsArg,
@@ -242,10 +250,22 @@ fn load_config(model_dir: &std::path::Path) -> Result<Config> {
     }
 }
 
+/// How many performance cores an Apple silicon machine has; nothing elsewhere, or if the system will not say.
+fn performance_cores() -> Option<usize> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = std::process::Command::new("sysctl").args(["-n", "hw.perflevel0.physicalcpu"]).output().ok()?;
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok().filter(|&cores| cores > 0)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let model_dir = resolve_model(cli.model.as_deref())?;
     PASSES.set(cli.passes).expect("set once");
+    if let Some(threads) = cli.threads.map(|threads| threads as usize).or_else(performance_cores) {
+        rayon::ThreadPoolBuilder::new().num_threads(threads).build_global()?;
+    }
     match cli.command {
         Command::Inspect => inspect(&model_dir),
         Command::Expert { layer, expert } => expert_stats(&model_dir, layer, expert),
@@ -264,6 +284,7 @@ fn main() -> Result<()> {
                 max_tokens: run.max_tokens,
                 stop_on_loop: !run.allow_loops,
                 draft_confidence: run.draft.then_some(run.draft_confidence),
+                copying: !run.no_copying,
                 passes: cli.passes,
                 context: run.window(),
                 cache_bytes: (cache_gb * (1u64 << 30) as f64) as usize,
@@ -446,8 +467,8 @@ fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, top: bool, t
         .map(|weights| Draft::load(&config, weights).map(|draft| draft.with_min_confidence(run.draft_confidence)))
         .transpose()?;
     let mut session = match &draft {
-        Some(draft) => Session::new(&model).with_window(run.window()).with_draft(draft),
-        None => Session::new(&model).with_window(run.window()),
+        Some(draft) => Session::new(&model).with_window(run.window()).with_copying(!run.no_copying).with_draft(draft),
+        None => Session::new(&model).with_window(run.window()).with_copying(!run.no_copying),
     };
     let started = Instant::now();
     session.set_context(&prompt_ids)?;
@@ -492,8 +513,11 @@ fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, top: bool, t
     if let Some(note) = stop_note(stop, run.limits()) {
         eprintln!("{note}");
     }
+    let drafting = session.drafting();
+    if drafting.copied_proposed > 0 {
+        eprintln!("copied: {} of {} proposed tokens accepted", drafting.copied_accepted, drafting.copied_proposed);
+    }
     if draft.is_some() {
-        let drafting = session.drafting();
         eprintln!(
             "draft: {} of {} proposed tokens accepted over {} rounds ({:.1} tokens per round); rested for {} tokens",
             drafting.accepted,
@@ -527,8 +551,8 @@ fn chat(model_dir: &std::path::Path, system: Option<&str>, run: &RunArgs) -> Res
         .map(|weights| Draft::load(&config, weights).map(|draft| draft.with_min_confidence(run.draft_confidence)))
         .transpose()?;
     let new_session = || match &draft {
-        Some(draft) => Session::new(&model).with_window(run.window()).with_draft(draft),
-        None => Session::new(&model).with_window(run.window()),
+        Some(draft) => Session::new(&model).with_window(run.window()).with_copying(!run.no_copying).with_draft(draft),
+        None => Session::new(&model).with_window(run.window()).with_copying(!run.no_copying),
     };
     let mut session = new_session();
     let mut messages: Vec<serde_json::Value> = Vec::new();

@@ -70,6 +70,8 @@ pub struct ServerOptions {
     pub stop_on_loop: bool,
     /// Generate with the draft model, proposing only runs it is at least this confident of.
     pub draft_confidence: Option<f32>,
+    /// Guess at coming tokens by copying from the context.
+    pub copying: bool,
     /// Overrides how many times the looped layers run, for a variable-loop checkpoint.
     pub passes: Option<usize>,
     /// The context window in tokens, prompt and reply together.
@@ -664,8 +666,8 @@ fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Jo
     let _ = ready.send(Ok(()));
 
     let mut session = match &draft {
-        Some(draft) => Session::new(&model).with_window(options.context).with_draft(draft),
-        None => Session::new(&model).with_window(options.context),
+        Some(draft) => Session::new(&model).with_window(options.context).with_copying(options.copying).with_draft(draft),
+        None => Session::new(&model).with_window(options.context).with_copying(options.copying),
     };
     // What snapshots depend on: one made with another model, pass count or arithmetic must not be reused.
     // The leading number changes with the layout of a saved state.
@@ -982,8 +984,16 @@ fn handle(
         ),
         false => String::new(),
     };
+    let copied = match drafted.copied_proposed > drafted_before.copied_proposed {
+        true => format!(
+            "; copied: {} of {} proposed tokens accepted",
+            drafted.copied_accepted - drafted_before.copied_accepted,
+            drafted.copied_proposed - drafted_before.copied_proposed
+        ),
+        false => String::new(),
+    };
     eprintln!(
-        "[{number}] reply: {} tokens in {seconds:.1}s ({:.1} tokens/s), {finish_reason}{drafting}",
+        "[{number}] reply: {} tokens in {seconds:.1}s ({:.1} tokens/s), {finish_reason}{drafting}{copied}",
         generated.len(),
         rate(generated.len(), seconds)
     );

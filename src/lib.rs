@@ -8,6 +8,7 @@ pub mod draft;
 pub mod ggml;
 #[cfg(target_os = "macos")]
 pub mod gpu;
+pub mod lookup;
 pub mod model;
 pub mod prompt;
 pub mod quant;
