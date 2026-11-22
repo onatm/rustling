@@ -27,7 +27,7 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | Variable-loop checkpoint with a chosen pass count (`--passes`) | done; 16 tokens/s at 1 pass, 12 at 2, 9 at 3 |
 | GGUF conversions (Q4_K, Q5_0, Q6_K, Q8_0 blocks), multiplied in integer arithmetic (`src/ggml.rs`) | done; Q4_K_M at about 15 tokens/s against 10 for the checkpoint. The GPU only on the fast path |
 | Context window limit (`--context`) | done |
-| Metal for single-token generation | measured and set aside: per-dispatch overhead eats the gain |
+| Whole tokens on the GPU from a GGUF file, one submission each (`src/model/decode.rs`, `src/decode.metal`) | done, with `--backend metal-fast`; Q4_K_M at 24 tokens/s on a short prompt and 20 at 15,000 tokens of context, against 15 and 9.4 on the CPU |
 | Vision tower | later |
 
 ## Usage
@@ -103,6 +103,42 @@ rustling --model ~/models/Inkling-2-Mini-Q4_K_M.gguf serve
 - **Not available with GGUF**: the exact Metal backend (`auto` and `cpu` are the same thing), and `--activations`
   (the experts are no longer in the formats the model's activations were trained against).
 
+## Generating on the GPU
+
+With a GGUF file and `--backend metal-fast`, single tokens are generated entirely on the GPU. A token is one
+submission: every matrix product, norm, convolution, attention and expert of the 48 layer visits and the output
+projection, laid out once as a fixed list of about 1,900 kernels and run again for each token with only its
+position changed. On an M1 Max with Q4_K_M:
+
+| Context | CPU | GPU | llama.cpp (Metal) |
+|---|---|---|---|
+| a short prompt | about 15 tokens/s | 24.3 | 20.9 |
+| 15,000 tokens | about 9.4 | 20.6 | 18.3 |
+
+Token by token the CPU is held back by coordination more than arithmetic: a token is hundreds of short bursts of
+parallel work, each of which has to wake the thread pool, and other work on the machine takes cores away (with
+a busy virtual machine running it has dropped from 15 tokens/s to 10). The GPU has neither problem: at 15,000
+tokens of context it lost 2% with three and a half cores' worth of other work running, and about 10% with nearly
+five.
+
+What makes it fast is the shape of the kernels. A GPU thread gets through a loop slowly, about a hundred times
+slower than a CPU core, so nothing is left to one thread: a group of 32 threads shares one to eight rows of a
+matrix, each taking every so-manyth block and the group adding up, and the norms, reads and softmaxes are split
+the same way. All of a token's matrix products then take 23 ms, where a thread to a row took 46.
+
+The state stays where the rest of the engine keeps it, on the CPU. The GPU holds a copy of the keys and values
+to attend over, brought up to date before a token with whatever changed since (a prompt, a batch, tokens taken
+back) and matched by what the token adds to both; that copy takes about as much memory again as the state
+itself. So long prompts, the prompt cache and stepping back all work as before.
+
+The arithmetic is float throughout, where the CPU path rounds the inputs of a quantised matrix to bytes, so the
+two agree only approximately; llama.cpp computes the same way on a GPU. Against the CPU computing in floats,
+every layer visit matches to about one part in a million.
+
+Copying from the context and the draft model are not used while tokens come from the GPU: proposals are checked
+in a batch on the CPU, and a token of such a batch now costs more than a token from the GPU. `--draft` says so
+and is ignored.
+
 ## Context window
 
 `--context <TOKENS>` on `generate`, `chat` and `serve` limits how many tokens a prompt and its reply may take
@@ -143,7 +179,8 @@ as what follows now, up to 16 tokens when a long stretch matches, and the main m
 batch, as it checks the draft model's. A proposal costs a table lookup. llama.cpp calls this n-gram speculative
 decoding.
 
-It is on by default (`--no-copying` turns it off) and, like the draft model, changes the speed and not what is
+It is on by default wherever tokens are generated on the CPU (`--no-copying` turns it off) and, like the draft
+model, changes the speed and not what is
 generated: with `--temperature 0` the output is identical on the exact backends, and equal to rounding with
 `--backend metal-fast`. It rests in the same way when its guesses are being rejected. With a 15,000-token prompt
 of source code on a Q4_K_M conversion and an M1 Max, a reply that reasons and then writes out part of that code

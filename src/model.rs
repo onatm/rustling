@@ -107,12 +107,26 @@ const TOKEN_TILE: usize = NVFP4_MAX_BATCH;
 /// Tokens per tile in the dense products, where each token's vector is four times the size.
 const DENSE_TILE: usize = 16;
 
+#[cfg(target_os = "macos")]
+mod decode;
+
+/// Makes the CPU multiply quantised matrices by float inputs, as the GPU decoder does, where it normally rounds
+/// the inputs to bytes first. Slow; for checking the decoder against.
+pub(crate) static FLOAT_REFERENCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn float_reference() -> bool {
+    FLOAT_REFERENCE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Model<'a> {
     cfg: TextConfig,
     embed: Mat<'a>,
     unembed: Mat<'a>,
     activations: Activations,
     gpu: Option<Gpu>,
+    /// Generates single tokens on the GPU; built at the first one. Nothing when that failed.
+    #[cfg(target_os = "macos")]
+    decoder: std::sync::OnceLock<Option<std::sync::Mutex<decode::Decoder>>>,
     embed_norm: Vec<f32>,
     final_norm: Vec<f32>,
     output_query: Vec<f32>,
@@ -174,6 +188,9 @@ pub struct Forward {
     pub last: Seq,
     /// The hidden state entering each visit asked for with [`Model::forward_tapped`], in visit order.
     pub taps: Vec<Seq>,
+    /// The logits after the last token, when the pass computed them along the way: [`Model::logits`] of the
+    /// last state, to the path's own rounding.
+    pub logits: Option<Vec<f32>>,
 }
 
 /// Everything the tokens seen so far left behind for the tokens to come.
@@ -182,6 +199,24 @@ pub struct State {
     /// Number of tokens already processed, which is the position of the next one.
     position: usize,
     visits: Vec<VisitState>,
+    /// What a copy of this state kept elsewhere can still rely on.
+    #[serde(skip)]
+    track: Track,
+}
+
+/// How a state relates to the copy of its keys and values that the GPU decoder keeps. Every change gives the
+/// state a new `version`. `anchor` is the version the copy last matched, and the first `kept` tokens have not
+/// changed since, so bringing the copy up to date takes only the tokens after them.
+#[derive(Clone, Copy, Default)]
+struct Track {
+    version: u64,
+    anchor: u64,
+    kept: usize,
+}
+
+fn next_version() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl State {
@@ -197,6 +232,12 @@ impl State {
             .map(|v| v.keys.iter().chain(&v.values).chain(&v.convs).map(Vec::len).sum::<usize>())
             .sum();
         floats * size_of::<f32>()
+    }
+
+    /// Records a change that left the first `kept` tokens as they were.
+    fn changed(&mut self, kept: usize) {
+        self.track.version = next_version();
+        self.track.kept = self.track.kept.min(kept);
     }
 
     /// Whether the state has the shape `model` expects, as a check on one read back from disk.
@@ -219,6 +260,7 @@ impl State {
     pub fn truncate(&mut self, tokens: usize) {
         assert!(tokens <= MAX_ROLLBACK && tokens <= self.position, "cannot take back {tokens} tokens");
         self.position -= tokens;
+        self.changed(self.position);
         for visit in &mut self.visits {
             for head in visit.keys.iter_mut().chain(&mut visit.values) {
                 let dim = head.len() / (self.position + tokens - visit.first);
@@ -269,6 +311,7 @@ impl State {
             }
         }
         self.position = mark.position;
+        self.changed(self.position);
     }
 }
 
@@ -289,6 +332,37 @@ struct VisitState {
     convs: [Vec<f32>; 4],
     /// The width of each convolution's input.
     conv_channels: [usize; 4],
+}
+
+impl VisitState {
+    /// Adds one token computed elsewhere: its keys and values, and the inputs its convolutions took.
+    #[cfg(target_os = "macos")]
+    fn push(&mut self, cfg: &TextConfig, local: bool, position: usize, keys: &[f32], values: &[f32], conv_inputs: [&[f32]; 4]) {
+        let dim = cfg.head_dim;
+        self.drop_stale(cfg, local, position);
+        for (table, new) in [(&mut self.keys, keys), (&mut self.values, values)] {
+            for (head, new) in table.iter_mut().zip(new.chunks_exact(dim)) {
+                head.extend_from_slice(new);
+            }
+        }
+        for ((history, input), channels) in self.convs.iter_mut().zip(conv_inputs).zip(self.conv_channels) {
+            history.extend_from_slice(input);
+            let keep = (cfg.sconv_kernel_size - 1 + MAX_ROLLBACK) * channels;
+            history.drain(..history.len().saturating_sub(keep));
+        }
+    }
+
+    /// Drops the keys and values that have left a sliding layer's window, once a batch of them has: dropping
+    /// from the front moves everything kept, megabytes per visit, so until then they sit unread at the front.
+    fn drop_stale(&mut self, cfg: &TextConfig, local: bool, position: usize) {
+        let dim = cfg.head_dim;
+        let window_start = if local { (position + 1).saturating_sub(cfg.sliding_window_size) } else { 0 };
+        let stale = window_start.saturating_sub(self.first).min(self.keys[0].len() / dim);
+        if stale >= STALE_BATCH {
+            self.keys.iter_mut().chain(&mut self.values).for_each(|head| drop(head.drain(..stale * dim)));
+            self.first += stale;
+        }
+    }
 }
 
 impl<'a> Model<'a> {
@@ -411,6 +485,8 @@ impl<'a> Model<'a> {
                 false => options.activations,
             },
             gpu,
+            #[cfg(target_os = "macos")]
+            decoder: std::sync::OnceLock::new(),
         })
     }
 
@@ -481,7 +557,7 @@ impl<'a> Model<'a> {
         let heads = vec![Vec::new(); cfg.num_key_value_heads];
         let fresh = VisitState { keys: heads.clone(), values: heads, conv_channels, ..Default::default() };
         let visits = cfg.visits().iter().map(|_| fresh.clone()).collect();
-        State { position: 0, visits }
+        State { position: 0, visits, track: Track::default() }
     }
 
     /// Runs the decoder over `ids`, which continue the context in `state`. With `trace`, keeps the output of
@@ -511,7 +587,49 @@ impl<'a> Model<'a> {
     /// pass would be handed over and waited for separately, which costs more than the steps themselves when
     /// generating token by token.
     fn run(&self, ids: &[u32], state: &mut State, trace: bool, taps: &[usize]) -> Result<Forward> {
+        #[cfg(target_os = "macos")]
+        if let ([id], false) = (ids, trace)
+            && let Some(forward) = self.decode(*id, state, taps)?
+        {
+            return Ok(forward);
+        }
         in_pool(|| self.run_in_pool(ids, state, trace, taps))
+    }
+
+    /// Whether single tokens are generated on the GPU. A token then costs less than its share of a batch on the
+    /// CPU, which is where proposed tokens are checked, so proposing tokens (by copying, or from a draft model)
+    /// cannot gain anything.
+    pub fn decodes_on_gpu(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.gpu.as_ref().is_some_and(Gpu::fast) && self.layers[0].experts.gate_up.ggml().is_some();
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
+    /// One token on the GPU, when the model is set up for it: a GGUF file on the fast backend. Nothing
+    /// otherwise, or when the GPU fails, and the caller takes the CPU path with the state untouched.
+    #[cfg(target_os = "macos")]
+    fn decode(&self, id: u32, state: &mut State, taps: &[usize]) -> Result<Option<Forward>> {
+        let Some(gpu) = self.gpu.as_ref().filter(|_| self.decodes_on_gpu() && !float_reference()) else { return Ok(None) };
+        let decoder = self.decoder.get_or_init(|| match decode::Decoder::new(self, gpu) {
+            Ok(decoder) => Some(std::sync::Mutex::new(decoder)),
+            Err(error) => {
+                gpu_failed(&error);
+                None
+            }
+        });
+        let Some(decoder) = decoder else { return Ok(None) };
+        let embedded = self.embed(id)?;
+        let started = std::time::Instant::now();
+        let result = decoder.lock().expect("decoder lock").token(self, gpu, state, &embedded, taps);
+        timing::since(Stage::Token, started);
+        match result {
+            Ok(token) => Ok(Some(Forward { hidden: Vec::new(), last: token.last, taps: token.taps, logits: Some(token.logits) })),
+            Err(error) => {
+                gpu_failed(&error);
+                Ok(None)
+            }
+        }
     }
 
     fn run_in_pool(&self, ids: &[u32], state: &mut State, trace: bool, taps: &[usize]) -> Result<Forward> {
@@ -574,13 +692,14 @@ impl<'a> Model<'a> {
         }
         run(end..cfg.num_hidden_layers, 0, &mut hidden, &mut blocks, None);
         drop(run);
+        state.changed(state.position);
         state.position += ids.len();
 
         let block_refs: Vec<&Seq> = blocks.iter().collect();
         let mut last = attn_res(&self.output_query, &block_refs, &hidden, h).remove(0);
         last.chunks_exact_mut(h).for_each(|x| rms_norm(x, Some(&self.final_norm), eps));
         round_all(self.bf16(), &mut last);
-        Ok(Forward { hidden: visits, last, taps: tapped })
+        Ok(Forward { hidden: visits, last, taps: tapped, logits: None })
     }
 
     /// Soft-capped logits over the usable vocabulary for one final state.
@@ -817,13 +936,7 @@ impl<'a> Model<'a> {
 
         // Sliding layers see the last `sliding_window_size` tokens; full layers see everything.
         let window_start = |t: usize| if layer.local { (t + 1).saturating_sub(cfg.sliding_window_size) } else { 0 };
-        // Dropping from the front moves everything kept, megabytes per visit, so it waits until a batch of
-        // tokens has left the window; until then they sit unread at the front.
-        let stale = window_start(position).saturating_sub(state.first).min(state.keys[0].len() / dim);
-        if stale >= STALE_BATCH {
-            state.keys.iter_mut().chain(&mut state.values).for_each(|head| drop(head.drain(..stale * dim)));
-            state.first += stale;
-        }
+        state.drop_stale(cfg, layer.local, position);
         for (table, new) in [(&mut state.keys, &k), (&mut state.values, &v)] {
             for (kv, head) in table.iter_mut().enumerate() {
                 new.chunks_exact(kv_dim).for_each(|token| head.extend_from_slice(&token[kv * dim..][..dim]));
@@ -1107,7 +1220,7 @@ impl<'a> Model<'a> {
         }
 
         let contributions = match self.activations {
-            _ if layer.experts.gate_up.ggml().is_some() => self.expert_outputs_ggml(layer, x, &tokens_of),
+            _ if layer.experts.gate_up.ggml().is_some() && !float_reference() => self.expert_outputs_ggml(layer, x, &tokens_of),
             Activations::Float | Activations::FloatBf16 => self.expert_outputs_float(layer, x, &tokens_of),
             Activations::Quantised => self.expert_outputs_quantised(layer, x, &tokens_of),
         };
@@ -1800,7 +1913,7 @@ impl<'a> Mat<'a> {
 
     /// Whether the matrix is multiplied in integer arithmetic, against activations rounded to bytes.
     fn int8(&self) -> bool {
-        self.format.is_quantised() && self.cols.is_multiple_of(crate::ggml::INT8_BLOCK)
+        self.format.is_quantised() && self.cols.is_multiple_of(crate::ggml::INT8_BLOCK) && !float_reference()
     }
 
     /// `W x` for each of the rounded activations `xs`, rows `first..first + outs[i].len()`, into `outs`.

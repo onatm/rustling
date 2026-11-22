@@ -21,6 +21,8 @@ pub enum Stage {
     ExpertOutput,
     /// The output projection onto the vocabulary.
     Logits,
+    /// A whole token on the GPU: every layer visit and the output projection in one submission.
+    Token,
     /// The draft model's layers, for a block of proposals.
     DraftLayers,
     /// The draft model's recurrent head, including its vocabulary projections.
@@ -29,7 +31,7 @@ pub enum Stage {
     DraftContext,
 }
 
-const STAGES: [Stage; 10] = [
+const STAGES: [Stage; 11] = [
     Stage::Inputs,
     Stage::Projections,
     Stage::Attention,
@@ -37,6 +39,7 @@ const STAGES: [Stage; 10] = [
     Stage::Experts,
     Stage::ExpertOutput,
     Stage::Logits,
+    Stage::Token,
     Stage::DraftLayers,
     Stage::DraftHead,
     Stage::DraftContext,

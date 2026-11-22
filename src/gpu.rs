@@ -535,6 +535,132 @@ impl Gpu {
     }
 }
 
+/// A buffer shared with the GPU that the caller also reads and writes directly, between runs.
+pub(crate) struct Shared {
+    buffer: Buffer,
+    /// How many bytes the caller may touch: none for weights wrapped in place, which are only bound.
+    bytes: usize,
+}
+
+// SAFETY: as for `Gpu`: Metal buffers may be used from any thread, and access to the contents goes through
+// `&self`/`&mut self`.
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
+
+impl Shared {
+    pub(crate) fn floats(&self) -> &[f32] {
+        // SAFETY: a shared-mode buffer of `bytes` bytes, page-aligned, that no kernel is writing: runs are
+        // synchronous and take the buffers by reference.
+        unsafe { std::slice::from_raw_parts(self.buffer.contents().as_ptr() as *const f32, self.bytes / 4) }
+    }
+
+    pub(crate) fn floats_mut(&mut self) -> &mut [f32] {
+        // SAFETY: as `floats`, and `&mut self` rules out any other view.
+        unsafe { std::slice::from_raw_parts_mut(self.buffer.contents().as_ptr() as *mut f32, self.bytes / 4) }
+    }
+
+    pub(crate) fn words_mut(&mut self) -> &mut [u32] {
+        // SAFETY: as `floats_mut`.
+        unsafe { std::slice::from_raw_parts_mut(self.buffer.contents().as_ptr() as *mut u32, self.bytes / 4) }
+    }
+}
+
+/// Compiled kernels, addressed by their place in the list they were built from.
+pub(crate) struct Kernels(Vec<Pipeline>);
+
+// SAFETY: pipeline states are immutable once built and documented as thread-safe.
+unsafe impl Send for Kernels {}
+unsafe impl Sync for Kernels {}
+
+/// One kernel of a program: which buffers it is given, at which byte offsets, its parameters and its grid.
+pub(crate) struct Step {
+    pub kernel: usize,
+    /// `(buffer, byte offset)` for each binding in order; the parameters take the next binding.
+    pub buffers: Vec<(usize, usize)>,
+    pub params: Vec<u8>,
+    pub grid: Grid,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Grid {
+    /// A thread per cell.
+    Threads(usize, usize),
+    /// A group of 32 threads per cell.
+    Groups(usize, usize),
+    /// So many groups, each of the given number of threads (a multiple of 32).
+    Wide { groups: usize, threads: usize },
+    /// A thread per visible key and row; how many keys are visible is known only when the program runs.
+    Keys { local: bool, rows: usize },
+}
+
+impl Gpu {
+    /// A zeroed buffer of `bytes` bytes.
+    pub(crate) fn shared(&self, bytes: usize) -> Result<Shared> {
+        let bytes = bytes.next_multiple_of(16).max(16);
+        Ok(Shared { buffer: empty(&self.device, bytes)?, bytes })
+    }
+
+    /// Weights as a buffer and the offset they start at: wrapped in place when they lie in the checkpoint's
+    /// memory map, which must then outlive the buffer.
+    pub(crate) fn wrap(&self, bytes: &[u8]) -> Result<(Shared, usize)> {
+        let (buffer, offset) = self.weights(bytes)?;
+        Ok((Shared { buffer, bytes: 0 }, offset))
+    }
+
+    /// Compiles `source` and builds the kernels named.
+    pub(crate) fn kernels(&self, source: &str, names: &[&str]) -> Result<Kernels> {
+        let library = self
+            .device
+            .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&MTLCompileOptions::new()))
+            .map_err(|e| anyhow!("compiling kernels: {}", e.localizedDescription()))?;
+        let build = |name: &&str| -> Result<Pipeline> {
+            let function = library.newFunctionWithName(&NSString::from_str(name)).with_context(|| format!("no kernel {name}"))?;
+            self.device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|e| anyhow!("building kernel {name}: {}", e.localizedDescription()))
+        };
+        Ok(Kernels(names.iter().map(build).collect::<Result<_>>()?))
+    }
+
+    /// Runs `steps` in order as one submission and waits for it. `keys` is how many keys a sliding layer and a
+    /// full layer see, for the grids that depend on it. Returns the seconds the GPU spent.
+    pub(crate) fn run(&self, kernels: &[&Kernels], steps: &[Step], buffers: &[Shared], keys: [usize; 2]) -> Result<f64> {
+        let pipelines: Vec<&Pipeline> = kernels.iter().flat_map(|kernels| &kernels.0).collect();
+        let commands = self.queue.commandBuffer().context("creating a command buffer")?;
+        let encoder = commands.computeCommandEncoder().context("creating a compute encoder")?;
+        let wide = MTLSize { width: 32, height: 1, depth: 1 };
+        for step in steps {
+            encoder.setComputePipelineState(pipelines[step.kernel]);
+            // SAFETY: the buffers outlive the submission, which is waited for below; the offsets were laid out
+            // within them by the program's builder; Metal copies the parameter bytes during the call.
+            unsafe {
+                for (index, &(buffer, offset)) in step.buffers.iter().enumerate() {
+                    encoder.setBuffer_offset_atIndex(Some(&buffers[buffer].buffer), offset, index);
+                }
+                if !step.params.is_empty() {
+                    let pointer = NonNull::new(step.params.as_ptr() as *mut c_void).expect("parameters");
+                    encoder.setBytes_length_atIndex(pointer, step.params.len(), step.buffers.len());
+                }
+            }
+            let size = |width: usize, height: usize| MTLSize { width, height, depth: 1 };
+            match step.grid {
+                Grid::Threads(width, height) => encoder.dispatchThreads_threadsPerThreadgroup(size(width, height), wide),
+                Grid::Groups(width, height) => encoder.dispatchThreadgroups_threadsPerThreadgroup(size(width, height), wide),
+                Grid::Wide { groups, threads } => encoder
+                    .dispatchThreadgroups_threadsPerThreadgroup(size(groups, 1), MTLSize { width: threads, height: 1, depth: 1 }),
+                Grid::Keys { local, rows } => {
+                    encoder.dispatchThreads_threadsPerThreadgroup(size(keys[usize::from(!local)], rows), wide)
+                }
+            }
+        }
+        encoder.endEncoding();
+        commands.commit();
+        commands.waitUntilCompleted();
+        finish(&commands)?;
+        Ok(commands.GPUEndTime() - commands.GPUStartTime())
+    }
+}
+
 fn finish(commands: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<()> {
     match commands.error() {
         Some(error) => Err(anyhow!("Metal command buffer failed: {}", error.localizedDescription())),
@@ -605,42 +731,40 @@ mod tests {
         }
     }
 
-    /// What a whole token's matrix products cost on the GPU from a GGUF file, in one command buffer, against the
-    /// CPU's results: `cargo test --release --lib gpu::tests::gguf_token -- --ignored --nocapture`.
+    /// What a token's matrix products cost with a group of 32 threads sharing 1, 2, 4 or 8 rows, and what a
+    /// dispatch costs by itself: `cargo test --release --lib gpu::tests::row_kernels -- --ignored --nocapture`.
     #[test]
     #[ignore]
-    fn gguf_token() {
+    fn row_kernels() {
         use crate::checkpoint::{Checkpoint, resolve_model};
-        use crate::ggml::Format;
-        use std::time::Instant;
         let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
         let gpu = Gpu::new(&weights.maps(), false).unwrap();
-        let options = MTLCompileOptions::new();
-        let library = gpu
-            .device
-            .newLibraryWithSource_options_error(&NSString::from_str(include_str!("gguf.metal")), Some(&options))
-            .map_err(|e| e.localizedDescription().to_string())
-            .unwrap();
-        let pipeline = |name: &str| {
-            let function = library.newFunctionWithName(&NSString::from_str(name)).unwrap();
-            gpu.device.newComputePipelineStateWithFunction_error(&function).unwrap()
-        };
-        let kernels = [pipeline("mv_q4k"), pipeline("mv_q5_0"), pipeline("mv_q6k"), pipeline("mv_q8_0")];
-        let kernel = |format: Format| match format {
-            Format::Q4K => &kernels[0],
-            Format::Q5_0 => &kernels[1],
-            Format::Q6K => &kernels[2],
-            Format::Q8_0 => &kernels[3],
+        let kernels = gpu.kernels(include_str!("gguf.metal"), &["row_q4k", "row_q5_0", "row_q6k", "row_q8_0", "row_f32"]).unwrap();
+        let index = |format: Format| match format {
+            Format::Q4K => 0,
+            Format::Q5_0 => 1,
+            Format::Q6K => 2,
+            Format::Q8_0 => 3,
             other => panic!("{other:?}"),
         };
-        let x = floats(8 * 3072, 5);
-        let x_buffer = copied(&gpu.device, &x).unwrap();
+        let word = |values: &[usize]| -> Vec<u8> { values.iter().flat_map(|v| (*v as u32).to_le_bytes()).collect() };
+        // Buffers: inputs, outputs, the matrices' order, then the weights.
+        let mut buffers = vec![gpu.shared(8 * 3072 * 4).unwrap(), gpu.shared(200_058 * 4).unwrap(), gpu.shared(32).unwrap()];
+        buffers[0].floats_mut().copy_from_slice(&floats(8 * 3072, 5));
+        buffers[2].words_mut().copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
+
+        for (count, rows) in [(300usize, 1usize), (3000, 1), (300, 2304)] {
+            let step = || Step { kernel: 4, buffers: vec![(0, 0), (0, 0), (1, 0), (2, 0)], params: word(&[rows, 64, 256, 1, 0]), grid: Grid::Groups(rows, 1) };
+            let steps: Vec<Step> = (0..count).map(|_| step()).collect();
+            let best = (0..3).map(|_| gpu.run(&[&kernels], &steps, &buffers, [0, 0]).unwrap()).fold(f64::MAX, f64::min);
+            eprintln!("{count} dispatches of {rows} short rows: {:.2} ms ({:.1} us each)", best * 1e3, best * 1e6 / count as f64);
+        }
+
         // (name, rows, cols, matrices)
         let mut jobs: Vec<(String, usize, usize, usize)> = Vec::new();
         for visit in 0..48 {
-            let l = visit % 24;
-            let p = format!("model.llm.layers.{l}");
+            let p = format!("model.llm.layers.{}", visit % 24);
             for (name, rows, cols) in [
                 ("attn.wq_du.weight", 3072, 2304),
                 ("attn.wk_dv.weight", 1024, 2304),
@@ -651,177 +775,44 @@ mod tests {
             ] {
                 jobs.push((format!("{p}.{name}"), rows, cols, 1));
             }
-            jobs.push((format!("{p}.mlp.experts.w13_weight"), 4608, 2304, 8));
+            jobs.push((format!("{p}.mlp.experts.w13_weight"), 2304, 2304, 8));
             jobs.push((format!("{p}.mlp.experts.w2_weight"), 2304, 1152, 8));
         }
         jobs.push(("model.llm.unembed.weight".to_owned(), 200_058, 2304, 1));
-        let out = empty(&gpu.device, 200_058 * 4).unwrap();
-        let prepared: Vec<_> = jobs
-            .iter()
-            .map(|(name, rows, cols, matrices)| {
-                let (format, _, bytes) = weights.rows(name).unwrap();
-                let (buffer, offset) = gpu.weights(bytes).unwrap();
-                let stride = (rows * format.row_bytes(*cols).unwrap()) as u32;
-                (format, buffer, offset, [*rows as u32, *cols as u32, stride], *matrices)
-            })
-            .collect();
-        let products: usize = jobs.iter().map(|(_, rows, cols, matrices)| rows * cols * matrices).sum();
-
-        for (label, one_encoder) in [("one encoder", true), ("an encoder per kernel", false), ("one encoder", true)] {
-            let started = Instant::now();
-            let commands = gpu.queue.commandBuffer().unwrap();
-            let mut shared = one_encoder.then(|| commands.computeCommandEncoder().unwrap());
-            for (format, buffer, offset, params, matrices) in &prepared {
-                let pipeline = kernel(*format);
-                let own = (!one_encoder).then(|| commands.computeCommandEncoder().unwrap());
-                let encoder = shared.as_ref().or(own.as_ref()).unwrap();
-                encoder.setComputePipelineState(pipeline);
-                unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(buffer), *offset, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&x_buffer), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&out), 0, 2);
-                    encoder.setBytes_length_atIndex(NonNull::from(params).cast::<c_void>(), 12, 3);
-                }
-                let width = pipeline.threadExecutionWidth();
-                encoder.dispatchThreads_threadsPerThreadgroup(
-                    MTLSize { width: params[0] as usize, height: *matrices, depth: 1 },
-                    MTLSize { width, height: 1, depth: 1 },
-                );
-                if let Some(own) = own {
-                    own.endEncoding();
-                }
-            }
-            if let Some(shared) = shared.take() {
-                shared.endEncoding();
-            }
-            let encoded = started.elapsed().as_secs_f64();
-            commands.commit();
-            commands.waitUntilCompleted();
-            finish(&commands).unwrap();
-            let seconds = started.elapsed().as_secs_f64();
-            eprintln!(
-                "{label}: {} kernels, {:.2} G products in {:.1} ms ({:.1} ms encoding), GPU time {:.1} ms",
-                prepared.len(),
-                products as f64 / 1e9,
-                seconds * 1e3,
-                encoded * 1e3,
-                (commands.GPUEndTime() - commands.GPUStartTime()) * 1e3,
-            );
-        }
-
-        // Where the time goes, and what a tuned Q4_K kernel changes.
-        let fast = pipeline("mv_q4k_fast");
-        let sums: Vec<f32> = x.chunks(32).map(|c| c.iter().sum()).collect();
-        let sums_buffer = copied(&gpu.device, &sums).unwrap();
-        let groups: [(&str, Box<dyn Fn(&str) -> bool>, bool); 6] = [
-            ("dense", Box::new(|n: &str| n.contains(".attn.")), false),
-            ("dense, tuned Q4_K", Box::new(|n: &str| n.contains(".attn.")), true),
-            ("gate_up", Box::new(|n: &str| n.contains("w13")), false),
-            ("gate_up, tuned Q4_K", Box::new(|n: &str| n.contains("w13")), true),
-            ("down", Box::new(|n: &str| n.contains("w2_")), false),
-            ("logits", Box::new(|n: &str| n.contains("unembed")), false),
-        ];
-        for (label, wanted, tuned) in &groups {
-            let mut best = f64::MAX;
-            let mut check = 0.0f32;
-            for _ in 0..3 {
-                let commands = gpu.queue.commandBuffer().unwrap();
-                let encoder = commands.computeCommandEncoder().unwrap();
-                for ((name, ..), (format, buffer, offset, params, matrices)) in jobs.iter().zip(&prepared) {
-                    if !wanted(name) {
-                        continue;
-                    }
-                    let tuned = *tuned && *format == Format::Q4K;
-                    let pipeline = if tuned { &fast } else { kernel(*format) };
-                    encoder.setComputePipelineState(pipeline);
-                    unsafe {
-                        encoder.setBuffer_offset_atIndex(Some(buffer), *offset, 0);
-                        encoder.setBuffer_offset_atIndex(Some(&x_buffer), 0, 1);
-                        encoder.setBuffer_offset_atIndex(Some(&out), 0, 2);
-                        encoder.setBytes_length_atIndex(NonNull::from(params).cast::<c_void>(), 12, 3);
-                        encoder.setBuffer_offset_atIndex(Some(&sums_buffer), 0, 4);
-                    }
-                    let width = pipeline.threadExecutionWidth();
-                    let rows = params[0] as usize / if tuned { 2 } else { 1 };
-                    encoder.dispatchThreads_threadsPerThreadgroup(
-                        MTLSize { width: rows, height: *matrices, depth: 1 },
-                        MTLSize { width, height: 1, depth: 1 },
-                    );
-                }
-                encoder.endEncoding();
-                commands.commit();
-                commands.waitUntilCompleted();
-                best = best.min(commands.GPUEndTime() - commands.GPUStartTime());
-                check = read(&out, 4608)[4607];
-            }
-            eprintln!("{label}: {:.1} ms (last value {check})", best * 1e3);
-        }
-
-        // A visit's experts as their own submission: what sharing them between the CPU and the GPU would cost.
-        for share in [2usize, 3, 4, 8] {
-            let started = Instant::now();
-            let mut gpu_time = 0.0;
-            for visit in 0..48 {
-                let commands = gpu.queue.commandBuffer().unwrap();
-                let encoder = commands.computeCommandEncoder().unwrap();
-                for (format, buffer, offset, params, _) in &prepared[visit * 8 + 6..visit * 8 + 8] {
-                    let tuned = *format == Format::Q4K;
-                    let pipeline = if tuned { &fast } else { kernel(*format) };
-                    encoder.setComputePipelineState(pipeline);
-                    unsafe {
-                        encoder.setBuffer_offset_atIndex(Some(buffer), *offset, 0);
-                        encoder.setBuffer_offset_atIndex(Some(&x_buffer), 0, 1);
-                        encoder.setBuffer_offset_atIndex(Some(&out), 0, 2);
-                        encoder.setBytes_length_atIndex(NonNull::from(params).cast::<c_void>(), 12, 3);
-                        encoder.setBuffer_offset_atIndex(Some(&sums_buffer), 0, 4);
-                    }
-                    let width = pipeline.threadExecutionWidth();
-                    let rows = params[0] as usize / if tuned { 2 } else { 1 };
-                    encoder.dispatchThreads_threadsPerThreadgroup(
-                        MTLSize { width: rows, height: share, depth: 1 },
-                        MTLSize { width, height: 1, depth: 1 },
-                    );
-                }
-                encoder.endEncoding();
-                commands.commit();
-                commands.waitUntilCompleted();
-                gpu_time += commands.GPUEndTime() - commands.GPUStartTime();
-            }
-            let wall = started.elapsed().as_secs_f64();
-            eprintln!(
-                "{share} experts per visit on the GPU: {:.2} ms a visit, of which the GPU worked {:.2} ms",
-                wall / 48.0 * 1e3,
-                gpu_time / 48.0 * 1e3
-            );
-        }
-
-        // Each kernel against the CPU decoder, on real rows.
-        for (name, rows, cols) in [
-            ("model.llm.layers.3.attn.wq_du.weight", 3072, 2304),
-            ("model.llm.layers.0.attn.wv_dv.weight", 1024, 2304),
-            ("model.llm.layers.3.mlp.experts.w2_weight", 2304, 1152),
-            ("model.llm.layers.21.mlp.experts.w2_weight", 2304, 1152),
-        ] {
+        let mut prepared = Vec::new();
+        for (name, rows, cols, matrices) in &jobs {
             let (format, _, bytes) = weights.rows(name).unwrap();
-            let (buffer, offset) = gpu.weights(bytes).unwrap();
-            let row_bytes = format.row_bytes(cols).unwrap();
-            let params = [rows as u32, cols as u32, (rows * row_bytes) as u32];
-            let commands = gpu.queue.commandBuffer().unwrap();
-            gpu.encode(&commands, kernel(format), &[(&buffer, offset), (&x_buffer, 0), (&out, 0)], &params, (rows, 1)).unwrap();
-            commands.commit();
-            commands.waitUntilCompleted();
-            finish(&commands).unwrap();
-            let got = read(&out, rows);
-            let mut decoded = vec![0.0f32; cols];
-            let mut worst = 0.0f64;
-            for r in [0, 1, rows / 2, rows - 1] {
-                format.decode_row(&bytes[r * row_bytes..][..row_bytes], &mut decoded);
-                let exact: f64 = decoded.iter().zip(&x).map(|(w, x)| *w as f64 * *x as f64).sum();
-                let size: f64 = decoded.iter().zip(&x).map(|(w, x)| (*w as f64 * *x as f64).abs()).sum();
-                worst = worst.max((got[r] as f64 - exact).abs() / size);
-            }
-            eprintln!("{format:?}: worst error {worst:.1e} of the terms' size");
-            assert!(worst < 1e-5, "{format:?}");
+            let (buffer, offset) = gpu.wrap(bytes).unwrap();
+            buffers.push(buffer);
+            prepared.push((index(format), buffers.len() - 1, offset, *rows, *cols, rows * format.row_bytes(*cols).unwrap(), *matrices));
+        }
+        let groups: [(&str, &dyn Fn(&str) -> bool); 5] = [
+            ("projections", &|n: &str| n.contains(".attn.")),
+            ("gate_up", &|n: &str| n.contains("w13")),
+            ("down", &|n: &str| n.contains("w2_")),
+            ("logits", &|n: &str| n.contains("unembed")),
+            ("everything", &|_: &str| true),
+        ];
+        for (label, wanted) in groups {
+            let times: Vec<String> = [1usize, 2, 4, 8]
+                .iter()
+                .map(|&together| {
+                    let steps: Vec<Step> = jobs
+                        .iter()
+                        .zip(&prepared)
+                        .filter(|((name, ..), _)| wanted(name))
+                        .map(|(_, &(kernel, buffer, offset, rows, cols, stride, matrices))| Step {
+                            kernel,
+                            buffers: vec![(buffer, offset), (0, 0), (1, 0), (2, 0)],
+                            params: word(&[rows, cols, stride, together, cols]),
+                            grid: Grid::Groups(rows.div_ceil(together), matrices),
+                        })
+                        .collect();
+                    let best = (0..3).map(|_| gpu.run(&[&kernels], &steps, &buffers, [0, 0]).unwrap()).fold(f64::MAX, f64::min);
+                    format!("{:.1}", best * 1e3)
+                })
+                .collect();
+            eprintln!("{label}: {} ms with a group of threads to 1, 2, 4, 8 rows", times.join(", "));
         }
     }
 

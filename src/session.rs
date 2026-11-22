@@ -16,6 +16,8 @@ pub struct Session<'m, 'a> {
     context: Vec<u32>,
     /// The final hidden state of the last token in `context`: what the next token is predicted from.
     last: Vec<f32>,
+    /// The logits that state gives, when the pass that produced it computed them too.
+    ahead: Option<Vec<f32>>,
     /// The most tokens the context may hold, prompt and reply together.
     window: usize,
     /// A draft model proposing several tokens at a time, and its view of the context.
@@ -163,6 +165,7 @@ impl<'m, 'a> Session<'m, 'a> {
             state: model.new_state(),
             context: Vec::new(),
             last: Vec::new(),
+            ahead: None,
             window: usize::MAX,
             draft: None,
             drafting: Drafting::default(),
@@ -234,6 +237,7 @@ impl<'m, 'a> Session<'m, 'a> {
         }
         self.context.truncate(mark.tokens);
         self.last = mark.last.clone();
+        self.ahead = None;
         Ok(())
     }
 
@@ -250,6 +254,7 @@ impl<'m, 'a> Session<'m, 'a> {
     /// The session's current context, moved out without copying. The session is left empty.
     pub fn take_snapshot(&mut self) -> Snapshot {
         let draft = self.draft.as_mut().map(|(draft, state)| std::mem::replace(state, draft.new_state()));
+        self.ahead = None;
         self.mark = None;
         Snapshot {
             tokens: std::mem::take(&mut self.context),
@@ -277,6 +282,7 @@ impl<'m, 'a> Session<'m, 'a> {
             _ => anyhow::bail!("the snapshot and the session disagree on whether a draft model is in use"),
         }
         (self.context, self.state, self.last) = (snapshot.tokens, snapshot.state, snapshot.last);
+        self.ahead = None;
         self.mark = None;
         Ok(())
     }
@@ -303,6 +309,7 @@ impl<'m, 'a> Session<'m, 'a> {
                 self.state = self.model.new_state();
                 self.context.clear();
                 self.last.clear();
+                self.ahead = None;
                 self.mark = None;
                 if let Some((draft, state)) = &mut self.draft {
                     *state = draft.new_state();
@@ -335,6 +342,7 @@ impl<'m, 'a> Session<'m, 'a> {
             }
         };
         self.last = forward.last[forward.last.len() - hidden..].to_vec();
+        self.ahead = forward.logits;
         self.context.extend_from_slice(ids);
         Ok(())
     }
@@ -342,7 +350,10 @@ impl<'m, 'a> Session<'m, 'a> {
     /// The logits for the token after the context.
     pub fn logits(&self) -> Result<Vec<f32>> {
         anyhow::ensure!(!self.context.is_empty(), "nothing to predict from: the context is empty");
-        self.model.logits(&self.last)
+        match &self.ahead {
+            Some(logits) => Ok(logits.clone()),
+            None => self.model.logits(&self.last),
+        }
     }
 
     /// Samples tokens until the model ends its turn or a limit is hit, calling `on_token` with each token and the
@@ -376,7 +387,9 @@ impl<'m, 'a> Session<'m, 'a> {
         // draft and copying are judged apart, since text that defeats one may suit the other.
         let mut pacing = Pacing::new();
         let mut copying = Pacing::new();
-        let mut lookup = Lookup::new(&self.context);
+        // Proposals are checked in a batch on the CPU, which only pays while single tokens are computed there too.
+        let proposing = !self.model.decodes_on_gpu();
+        let mut lookup = Lookup::new(if proposing { &self.context } else { &[] });
         let mut logits = self.logits()?;
         let mut next = sampler.sample(&logits);
         loop {
@@ -388,10 +401,10 @@ impl<'m, 'a> Session<'m, 'a> {
             // One round: something proposes what follows `next`, and the main model runs `next` and the
             // proposals as one batch. Its output after each token says whether the following proposal stands.
             // Copying is tried first: it costs nothing to propose, and where it applies it reaches further.
-            let copied = if self.copying && !copying.is_resting() { lookup.propose() } else { &[][..] };
+            let copied = if proposing && self.copying && !copying.is_resting() { lookup.propose() } else { &[][..] };
             let (proposal, from_draft) = match &self.draft {
                 _ if !copied.is_empty() => (copied.to_vec(), false),
-                Some((draft, draft_state)) if !pacing.is_resting() => (draft.propose(draft_state, next, self.model)?, true),
+                Some((draft, draft_state)) if proposing && !pacing.is_resting() => (draft.propose(draft_state, next, self.model)?, true),
                 _ => (Vec::new(), false),
             };
             if proposal.is_empty() && !from_draft {
@@ -399,7 +412,7 @@ impl<'m, 'a> Session<'m, 'a> {
                 self.extend(&[next])?;
                 logits = self.logits()?;
                 next = sampler.sample(&logits);
-                if self.draft.is_some() {
+                if self.draft.is_some() && proposing {
                     self.drafting.rested += 1;
                 }
                 pacing.passed(1);
@@ -464,6 +477,7 @@ impl<'m, 'a> Session<'m, 'a> {
             }
             self.context.extend_from_slice(&batch[..kept]);
             self.last = forward.last[(kept - 1) * hidden..][..hidden].to_vec();
+            self.ahead = None;
             if let Some(stop) = stop {
                 return Ok((generated, stop));
             }

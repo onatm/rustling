@@ -650,13 +650,21 @@ fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Jo
         },
         _ => None,
     };
+    if draft.is_some() && model.decodes_on_gpu() {
+        eprintln!("--draft is not used: tokens are generated on the GPU, where one costs less than checking a proposal");
+    }
+    let draft = draft.filter(|_| !model.decodes_on_gpu());
     // Bring the weights into memory and run a token through the model, so the first request is not the slow one.
     let started = std::time::Instant::now();
     let bytes = checkpoint.read_through();
     if let Err(error) = model.warm_up() {
         return drop(ready.send(Err(error.context("warming up"))));
     }
-    let backend = if model.uses_gpu() { "Metal for large batches" } else { "CPU" };
+    let backend = match (model.uses_gpu(), model.decodes_on_gpu()) {
+        (_, true) => "Metal for long prompts and for generating",
+        (true, false) => "Metal for large batches",
+        (false, false) => "CPU",
+    };
     let drafting = if draft.is_some() { ", with the draft model" } else { "" };
     eprintln!(
         "model loaded ({backend}{drafting}); read {:.1} GB and warmed up in {:.1}s",

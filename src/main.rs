@@ -250,6 +250,14 @@ fn load_config(model_dir: &std::path::Path) -> Result<Config> {
     }
 }
 
+/// Whether a draft model can speed this model up; says why not when it cannot.
+fn drafting_pays(model: &Model) -> bool {
+    if model.decodes_on_gpu() {
+        eprintln!("--draft is not used: tokens are generated on the GPU, where one costs less than checking a proposal");
+    }
+    !model.decodes_on_gpu()
+}
+
 /// How many performance cores an Apple silicon machine has; nothing elsewhere, or if the system will not say.
 fn performance_cores() -> Option<usize> {
     if !cfg!(target_os = "macos") {
@@ -466,6 +474,7 @@ fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, top: bool, t
         .as_ref()
         .map(|weights| Draft::load(&config, weights).map(|draft| draft.with_min_confidence(run.draft_confidence)))
         .transpose()?;
+    let draft = draft.filter(|_| drafting_pays(&model));
     let mut session = match &draft {
         Some(draft) => Session::new(&model).with_window(run.window()).with_copying(!run.no_copying).with_draft(draft),
         None => Session::new(&model).with_window(run.window()).with_copying(!run.no_copying),
@@ -550,6 +559,7 @@ fn chat(model_dir: &std::path::Path, system: Option<&str>, run: &RunArgs) -> Res
         .as_ref()
         .map(|weights| Draft::load(&config, weights).map(|draft| draft.with_min_confidence(run.draft_confidence)))
         .transpose()?;
+    let draft = draft.filter(|_| drafting_pays(&model));
     let new_session = || match &draft {
         Some(draft) => Session::new(&model).with_window(run.window()).with_copying(!run.no_copying).with_draft(draft),
         None => Session::new(&model).with_window(run.window()).with_copying(!run.no_copying),
