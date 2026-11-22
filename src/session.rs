@@ -20,6 +20,17 @@ pub struct Session<'m, 'a> {
     /// A draft model proposing several tokens at a time, and its view of the context.
     draft: Option<(&'m Draft<'a>, DraftState)>,
     drafting: Drafting,
+    /// A point in the present context that [`Session::rewind`] can go back to.
+    mark: Option<Mark>,
+}
+
+/// What it takes to come back to a point in a session's context: far less than a [`Snapshot`], because most of
+/// the state only grows and needs no copy. It lasts while the context still starts with the marked tokens.
+struct Mark {
+    tokens: usize,
+    state: crate::model::Mark,
+    last: Vec<f32>,
+    draft_head_context: Option<Vec<f32>>,
 }
 
 /// A session's context frozen at one point: the tokens and everything they left behind. Restoring it puts a
@@ -149,6 +160,7 @@ impl<'m, 'a> Session<'m, 'a> {
             window: usize::MAX,
             draft: None,
             drafting: Drafting::default(),
+            mark: None,
         }
     }
 
@@ -181,6 +193,35 @@ impl<'m, 'a> Session<'m, 'a> {
         &self.context
     }
 
+    /// Marks the present context as a point to come back to, replacing any earlier mark. A reply is generated
+    /// from the end of a prompt, and a request that repeats the prompt but not the reply (a retry, or history
+    /// the client has rewritten) can then start from there instead of from nothing.
+    pub fn mark(&mut self) {
+        self.mark = (!self.context.is_empty()).then(|| Mark {
+            tokens: self.context.len(),
+            state: self.model.mark(&self.state),
+            last: self.last.clone(),
+            draft_head_context: self.draft.as_ref().map(|(_, state)| state.head_context().to_vec()),
+        });
+    }
+
+    /// How many tokens of the present context the mark covers; none without a mark.
+    pub fn marked(&self) -> usize {
+        self.mark.as_ref().map_or(0, |mark| mark.tokens)
+    }
+
+    /// Takes the context back to the mark, which stays for another time.
+    pub fn rewind(&mut self) -> Result<()> {
+        let Some(mark) = &self.mark else { anyhow::bail!("the session has no mark to go back to") };
+        self.state.rewind(&mark.state);
+        if let (Some((_, state)), Some(head_context)) = (&mut self.draft, &mark.draft_head_context) {
+            state.rewind(mark.tokens, head_context.clone());
+        }
+        self.context.truncate(mark.tokens);
+        self.last = mark.last.clone();
+        Ok(())
+    }
+
     /// A copy of the session's current context.
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
@@ -194,6 +235,7 @@ impl<'m, 'a> Session<'m, 'a> {
     /// The session's current context, moved out without copying. The session is left empty.
     pub fn take_snapshot(&mut self) -> Snapshot {
         let draft = self.draft.as_mut().map(|(draft, state)| std::mem::replace(state, draft.new_state()));
+        self.mark = None;
         Snapshot {
             tokens: std::mem::take(&mut self.context),
             state: std::mem::replace(&mut self.state, self.model.new_state()),
@@ -220,6 +262,7 @@ impl<'m, 'a> Session<'m, 'a> {
             _ => anyhow::bail!("the snapshot and the session disagree on whether a draft model is in use"),
         }
         (self.context, self.state, self.last) = (snapshot.tokens, snapshot.state, snapshot.last);
+        self.mark = None;
         Ok(())
     }
 
@@ -245,6 +288,7 @@ impl<'m, 'a> Session<'m, 'a> {
                 self.state = self.model.new_state();
                 self.context.clear();
                 self.last.clear();
+                self.mark = None;
                 if let Some((draft, state)) = &mut self.draft {
                     *state = draft.new_state();
                 }

@@ -231,6 +231,47 @@ impl State {
     }
 }
 
+/// A place in a [`State`] to come back to after any number of further tokens, made by [`Model::mark`]. A visit
+/// that keeps every token's keys and values only ever adds to them, so its part of the mark is their count; a
+/// sliding-window visit drops old ones as it goes, so the mark holds a copy of its window. The size is therefore
+/// fixed, a few hundred megabytes, however long the context.
+#[derive(Clone)]
+pub struct Mark {
+    position: usize,
+    visits: Vec<VisitMark>,
+}
+
+#[derive(Clone)]
+struct VisitMark {
+    first: usize,
+    convs: [Vec<f32>; 4],
+    /// The keys and values, for a visit that drops old ones.
+    window: Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)>,
+}
+
+impl State {
+    /// Goes back to `mark`, as if the tokens since had never been processed. The state must have come from the
+    /// marked one by processing more tokens.
+    pub fn rewind(&mut self, mark: &Mark) {
+        assert!(mark.position <= self.position && mark.visits.len() == self.visits.len(), "not a mark of this state");
+        for (visit, marked) in self.visits.iter_mut().zip(&mark.visits) {
+            visit.convs = marked.convs.clone();
+            match &marked.window {
+                Some((keys, values)) => {
+                    (visit.keys, visit.values, visit.first) = (keys.clone(), values.clone(), marked.first);
+                }
+                None => {
+                    assert_eq!(visit.first, marked.first, "a visit that keeps everything dropped something");
+                    let dim = visit.conv_channels[0] / visit.keys.len();
+                    let held = (mark.position - visit.first) * dim;
+                    visit.keys.iter_mut().chain(&mut visit.values).for_each(|head| head.truncate(held));
+                }
+            }
+        }
+        self.position = mark.position;
+    }
+}
+
 /// How many of the most recent tokens [`State::truncate`] can take back: each convolution remembers this many
 /// inputs beyond the ones it needs.
 pub const MAX_ROLLBACK: usize = 16;
@@ -414,6 +455,22 @@ impl<'a> Model<'a> {
 
     pub fn config(&self) -> &TextConfig {
         &self.cfg
+    }
+
+    /// Marks where `state` stands, for [`State::rewind`].
+    pub fn mark(&self, state: &State) -> Mark {
+        let visits = self
+            .cfg
+            .visits()
+            .iter()
+            .zip(&state.visits)
+            .map(|(visit, held)| VisitMark {
+                first: held.first,
+                convs: held.convs.clone(),
+                window: self.cfg.is_local(visit.layer).then(|| (held.keys.clone(), held.values.clone())),
+            })
+            .collect();
+        Mark { position: state.position, visits }
     }
 
     /// A fresh context with no tokens in it.

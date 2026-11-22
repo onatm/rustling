@@ -83,4 +83,32 @@ fn cached_prompts_give_the_same_state_as_fresh_ones() {
     assert_eq!(cache.prepare(&mut session, &b, Some(header.len())).unwrap(), 0);
     assert!(session.logits().unwrap() == fresh(&b));
     let _ = std::fs::remove_dir_all(&dir);
+
+    // A prompt asked again after its reply: the session steps back to where the prompt ended, with nothing
+    // processed and no snapshot taken. Long enough that the sliding-window layers have dropped tokens since,
+    // which is the part of the state that stepping back has to restore from a copy.
+    let text = |tokens: std::ops::Range<usize>| -> Vec<u32> {
+        let words: String = tokens.map(|i| format!("item {i} is on shelf {}. ", i * 7 % 13)).collect();
+        prompter.encode(&words).unwrap()
+    };
+    let prompt: Vec<u32> = a.iter().copied().chain(text(0..200)).take(1060).collect();
+    assert_eq!(prompt.len(), 1060);
+    let reply = text(300..340);
+    let longer: Vec<u32> = prompt.iter().chain(&reply[..100]).copied().collect();
+    let longest: Vec<u32> = prompt.iter().chain(&reply[..150]).copied().collect();
+    let mut cache = PromptCache::new(4 * GIB);
+    let mut session = Session::new(&model);
+    cache.prepare(&mut session, &prompt, None).unwrap();
+    let at_prompt = session.logits().unwrap();
+    // The reply, in two steps as generation would add it.
+    session.set_context(&longer).unwrap();
+    session.set_context(&longest).unwrap();
+    assert_eq!(cache.prepare(&mut session, &prompt, None).unwrap(), prompt.len());
+    assert!(cache.is_empty(), "stepping back needs no snapshot");
+    assert!(session.logits().unwrap() == at_prompt, "the prompt stepped back to differs");
+    // And a different continuation from there matches a fresh session.
+    let other: Vec<u32> = prompt.iter().copied().chain(text(400..410)).collect();
+    session.set_context(&longest).unwrap();
+    assert_eq!(cache.prepare(&mut session, &other, None).unwrap(), prompt.len());
+    assert!(session.logits().unwrap() == fresh(&other), "a continuation after stepping back differs");
 }

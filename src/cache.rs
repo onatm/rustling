@@ -10,6 +10,10 @@
 //!   the same setup begin with;
 //! - wherever a new prompt stops agreeing with one seen before, which marks a prefix the two share.
 //!
+//! One case needs no snapshot: a prompt that agrees with the live session up to where its last prompt ended, and
+//! not with the reply after it. That is a retry, or a client that sends the reply back changed (its reasoning
+//! dropped, say). The session marks the end of each prompt and steps back to it.
+//!
 //! Snapshots are large (hundreds of megabytes to gigabytes), so they share a byte budget and the least recently
 //! used go first.
 
@@ -72,15 +76,18 @@ pub struct Plan {
 pub enum Source {
     /// The session as it stands.
     Live,
+    /// The session, stepped back to its mark.
+    Rewound,
     /// The snapshot at this index.
     Snapshot(usize),
     /// Nothing reusable: start from an empty context.
     Scratch,
 }
 
-/// Decides how to process `prompt` given the token sequences of the snapshots on hand and of the live session.
-/// `header` is the length of the prompt's system-and-tools header, when it has one.
-pub fn plan(snapshots: &[&[u32]], live: &[u32], prompt: &[u32], header: Option<usize>) -> Plan {
+/// Decides how to process `prompt` given the token sequences of the snapshots on hand and of the live session,
+/// which can step back to its first `marked` tokens. `header` is the length of the prompt's system-and-tools
+/// header, when it has one.
+pub fn plan(snapshots: &[&[u32]], live: &[u32], marked: usize, prompt: &[u32], header: Option<usize>) -> Plan {
     // The longest thing on hand that the prompt starts with; the live session wins a tie, as it costs no copy.
     let mut source = Source::Scratch;
     let mut start = 0;
@@ -91,6 +98,10 @@ pub fn plan(snapshots: &[&[u32]], live: &[u32], prompt: &[u32], header: Option<u
     }
     if !live.is_empty() && live.len() >= start && prompt.starts_with(live) {
         (source, start) = (Source::Live, live.len());
+    }
+    // Stepping back costs less than copying a snapshot of the same point, so the mark wins a tie as well.
+    if marked > 0 && marked >= start && source != Source::Live && prompt.starts_with(&live[..marked]) {
+        (source, start) = (Source::Rewound, marked);
     }
 
     // The prompt may agree with something on hand beyond that point without a snapshot there to use. This time
@@ -151,9 +162,12 @@ impl PromptCache {
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<usize> {
         let tokens: Vec<&[u32]> = self.entries.iter().map(|entry| entry.snapshot.tokens()).collect();
-        let plan = plan(&tokens, session.context(), prompt, header);
+        let plan = plan(&tokens, session.context(), session.marked(), prompt, header);
 
-        if plan.source != Source::Live {
+        if plan.source == Source::Rewound {
+            // What the session held after the mark is given up: the request did not want it.
+            session.rewind()?;
+        } else if plan.source != Source::Live {
             // Taken out before anything is added, which could move or evict entries.
             let chosen = match plan.source {
                 Source::Snapshot(index) => {
@@ -182,6 +196,7 @@ impl PromptCache {
             self.insert(session.snapshot(), false);
         }
         session.set_context_watched(prompt, progress)?;
+        session.mark();
         Ok(plan.start)
     }
 
@@ -267,7 +282,7 @@ mod tests {
     fn the_next_turn_extends_the_live_session() {
         let live = ids(0..200);
         let prompt = ids(0..260);
-        let plan = plan(&[], &live, &prompt, Some(100));
+        let plan = plan(&[], &live, 0, &prompt, Some(100));
         // The header is already behind the live context, so nothing to snapshot.
         assert_eq!(plan, Plan { source: Source::Live, start: 200, boundaries: vec![] });
     }
@@ -275,10 +290,10 @@ mod tests {
     #[test]
     fn a_first_prompt_snapshots_its_header() {
         let prompt = ids(0..500);
-        assert_eq!(plan(&[], &[], &prompt, Some(300)), Plan { source: Source::Scratch, start: 0, boundaries: vec![300] });
+        assert_eq!(plan(&[], &[], 0, &prompt, Some(300)), Plan { source: Source::Scratch, start: 0, boundaries: vec![300] });
         // A short header is not worth it.
-        assert_eq!(plan(&[], &[], &prompt, Some(40)).boundaries, Vec::<usize>::new());
-        assert_eq!(plan(&[], &[], &prompt, None).boundaries, Vec::<usize>::new());
+        assert_eq!(plan(&[], &[], 0, &prompt, Some(40)).boundaries, Vec::<usize>::new());
+        assert_eq!(plan(&[], &[], 0, &prompt, None).boundaries, Vec::<usize>::new());
     }
 
     #[test]
@@ -286,7 +301,7 @@ mod tests {
         let header = ids(0..300);
         let live: Vec<u32> = ids(0..300).into_iter().chain(1000..1200).collect();
         let prompt: Vec<u32> = ids(0..300).into_iter().chain(2000..2100).collect();
-        let plan = plan(&[&header], &live, &prompt, Some(300));
+        let plan = plan(&[&header], &live, 0, &prompt, Some(300));
         assert_eq!(plan, Plan { source: Source::Snapshot(0), start: 300, boundaries: vec![] });
     }
 
@@ -295,7 +310,7 @@ mod tests {
         // No header known, but the new prompt agrees with the live conversation for its first 150 tokens.
         let live: Vec<u32> = ids(0..150).into_iter().chain(1000..1100).collect();
         let prompt: Vec<u32> = ids(0..150).into_iter().chain(2000..2100).collect();
-        assert_eq!(plan(&[], &live, &prompt, None), Plan { source: Source::Scratch, start: 0, boundaries: vec![150] });
+        assert_eq!(plan(&[], &live, 0, &prompt, None), Plan { source: Source::Scratch, start: 0, boundaries: vec![150] });
     }
 
     #[test]
@@ -303,9 +318,16 @@ mod tests {
         // The live session holds the prompt and the reply to it; the same prompt arrives again.
         let prompt = ids(0..120);
         let live = ids(0..180);
-        assert_eq!(plan(&[], &live, &prompt, None), Plan { source: Source::Scratch, start: 0, boundaries: vec![120] });
-        // With that snapshot on hand, a third time costs nothing.
-        assert_eq!(plan(&[&prompt], &live, &prompt, None), Plan { source: Source::Snapshot(0), start: 120, boundaries: vec![] });
+        assert_eq!(plan(&[], &live, 0, &prompt, None), Plan { source: Source::Scratch, start: 0, boundaries: vec![120] });
+        // A session that marked the end of the prompt steps back to it, and nothing needs a snapshot.
+        assert_eq!(plan(&[], &live, 120, &prompt, None), Plan { source: Source::Rewound, start: 120, boundaries: vec![] });
+        // So does a prompt that carries on differently from there.
+        let changed: Vec<u32> = ids(0..120).into_iter().chain(500..560).collect();
+        assert_eq!(plan(&[], &live, 120, &changed, None), Plan { source: Source::Rewound, start: 120, boundaries: vec![] });
+        // The next turn of the conversation still extends the session as it stands.
+        assert_eq!(plan(&[], &live, 120, &ids(0..200), None).source, Source::Live);
+        // Without a mark, a snapshot is taken, and with that on hand a third time costs nothing.
+        assert_eq!(plan(&[&prompt], &live, 0, &prompt, None), Plan { source: Source::Snapshot(0), start: 120, boundaries: vec![] });
     }
 
     #[test]
@@ -314,7 +336,7 @@ mod tests {
         // working directory near the end.
         let first: Vec<u32> = ids(0..11_750).into_iter().chain(20_000..20_250).collect();
         let second: Vec<u32> = ids(0..11_750).into_iter().chain(30_000..30_250).collect();
-        let plan_for = |snapshots: &[&[u32]]| plan(snapshots, &[], &second, Some(11_960));
+        let plan_for = |snapshots: &[&[u32]]| plan(snapshots, &[], 0, &second, Some(11_960));
         // With nothing on hand the header is the only guess.
         assert_eq!(plan_for(&[]).boundaries, vec![11_960]);
         // Having seen the first session, the point where the two part is kept and the header, 210 tokens on, is not.
@@ -331,7 +353,7 @@ mod tests {
     fn the_longest_usable_snapshot_wins_and_close_boundaries_merge() {
         let (short, long, other) = (ids(0..100), ids(0..250), ids(500..900));
         let prompt = ids(0..400);
-        let plan = plan(&[&short, &other, &long], &[], &prompt, Some(260));
+        let plan = plan(&[&short, &other, &long], &[], 0, &prompt, Some(260));
         // The header at 260 is only ten tokens past the snapshot at 250.
         assert_eq!(plan, Plan { source: Source::Snapshot(2), start: 250, boundaries: vec![] });
     }

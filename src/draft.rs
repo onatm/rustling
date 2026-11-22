@@ -105,6 +105,21 @@ impl DraftState {
         self.tokens
     }
 
+    /// The part of the state that later tokens overwrite: with it and the token count, [`DraftState::rewind`]
+    /// comes back to this point. The keys and values are only ever added to.
+    pub(crate) fn head_context(&self) -> &[f32] {
+        &self.head_context
+    }
+
+    /// Forgets everything after the first `tokens` tokens; `head_context` is what the state held then.
+    pub(crate) fn rewind(&mut self, tokens: usize, head_context: Vec<f32>) {
+        assert!(tokens > 0 && tokens <= self.tokens, "cannot rewind a draft of {} tokens to {tokens}", self.tokens);
+        for table in self.keys.iter_mut().chain(&mut self.values) {
+            table.truncate(table.len() / self.tokens * tokens);
+        }
+        (self.head_context, self.tokens) = (head_context, tokens);
+    }
+
     /// Roughly how much memory the state holds.
     pub fn bytes(&self) -> usize {
         let floats: usize = self.keys.iter().chain(&self.values).map(Vec::len).sum::<usize>() + self.head_context.len();

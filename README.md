@@ -233,6 +233,11 @@ and tool declarations that end with the date and the working directory. The firs
 pays once more and leaves a snapshot where the two part, and from then on a new session in any directory reuses
 11,759 tokens and starts in about 5 s. With `--cache-dir` that survives a restart.
 
+A request that repeats the last prompt without its reply (a retry, a cancelled turn sent again, or history the
+client has changed) starts from the end of that prompt with nothing reprocessed. The server marks that point
+before each reply and steps back to it; the mark takes about 340 MB however long the conversation, outside the
+`--cache-gb` budget.
+
 Clients usually drop the assistant's reasoning when they send the history back. The server restores it for
 replies it generated, which is what lets the next turn match the conversation it kept.
 
