@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::Result;
 use safetensors::SafeTensors;
 use clap::{Parser, Subcommand};
-use rustling::checkpoint::{Checkpoint, ExpertFormat, ExpertMatrix, resolve_model_dir};
+use rustling::checkpoint::{Checkpoint, ExpertFormat, ExpertMatrix, resolve_model};
 use rustling::config::Config;
 use rustling::draft::Draft;
 use rustling::model::{Activations, Backend, Model, Options};
@@ -109,6 +109,10 @@ struct RunArgs {
     /// The most tokens to generate per reply.
     #[arg(long, default_value_t = 1024)]
     max_tokens: usize,
+    /// The context window: the most tokens a prompt and its reply may take together. Longer prompts are refused
+    /// and replies stop when it is full. Unlimited by default (the model was trained with up to 1,048,576).
+    #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u64).range(2..))]
+    context: Option<u64>,
     /// Sampling temperature; 0 always takes the most likely token. The model's own default is 1.
     #[arg(long, default_value_t = 1.0)]
     temperature: f32,
@@ -157,7 +161,7 @@ impl RunArgs {
         match self.draft {
             false => Ok(None),
             true => {
-                let path = model_dir.join("mtp.safetensors");
+                let path = rustling::checkpoint::companion_dir(model_dir)?.join("mtp.safetensors");
                 anyhow::ensure!(
                     path.exists(),
                     "{} is missing; fetch it with `hf download thinkingmachines/Inkling-2-Mini mtp.safetensors`",
@@ -166,6 +170,11 @@ impl RunArgs {
                 Ok(Some(Checkpoint::open_file(&path)?))
             }
         }
+    }
+
+    /// The context window in tokens.
+    fn window(&self) -> usize {
+        self.context.map_or(usize::MAX, |tokens| tokens as usize)
     }
 
     fn limits(&self) -> Limits {
@@ -235,7 +244,7 @@ fn load_config(model_dir: &std::path::Path) -> Result<Config> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let model_dir = resolve_model_dir(cli.model.as_deref())?;
+    let model_dir = resolve_model(cli.model.as_deref())?;
     PASSES.set(cli.passes).expect("set once");
     match cli.command {
         Command::Inspect => inspect(&model_dir),
@@ -256,6 +265,7 @@ fn main() -> Result<()> {
                 stop_on_loop: !run.allow_loops,
                 draft_confidence: run.draft.then_some(run.draft_confidence),
                 passes: cli.passes,
+                context: run.window(),
                 cache_bytes: (cache_gb * (1u64 << 30) as f64) as usize,
                 cache_dir,
             };
@@ -308,6 +318,7 @@ fn inspect(model_dir: &std::path::Path) -> Result<()> {
         let format = match experts.gate_up.format {
             ExpertFormat::Nvfp4 { .. } => "NVFP4",
             ExpertFormat::Mxfp8 => "MXFP8",
+            ExpertFormat::Ggml(_) => "GGUF blocks",
         };
         println!(
             "  layer {layer:<2} experts: {format}, gate_up {}x{}x{}, down {}x{}x{}",
@@ -410,6 +421,7 @@ fn stop_note(stop: Stop, limits: Limits) -> Option<String> {
         Stop::EndOfTurn | Stop::Requested => None,
         Stop::MaxTokens => Some(format!("stopped at the limit of {} tokens", limits.max_tokens)),
         Stop::Loop => Some("stopped: the output was repeating itself (--allow-loops to continue)".to_owned()),
+        Stop::ContextFull => Some("stopped: the context window is full (--context sets its size)".to_owned()),
     }
 }
 
@@ -434,8 +446,8 @@ fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, top: bool, t
         .map(|weights| Draft::load(&config, weights).map(|draft| draft.with_min_confidence(run.draft_confidence)))
         .transpose()?;
     let mut session = match &draft {
-        Some(draft) => Session::new(&model).with_draft(draft),
-        None => Session::new(&model),
+        Some(draft) => Session::new(&model).with_window(run.window()).with_draft(draft),
+        None => Session::new(&model).with_window(run.window()),
     };
     let started = Instant::now();
     session.set_context(&prompt_ids)?;
@@ -510,8 +522,8 @@ fn chat(model_dir: &std::path::Path, system: Option<&str>, run: &RunArgs) -> Res
         .map(|weights| Draft::load(&config, weights).map(|draft| draft.with_min_confidence(run.draft_confidence)))
         .transpose()?;
     let new_session = || match &draft {
-        Some(draft) => Session::new(&model).with_draft(draft),
-        None => Session::new(&model),
+        Some(draft) => Session::new(&model).with_window(run.window()).with_draft(draft),
+        None => Session::new(&model).with_window(run.window()),
     };
     let mut session = new_session();
     let mut messages: Vec<serde_json::Value> = Vec::new();

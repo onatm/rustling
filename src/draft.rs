@@ -12,7 +12,7 @@
 //! only gets fewer proposals accepted, it cannot change what is generated.
 
 use anyhow::{Context, Result, ensure};
-use safetensors::Dtype;
+use crate::ggml::Format;
 
 use crate::checkpoint::Checkpoint;
 use crate::config::{Config, DraftConfig};
@@ -115,12 +115,7 @@ impl<'a> Draft<'a> {
             ensure!(dense.data.len() == len, "{name}: expected {len} values, found shape {:?}", dense.shape);
             Ok(dense.data)
         };
-        let mat = |name: &str, rows: usize, cols: usize| -> Result<Mat<'a>> {
-            let (info, bytes) = weights.bytes(name)?;
-            ensure!(info.dtype == Dtype::BF16, "{name}: expected bfloat16, found {:?}", info.dtype);
-            ensure!(bytes.len() == rows * cols * 2, "{name}: expected {rows}x{cols}, found shape {:?}", info.shape);
-            Ok(Mat { rows, cols, bytes })
-        };
+        let mat = |name: &str, rows: usize, cols: usize| Mat::open(weights, name, rows, cols);
 
         let (q_dim, kv_dim) = (cfg.num_attention_heads * cfg.head_dim, cfg.num_key_value_heads * cfg.head_dim);
         let layers = (0..cfg.num_hidden_layers)
@@ -160,8 +155,8 @@ impl<'a> Draft<'a> {
             .collect();
 
         let rank = cfg.markov_rank;
-        let (info, previous) = weights.bytes("markov_head.markov_w1.weight")?;
-        ensure!(info.dtype == Dtype::BF16 && previous.len() == text.vocab_size * rank * 2, "unexpected markov_w1");
+        let (format, _, previous) = weights.rows("markov_head.markov_w1.weight")?;
+        ensure!(format == Format::Bf16 && previous.len() == text.vocab_size * rank * 2, "unexpected markov_w1");
         let head = Head {
             rank,
             context_norm: vec("markov_head.dflare_norm.weight", h)?,

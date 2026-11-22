@@ -22,7 +22,7 @@ use rustling::cache::PromptCache;
 use rustling::checkpoint::Checkpoint;
 use rustling::config::Config;
 use rustling::draft::Draft;
-use rustling::model::{Model, Options};
+use rustling::model::{Backend, Model, Options};
 use rustling::prompt::{Prompter, SegmentKind, parse_reply, reply_message};
 use rustling::sampler::{Sampler, SamplerConfig};
 use rustling::session::{Limits, Session, Stop};
@@ -38,8 +38,10 @@ fn model_name(model_dir: &Path, passes: Option<usize>) -> String {
     let from_cache = model_dir.ancestors().filter_map(|dir| dir.file_name()?.to_str()).find_map(|name| {
         name.strip_prefix("models--").and_then(|rest| rest.rsplit("--").next())
     });
-    let own = model_dir.file_name().and_then(|name| name.to_str());
-    let name = from_cache.or(own).unwrap_or("model").to_lowercase();
+    // A GGUF file is named after itself, without the extension.
+    let gguf = model_dir.extension().is_some_and(|extension| extension == "gguf");
+    let own = if gguf { model_dir.file_stem() } else { model_dir.file_name() }.and_then(|name| name.to_str());
+    let name = if gguf { own } else { from_cache.or(own) }.unwrap_or("model").to_lowercase();
     match passes {
         Some(passes) => format!("{name}-{passes}-passes"),
         None => name,
@@ -70,6 +72,8 @@ pub struct ServerOptions {
     pub draft_confidence: Option<f32>,
     /// Overrides how many times the looped layers run, for a variable-loop checkpoint.
     pub passes: Option<usize>,
+    /// The context window in tokens, prompt and reply together.
+    pub context: usize,
     /// How much memory processed prompts may take up, for reuse by later requests.
     pub cache_bytes: usize,
     /// Where to keep the processed prompts between runs.
@@ -312,7 +316,7 @@ fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Jo
     };
     let draft_weights = match options.draft_confidence {
         None => None,
-        Some(_) => match Checkpoint::open_file(&model_dir.join("mtp.safetensors")) {
+        Some(_) => match rustling::checkpoint::companion_dir(model_dir).and_then(|dir| Checkpoint::open_file(&dir.join("mtp.safetensors"))) {
             Ok(weights) => Some(weights),
             Err(error) => return drop(ready.send(Err(error.context("opening the draft model")))),
         },
@@ -330,16 +334,18 @@ fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Jo
     let _ = ready.send(Ok(()));
 
     let mut session = match &draft {
-        Some(draft) => Session::new(&model).with_draft(draft),
-        None => Session::new(&model),
+        Some(draft) => Session::new(&model).with_window(options.context).with_draft(draft),
+        None => Session::new(&model).with_window(options.context),
     };
     // What snapshots depend on: one made with another model, pass count or arithmetic must not be reused.
     let fingerprint = format!(
-        "{}|{} bytes|{} visits|{:?}|draft {}",
+        "{}|{} bytes|{} visits|{:?}|{}|draft {}",
         model_dir.display(),
         checkpoint.maps().iter().map(|map| map.len()).sum::<usize>(),
         config.text_config.visits().len(),
         options.model.activations,
+        // The fast path's states differ from the exact ones, so the two must not share snapshots.
+        if options.model.backend == Backend::MetalFast { "fast" } else { "exact" },
         draft.is_some(),
     );
     let mut cache = match &options.cache_dir {
@@ -517,6 +523,14 @@ fn handle(
         Some(header) => Some(prompter.encode(&header)?).filter(|header| ids.starts_with(header)).map(|h| h.len()),
         None => None,
     };
+    // A prompt that does not fit is the client's to shorten.
+    if ids.len() >= session.window() {
+        return Err(Failure::bad_request(format!(
+            "the prompt is {} tokens, which leaves no room in the context window of {} (set with --context)",
+            ids.len(),
+            session.window()
+        )));
+    }
     send(Event::Started)?;
     let cached_tokens = cache.prepare(session, &ids, header)?;
 
@@ -586,7 +600,7 @@ fn handle(
         Stop::EndOfTurn | Stop::Requested if calls_sent > 0 => "tool_calls",
         Stop::EndOfTurn | Stop::Requested => "stop",
         // A loop cut short is reported like any other truncated reply.
-        Stop::MaxTokens | Stop::Loop => "length",
+        Stop::MaxTokens | Stop::Loop | Stop::ContextFull => "length",
     };
     let usage = Usage { prompt_tokens: ids.len(), cached_tokens, completion_tokens: generated.len() };
     send(Event::Done { finish_reason, usage })?;
@@ -602,6 +616,7 @@ mod tests {
         let cached = Path::new("/home/u/.cache/huggingface/hub/models--thinkingmachines--TML-d24-varloop-research/snapshots/657b53");
         assert_eq!(model_name(cached, Some(2)), "tml-d24-varloop-research-2-passes");
         assert_eq!(model_name(Path::new("/models/Inkling-2-Mini"), None), "inkling-2-mini");
+        assert_eq!(model_name(Path::new("/models/x/Inkling-2-Mini-Q4_K_M.gguf"), None), "inkling-2-mini-q4_k_m");
     }
 
     #[test]

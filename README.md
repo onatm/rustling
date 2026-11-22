@@ -24,6 +24,8 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | DSpark draft model: proposes several tokens at a time for the main model to check (`src/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, no gain on prose |
 | Quantised expert activations with an integer dot-product kernel, as the model was trained | done and the default; about 10 tokens/s. `--activations float` gives the transformers arithmetic |
 | Variable-loop checkpoint with a chosen pass count (`--passes`) | done; 16 tokens/s at 1 pass, 12 at 2, 9 at 3 |
+| GGUF conversions (Q4_K, Q5_0, Q6_K, Q8_0 blocks), multiplied in integer arithmetic (`src/ggml.rs`) | done, CPU only; Q4_K_M at about 13 tokens/s against 9 for the checkpoint |
+| Context window limit (`--context`) | done |
 | Metal for single-token generation | measured and set aside: per-dispatch overhead eats the gain |
 | Vision tower | later |
 
@@ -63,6 +65,37 @@ of 4-bit activations, not of this engine: any two implementations that differ at
 means the same long prompt can lead to a different, equally valid reply depending on the backend, and on whether
 it was processed in one go or resumed from the prompt cache. That is why `metal-fast` is opt-in: the default
 backends give the same output every time.
+
+## GGUF models
+
+`--model` also takes a GGUF conversion of the model, as a file or as a repository name with the quantisation
+wanted. Names are looked up among the models already downloaded: the Hugging Face cache, then LM Studio's models.
+
+```sh
+rustling --model unsloth/Inkling-2-Mini-GGUF:Q4_K_M chat
+rustling --model ~/models/Inkling-2-Mini-Q4_K_M.gguf serve
+```
+
+- **Formats**: tensors stored as F32, BF16, Q4_K, Q5_0, Q6_K or Q8_0, which is what a Q4_K_M file holds. Other
+  quantisations (the IQ and other K sizes) are refused with a message naming the tensor.
+- **Companion files**: the config, tokenizer and chat template still come from the published checkpoint, so that
+  must be downloaded too, without its weights: `hf download thinkingmachines/Inkling-2-Mini --include '*.json'
+  '*.jinja'`. `$RUSTLING_BASE_MODEL` names a different one.
+- **Speed**: about 13 tokens/s on an M1 Max against 9 for the checkpoint, because every matrix is 4 to 8 bits per
+  weight where the checkpoint keeps the attention weights in 16.
+- **Arithmetic**: the input of each quantised matrix is rounded to 8 bits per value, in blocks of 32, and the
+  product is taken in integers, as ggml does on a CPU. Results do not depend on batching.
+- **Accuracy**: a conversion is a lossy copy. On a passage of prose, Q4_K_M and the checkpoint agreed on the most
+  likely next token at 80% of positions (`tests/gguf.rs`); the 8-bit rounding did not change that figure.
+- **Not available with GGUF**: the Metal backend, and `--activations` (the experts are no longer in the formats
+  the model's activations were trained against).
+
+## Context window
+
+`--context <TOKENS>` on `generate`, `chat` and `serve` limits how many tokens a prompt and its reply may take
+together. A prompt that does not fit is refused (the server answers 400), and a reply stops when the window is
+full. Without it there is no limit short of the model's 1,048,576, and memory and time per token grow with the
+context.
 
 ## Variable-loop checkpoint
 

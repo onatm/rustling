@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use rustling::checkpoint::{Checkpoint, resolve_model_dir};
+use rustling::checkpoint::{Checkpoint, resolve_model};
 use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options};
 use safetensors::SafeTensors;
@@ -18,7 +18,7 @@ fn relative(ours: &[f32], reference: &[f32]) -> f64 {
 #[test]
 fn rounding_noise_explains_the_gap_to_transformers() {
     let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/hidden_default.safetensors");
-    let (Ok(bytes), Ok(model_dir)) = (std::fs::read(&golden), resolve_model_dir(None)) else {
+    let (Ok(bytes), Ok(model_dir)) = (std::fs::read(&golden), resolve_model(None)) else {
         eprintln!("skipping: needs the model and {}", golden.display());
         return;
     };

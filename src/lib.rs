@@ -5,6 +5,7 @@ pub mod cache;
 pub mod checkpoint;
 pub mod config;
 pub mod draft;
+pub mod ggml;
 #[cfg(target_os = "macos")]
 pub mod gpu;
 pub mod model;

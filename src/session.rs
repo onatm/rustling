@@ -15,6 +15,8 @@ pub struct Session<'m, 'a> {
     context: Vec<u32>,
     /// The final hidden state of the last token in `context`: what the next token is predicted from.
     last: Vec<f32>,
+    /// The most tokens the context may hold, prompt and reply together.
+    window: usize,
     /// A draft model proposing several tokens at a time, and its view of the context.
     draft: Option<(&'m Draft<'a>, DraftState)>,
     drafting: Drafting,
@@ -67,13 +69,35 @@ pub enum Stop {
     MaxTokens,
     /// The output was repeating itself.
     Loop,
+    /// The context window is full.
+    ContextFull,
     /// The caller's callback asked to stop.
     Requested,
 }
 
 impl<'m, 'a> Session<'m, 'a> {
     pub fn new(model: &'m Model<'a>) -> Self {
-        Self { model, state: model.new_state(), context: Vec::new(), last: Vec::new(), draft: None, drafting: Drafting::default() }
+        Self {
+            model,
+            state: model.new_state(),
+            context: Vec::new(),
+            last: Vec::new(),
+            window: usize::MAX,
+            draft: None,
+            drafting: Drafting::default(),
+        }
+    }
+
+    /// Limits the context to `tokens`, prompt and reply together. A prompt that leaves no room for a reply is
+    /// refused, and a reply stops when the window is full. Memory and the time per token both grow with the
+    /// context, so a window bounds them.
+    pub fn with_window(mut self, tokens: usize) -> Self {
+        self.window = tokens;
+        self
+    }
+
+    pub fn window(&self) -> usize {
+        self.window
     }
 
     /// Generates with the help of a draft model: it proposes several tokens at a time and the main model checks
@@ -138,6 +162,12 @@ impl<'m, 'a> Session<'m, 'a> {
     /// Makes the context exactly `ids`. When `ids` extends the current context only the new tokens are processed;
     /// otherwise everything is recomputed. Returns how many tokens were reused.
     pub fn set_context(&mut self, ids: &[u32]) -> Result<usize> {
+        anyhow::ensure!(
+            ids.len() < self.window,
+            "the prompt is {} tokens, which leaves no room in a context window of {}",
+            ids.len(),
+            self.window
+        );
         let reused = match ids.starts_with(&self.context) {
             true => self.context.len(),
             false => {
@@ -191,6 +221,7 @@ impl<'m, 'a> Session<'m, 'a> {
         mut on_token: impl FnMut(u32, &[f32]) -> Result<bool>,
     ) -> Result<(Vec<u32>, Stop)> {
         let mut generated = Vec::new();
+        let room = self.window.saturating_sub(self.context.len());
         // Records a chosen token and says whether generation ends with it.
         let mut emit = |generated: &mut Vec<u32>, token: u32, logits: &[f32]| -> Result<Option<Stop>> {
             generated.push(token);
@@ -198,6 +229,7 @@ impl<'m, 'a> Session<'m, 'a> {
             Ok(match () {
                 _ if token == end_of_turn => Some(Stop::EndOfTurn),
                 _ if !carry_on => Some(Stop::Requested),
+                _ if generated.len() >= room => Some(Stop::ContextFull),
                 _ if generated.len() >= limits.max_tokens => Some(Stop::MaxTokens),
                 _ if limits.stop_on_loop && is_looping(generated) => Some(Stop::Loop),
                 _ => None,

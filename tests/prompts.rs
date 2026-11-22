@@ -3,12 +3,12 @@
 
 use std::path::Path;
 
-use rustling::checkpoint::resolve_model_dir;
+use rustling::checkpoint::resolve_model;
 use rustling::prompt::Prompter;
 
 #[test]
 fn prompts_match_transformers() {
-    let Ok(model_dir) = resolve_model_dir(None) else {
+    let Ok(model_dir) = resolve_model(None) else {
         eprintln!("skipping: model not found");
         return;
     };
@@ -37,7 +37,7 @@ fn prompts_match_transformers() {
 /// results) against output worked out by hand from `chat_template.jinja`.
 #[test]
 fn tool_round_trip_renders() {
-    let Ok(model_dir) = resolve_model_dir(None) else {
+    let Ok(model_dir) = resolve_model(None) else {
         eprintln!("skipping: model not found");
         return;
     };

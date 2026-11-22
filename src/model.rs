@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result, ensure};
 use half::bf16;
-use safetensors::Dtype;
+use crate::ggml::{Format, INT8_MAX_BATCH, Int8Activation, dot_row_int8_many, quantize_int8};
 use rayon::prelude::*;
 
 use crate::accel;
@@ -20,7 +20,7 @@ use crate::gpu::{DenseJob, ExpertJob, Gpu};
 use crate::timing::{self, Stage, time};
 use crate::trace;
 use crate::quant::{
-    NVFP4_MAX_BATCH, Nvfp4Activation, decode_bf16_row, dot_bf16_row, dot_f32_row_many, quantize_nvfp4,
+    NVFP4_MAX_BATCH, Nvfp4Activation, dot_f32_row_many, quantize_nvfp4,
     requantize_mxfp8,
 };
 
@@ -69,7 +69,8 @@ const DENSE_TILE: usize = 16;
 
 pub struct Model<'a> {
     cfg: TextConfig,
-    checkpoint: &'a Checkpoint,
+    embed: Mat<'a>,
+    unembed: Mat<'a>,
     activations: Activations,
     gpu: Option<Gpu>,
     embed_norm: Vec<f32>,
@@ -215,13 +216,7 @@ impl<'a> Model<'a> {
             ensure!(dense.data.len() == len, "{name}: expected {len} values, found shape {:?}", dense.shape);
             Ok(dense.data)
         };
-        // Dense matrices stay in the checkpoint's bfloat16, read in place.
-        let mat = |name: &str, rows: usize, cols: usize| -> Result<Mat<'a>> {
-            let (info, bytes) = checkpoint.bytes(name)?;
-            ensure!(info.dtype == Dtype::BF16, "{name}: expected bfloat16, found {:?}", info.dtype);
-            ensure!(bytes.len() == rows * cols * 2, "{name}: expected {rows}x{cols}, found shape {:?}", info.shape);
-            Ok(Mat { rows, cols, bytes })
-        };
+        let mat = |name: &str, rows: usize, cols: usize| Mat::open(checkpoint, name, rows, cols);
 
         let layers = (0..cfg.num_hidden_layers)
             .into_par_iter()
@@ -298,14 +293,22 @@ impl<'a> Model<'a> {
 
         // The checkpoint stores [query, mlp] pairs and [key, value] pairs per looped layer, in two tensors.
         let core = cfg.loop_config.core_end - cfg.loop_config.core_start;
-        let q_mlp = vec("model.llm.middle_cycle_cross_pass_queries", 2 * core * h)?;
-        let k_v = vec("model.llm.middle_cycle_cross_pass_kv_queries", 2 * core * h)?;
-        let message_queries = (0..core)
-            .map(|i| {
-                let pair = |source: &[f32], j: usize| source[(2 * i + j) * h..(2 * i + j + 1) * h].to_vec();
-                [pair(&q_mlp, 0), pair(&k_v, 0), pair(&k_v, 1), pair(&q_mlp, 1)].concat()
-            })
-            .collect();
+        let message_queries = if checkpoint.contains("model.llm.middle_cycle_cross_pass_queries") {
+            let q_mlp = vec("model.llm.middle_cycle_cross_pass_queries", 2 * core * h)?;
+            let k_v = vec("model.llm.middle_cycle_cross_pass_kv_queries", 2 * core * h)?;
+            (0..core)
+                .map(|i| {
+                    let pair = |source: &[f32], j: usize| source[(2 * i + j) * h..(2 * i + j + 1) * h].to_vec();
+                    [pair(&q_mlp, 0), pair(&k_v, 0), pair(&k_v, 1), pair(&q_mlp, 1)].concat()
+                })
+                .collect()
+        } else {
+            // A GGUF file already has them per layer, in this order.
+            let start = cfg.loop_config.core_start;
+            (start..start + core)
+                .map(|l| vec(&format!("model.llm.layers.{l}.message_queries"), 4 * h))
+                .collect::<Result<_>>()?
+        };
 
         ensure!(cfg.rel_extent == cfg.sliding_window_size, "relative extent and sliding window are assumed equal");
         Ok(Self {
@@ -315,8 +318,13 @@ impl<'a> Model<'a> {
             message_queries,
             layers,
             cfg,
-            checkpoint,
-            activations: options.activations,
+            embed: mat("model.llm.embed.weight", config.text_config.vocab_size, h)?,
+            unembed: mat("model.llm.unembed.weight", config.text_config.vocab_size, h)?,
+            // A GGUF file's experts are not in the formats the activations are rounded to.
+            activations: match checkpoint.is_gguf() {
+                true => Activations::Float,
+                false => options.activations,
+            },
             gpu,
         })
     }
@@ -359,10 +367,9 @@ impl<'a> Model<'a> {
     pub(crate) fn embed(&self, id: u32) -> Result<Vec<f32>> {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
-        let (_, embed) = self.checkpoint.bytes("model.llm.embed.weight")?;
         ensure!((id as usize) < cfg.vocab_size, "token id {id} is out of range");
-        let row = &embed[id as usize * h * 2..(id as usize + 1) * h * 2];
-        let mut x: Vec<f32> = row.as_chunks::<2>().0.iter().map(|b| bf16::from_le_bytes(*b).to_f32()).collect();
+        let mut x = vec![0.0f32; h];
+        self.embed.format.decode_row(self.embed.row(id as usize), &mut x);
         rms_norm(&mut x, Some(&self.embed_norm), cfg.rms_norm_eps);
         round_all(self.bf16(), &mut x);
         Ok(x)
@@ -455,7 +462,9 @@ impl<'a> Model<'a> {
         }
         let started = std::time::Instant::now();
         let bf16 = self.bf16();
-        let (_, unembed) = self.checkpoint.bytes("model.llm.unembed.weight")?;
+        let unembed = &self.unembed;
+        let rounded: Vec<Int8Activation> = if unembed.int8() { xs.iter().map(|x| quantize_int8(x)).collect() } else { Vec::new() };
+        let rounded: Vec<&Int8Activation> = rounded.iter().collect();
         // Per token: one value for each state.
         let mut by_token = vec![0.0f32; vocab * xs.len()];
         by_token.par_chunks_mut(1024 * xs.len()).enumerate().for_each_init(
@@ -463,8 +472,14 @@ impl<'a> Model<'a> {
             |widened, (chunk, out)| {
                 for (i, out) in out.chunks_exact_mut(xs.len()).enumerate() {
                     let token = chunk * 1024 + i;
-                    decode_bf16_row(&unembed[token * h * 2..(token + 1) * h * 2], widened);
-                    dot_f32_row_many(widened, &xs, out);
+                    if unembed.int8() {
+                        for (xs, out) in rounded.chunks(INT8_MAX_BATCH).zip(out.chunks_mut(INT8_MAX_BATCH)) {
+                            dot_row_int8_many(unembed.format, unembed.row(token), xs, out);
+                        }
+                    } else {
+                        unembed.format.decode_row(unembed.row(token), widened);
+                        dot_f32_row_many(widened, &xs, out);
+                    }
                     for sum in out {
                         let rounded = if bf16 { round_bf16(*sum) } else { *sum };
                         *sum = (rounded / cap).tanh() * cap;
@@ -477,13 +492,21 @@ impl<'a> Model<'a> {
     }
 
     fn project(&self, state: &[f32]) -> Result<Vec<f32>> {
-        let (h, cap) = (self.cfg.hidden_size, self.cfg.final_logit_softcapping);
-        let (_, unembed) = self.checkpoint.bytes("model.llm.unembed.weight")?;
+        let cap = self.cfg.final_logit_softcapping;
+        let unembed = &self.unembed;
+        let rounded = unembed.int8().then(|| quantize_int8(state));
         let mut logits = vec![0.0f32; self.cfg.unpadded_vocab_size];
-        logits.par_chunks_mut(1024).enumerate().for_each(|(chunk, logits)| {
+        logits.par_chunks_mut(1024).enumerate().for_each_init(Vec::new, |scratch, (chunk, logits)| {
             for (i, logit) in logits.iter_mut().enumerate() {
                 let token = chunk * 1024 + i;
-                let sum = dot_bf16_row(&unembed[token * h * 2..(token + 1) * h * 2], state);
+                let sum = match &rounded {
+                    Some(rounded) => {
+                        let mut sum = [0.0f32];
+                        dot_row_int8_many(unembed.format, unembed.row(token), &[rounded], &mut sum);
+                        sum[0]
+                    }
+                    None => unembed.format.dot_row(unembed.row(token), state, scratch),
+                };
                 let sum = if self.bf16() { round_bf16(sum) } else { sum };
                 *logit = (sum / cap).tanh() * cap;
             }
@@ -776,6 +799,7 @@ impl<'a> Model<'a> {
         }
 
         let contributions = match self.activations {
+            _ if layer.experts.gate_up.ggml().is_some() => self.expert_outputs_ggml(layer, x, &tokens_of),
             Activations::Float | Activations::FloatBf16 => self.expert_outputs_float(layer, x, &tokens_of),
             Activations::Quantised => self.expert_outputs_quantised(layer, x, &tokens_of),
         };
@@ -810,8 +834,9 @@ impl<'a> Model<'a> {
                         .into_par_iter()
                         .with_min_len(64)
                         .map(|unit| {
-                            let gate = layer.experts.gate_up.dot_row(expert, 2 * unit, x);
-                            let up = layer.experts.gate_up.dot_row(expert, 2 * unit + 1, x);
+                            let (gate, up) = layer.experts.gate_up_rows(unit);
+                            let gate = layer.experts.gate_up.dot_row(expert, gate, x);
+                            let up = layer.experts.gate_up.dot_row(expert, up, x);
                             softcap(gate, cfg.mlp_gate_softcap) * sigmoid(gate) * softcap(up, cfg.mlp_up_softcap)
                         })
                         .collect();
@@ -847,6 +872,56 @@ impl<'a> Model<'a> {
                     }
                 }
                 tokens.iter().map(|&(t, _)| t).zip(outs).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Expert outputs from a GGUF file's quantised experts, in integer arithmetic: the input of each of the two
+    /// matrices is rounded to bytes first, as ggml does on a CPU. Returns `(token, output)` pairs, already scaled
+    /// by the routing weight. Every token takes the same arithmetic however many share its expert.
+    fn expert_outputs_ggml(&self, layer: &Layer, x: &Seq, tokens_of: &[Vec<(usize, f32)>]) -> Vec<(usize, Vec<f32>)> {
+        let cfg = &self.cfg;
+        let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
+        let experts = &layer.experts;
+        let inputs: Vec<Int8Activation> = x.par_chunks_exact(h).with_min_len(8).map(quantize_int8).collect();
+        // `matrix x` for every activation: `rows` values for the first, then for the second, and so on.
+        let multiply = |matrix: &ExpertMatrix, expert: usize, xs: &[&Int8Activation]| -> Vec<f32> {
+            let mut out = vec![0.0f32; xs.len() * matrix.rows];
+            let mut ranges: Vec<_> = out.chunks_exact_mut(matrix.rows).map(|out| out.chunks_mut(TASK_ROWS)).collect();
+            let tasks: Vec<(usize, Vec<&mut [f32]>)> = (0..matrix.rows.div_ceil(TASK_ROWS))
+                .map(|range| (range * TASK_ROWS, ranges.iter_mut().map(|r| r.next().expect("a range each")).collect()))
+                .collect();
+            tasks.into_par_iter().for_each(|(first, mut outs)| {
+                let mut dots = [0.0f32; INT8_MAX_BATCH];
+                for (xs, outs) in xs.chunks(INT8_MAX_BATCH).zip(outs.chunks_mut(INT8_MAX_BATCH)) {
+                    for r in 0..outs[0].len() {
+                        let (format, row) = matrix.ggml_row(expert, first + r);
+                        dot_row_int8_many(format, row, xs, &mut dots[..xs.len()]);
+                        outs.iter_mut().zip(&dots).for_each(|(out, dot)| out[r] = *dot);
+                    }
+                }
+            });
+            out
+        };
+        tokens_of
+            .par_iter()
+            .enumerate()
+            .filter(|(_, tokens)| !tokens.is_empty())
+            .flat_map_iter(|(expert, tokens)| {
+                let xs: Vec<&Int8Activation> = tokens.iter().map(|(t, _)| &inputs[*t]).collect();
+                let gate_up = multiply(&experts.gate_up, expert, &xs);
+                let activations: Vec<Int8Activation> = gate_up
+                    .chunks_exact(2 * inter)
+                    .map(|gate_up| {
+                        let (mut gate, mut up): (Vec<f32>, Vec<f32>) =
+                            (0..inter).map(|unit| experts.gate_up_rows(unit)).map(|(g, u)| (gate_up[g], gate_up[u])).unzip();
+                        capped_swiglu(&mut gate, &mut up, cfg.mlp_gate_softcap, cfg.mlp_up_softcap, 1.0);
+                        quantize_int8(&gate)
+                    })
+                    .collect();
+                let down = multiply(&experts.down, expert, &activations.iter().collect::<Vec<_>>());
+                let outputs = down.chunks_exact(h).zip(tokens);
+                outputs.map(|(out, &(t, weight))| (t, out.iter().map(|o| o * weight).collect())).collect::<Vec<_>>()
             })
             .collect()
     }
@@ -1127,6 +1202,11 @@ pub struct Options {
 
 #[cfg(target_os = "macos")]
 fn open_gpu(checkpoint: &Checkpoint, backend: Backend) -> Result<Option<Gpu>> {
+    // The GPU kernels read the checkpoint's own formats.
+    if checkpoint.is_gguf() {
+        ensure!(matches!(backend, Backend::Auto | Backend::Cpu), "GGUF weights run on the CPU only");
+        return Ok(None);
+    }
     match backend {
         Backend::Cpu => Ok(None),
         Backend::Auto => Ok(Gpu::new(&checkpoint.maps(), false).ok()),
@@ -1248,14 +1328,45 @@ impl Controller<'_> {
     }
 }
 
-/// Row-major dense matrix in bfloat16, borrowed from the checkpoint and applied as `y = W x`.
+/// Row-major dense matrix in its stored form (bfloat16 in the checkpoint, a block format in a GGUF file),
+/// borrowed from the weights and applied as `y = W x`.
 pub(crate) struct Mat<'a> {
     pub(crate) rows: usize,
     pub(crate) cols: usize,
+    pub(crate) format: Format,
+    row_bytes: usize,
     pub(crate) bytes: &'a [u8],
 }
 
-impl Mat<'_> {
+impl<'a> Mat<'a> {
+    pub(crate) fn open(weights: &'a Checkpoint, name: &str, rows: usize, cols: usize) -> Result<Self> {
+        let (format, shape, bytes) = weights.rows(name)?;
+        let row_bytes = format.row_bytes(cols).with_context(|| format!("{name}: rows of {cols} in {format:?}"))?;
+        ensure!(bytes.len() == rows * row_bytes, "{name}: expected {rows}x{cols}, found shape {shape:?}");
+        ensure!(format != Format::F32 || weights.is_gguf(), "{name}: expected bfloat16");
+        Ok(Mat { rows, cols, format, row_bytes, bytes })
+    }
+
+    pub(crate) fn row(&self, row: usize) -> &'a [u8] {
+        &self.bytes[row * self.row_bytes..][..self.row_bytes]
+    }
+
+    /// Whether the matrix is multiplied in integer arithmetic, against activations rounded to bytes.
+    fn int8(&self) -> bool {
+        self.format.is_quantised() && self.cols.is_multiple_of(crate::ggml::INT8_BLOCK)
+    }
+
+    /// `W x` for each of the rounded activations `xs`, rows `first..first + outs[i].len()`, into `outs`.
+    fn apply_int8(&self, first: usize, xs: &[&Int8Activation], outs: &mut [&mut [f32]]) {
+        let mut dots = [0.0f32; INT8_MAX_BATCH];
+        for (xs, outs) in xs.chunks(INT8_MAX_BATCH).zip(outs.chunks_mut(INT8_MAX_BATCH)) {
+            for r in 0..outs[0].len() {
+                dot_row_int8_many(self.format, self.row(first + r), xs, &mut dots[..xs.len()]);
+                outs.iter_mut().zip(&dots).for_each(|(out, dot)| out[r] = *dot);
+            }
+        }
+    }
+
     /// Applies the matrix to every vector of a sequence.
     pub(crate) fn apply(&self, xs: &[f32]) -> Seq {
         apply_many(None, &[(self, xs)]).remove(0)
@@ -1263,7 +1374,13 @@ impl Mat<'_> {
 
     /// Applies the matrix to one vector on the calling thread.
     pub(crate) fn apply_one(&self, x: &[f32]) -> Vec<f32> {
-        self.bytes.chunks_exact(self.cols * 2).map(|row| dot_bf16_row(row, x)).collect()
+        if self.int8() {
+            let mut out = vec![0.0f32; self.rows];
+            self.apply_int8(0, &[&quantize_int8(x)], &mut [&mut out[..]]);
+            return out;
+        }
+        let mut scratch = Vec::new();
+        self.bytes.chunks_exact(self.row_bytes).map(|row| self.format.dot_row(row, x, &mut scratch)).collect()
     }
 }
 
@@ -1279,7 +1396,7 @@ pub(crate) fn apply_many(gpu: Option<&Gpu>, jobs: &[(&Mat, &[f32])]) -> Vec<Seq>
     #[cfg(target_os = "macos")]
     if let Some(gpu) = gpu
         && jobs.iter().any(|(m, xs)| xs.len() / m.cols >= GPU_MIN_TOKENS)
-        && jobs.iter().all(|(m, _)| m.cols % 16 == 0)
+        && jobs.iter().all(|(m, _)| m.cols % 16 == 0 && m.format == Format::Bf16)
     {
         let dense: Vec<DenseJob> =
             jobs.iter().map(|(m, xs)| DenseJob { weights: m.bytes, rows: m.rows, cols: m.cols, xs }).collect();
@@ -1295,27 +1412,42 @@ pub(crate) fn apply_many(gpu: Option<&Gpu>, jobs: &[(&Mat, &[f32])]) -> Vec<Seq>
     let work: usize = jobs.iter().map(|(m, xs)| xs.len() * m.rows).sum();
 
     // One task per (matrix, tile of tokens, range of rows); it owns that range of each token's output.
+    // Quantised matrices meet their inputs rounded to bytes, once for all the rows.
+    let rounded: Vec<Vec<Int8Activation>> = jobs
+        .iter()
+        .map(|(m, xs)| match m.int8() {
+            true => xs.chunks_exact(m.cols).map(quantize_int8).collect(),
+            false => Vec::new(),
+        })
+        .collect();
     let mut tasks = Vec::new();
-    for ((m, xs), out) in jobs.iter().zip(&mut outs) {
+    for (((m, xs), out), rounded) in jobs.iter().zip(&mut outs).zip(&rounded) {
         let mut ranges: Vec<_> = out.chunks_exact_mut(m.rows).map(|out| out.chunks_mut(TASK_ROWS)).collect();
-        for (tile, ranges) in xs.chunks(DENSE_TILE * m.cols).zip(ranges.chunks_mut(DENSE_TILE)) {
+        let tiles = xs.chunks(DENSE_TILE * m.cols).zip(ranges.chunks_mut(DENSE_TILE)).enumerate();
+        for (t, (tile, ranges)) in tiles {
+            let rounded = rounded.get(t * DENSE_TILE..).unwrap_or_default();
             for range in 0..m.rows.div_ceil(TASK_ROWS) {
                 let outs: Vec<&mut [f32]> = ranges.iter_mut().map(|r| r.next().expect("a range per token")).collect();
-                tasks.push((*m, tile, range * TASK_ROWS, outs));
+                tasks.push((*m, tile, rounded, range * TASK_ROWS, outs));
             }
         }
     }
-    let run = |(m, xs, first, mut outs): (&Mat, &[f32], usize, Vec<&mut [f32]>)| {
-        let rows = m.bytes[first * m.cols * 2..].chunks_exact(m.cols * 2).take(outs[0].len());
+    let run = |(m, xs, rounded, first, mut outs): (&Mat, &[f32], &[Int8Activation], usize, Vec<&mut [f32]>)| {
+        if m.int8() {
+            let xs: Vec<&Int8Activation> = rounded.iter().take(outs.len()).collect();
+            return m.apply_int8(first, &xs, &mut outs);
+        }
+        let rows = m.bytes[first * m.row_bytes..].chunks_exact(m.row_bytes).take(outs[0].len());
         if let [out] = &mut outs[..] {
-            out.iter_mut().zip(rows).for_each(|(o, row)| *o = dot_bf16_row(row, xs));
+            let mut scratch = Vec::new();
+            out.iter_mut().zip(rows).for_each(|(o, row)| *o = m.format.dot_row(row, xs, &mut scratch));
             return;
         }
         let xs: Vec<&[f32]> = xs.chunks_exact(m.cols).collect();
         let mut widened = vec![0.0f32; m.cols];
         let mut dots = vec![0.0f32; xs.len()];
         for (r, row) in rows.enumerate() {
-            decode_bf16_row(row, &mut widened);
+            m.format.decode_row(row, &mut widened);
             dot_f32_row_many(&widened, &xs, &mut dots);
             outs.iter_mut().zip(&dots).for_each(|(out, dot)| out[r] = *dot);
         }

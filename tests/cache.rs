@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use rustling::cache::PromptCache;
-use rustling::checkpoint::{Checkpoint, resolve_model_dir};
+use rustling::checkpoint::{Checkpoint, resolve_model};
 use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options};
 use rustling::prompt::Prompter;
@@ -15,7 +15,7 @@ const GIB: usize = 1 << 30;
 
 #[test]
 fn cached_prompts_give_the_same_state_as_fresh_ones() {
-    let Ok(model_dir) = resolve_model_dir(None) else {
+    let Ok(model_dir) = resolve_model(None) else {
         eprintln!("skipping: model not found");
         return;
     };
