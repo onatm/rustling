@@ -8,8 +8,9 @@
 //! position's output predicts the token there. A small recurrent head then walks the block left to right, nudging
 //! each position's prediction by the tokens chosen before it.
 //!
-//! Ported from vLLM's `models/inkling2/nvidia/dspark.py`. Arithmetic is plain f32: a draft that is slightly off
-//! only gets fewer proposals accepted, it cannot change what is generated.
+//! Ported from vLLM's `models/inkling2/nvidia/dspark.py`. Its matrices are rounded to bytes when loaded and
+//! multiplied in integers: a draft that is slightly off only gets fewer proposals accepted, it cannot change what
+//! is generated.
 
 use anyhow::{Context, Result, ensure};
 use crate::ggml::Format;
@@ -32,6 +33,9 @@ pub struct Draft<'a> {
     frequencies: Vec<f32>,
     /// A proposal ends where the draft's confidence in the whole run so far would fall below this.
     min_confidence: f32,
+    /// The main model's output weights rounded to bytes, made on first use; nothing when the model's own are
+    /// quantised already. A proposal takes one vocabulary projection per token, which is most of the head's work.
+    unembed: std::sync::OnceLock<Option<Mat<'static>>>,
 }
 
 /// A rejected proposal wastes the work of checking it and everything proposed after it, so only confident runs
@@ -115,7 +119,9 @@ impl<'a> Draft<'a> {
             ensure!(dense.data.len() == len, "{name}: expected {len} values, found shape {:?}", dense.shape);
             Ok(dense.data)
         };
-        let mat = |name: &str, rows: usize, cols: usize| Mat::open(weights, name, rows, cols);
+        // The matrices are packed as bytes at load. A draft that is slightly off only has fewer proposals
+        // accepted, and its own work is what every round pays before the main model checks anything.
+        let mat = |name: &str, rows: usize, cols: usize| Mat::open(weights, name, rows, cols).map(Mat::rounded_to_bytes);
 
         let (q_dim, kv_dim) = (cfg.num_attention_heads * cfg.head_dim, cfg.num_key_value_heads * cfg.head_dim);
         let layers = (0..cfg.num_hidden_layers)
@@ -177,6 +183,7 @@ impl<'a> Draft<'a> {
             head,
             frequencies,
             min_confidence: DEFAULT_MIN_CONFIDENCE,
+            unembed: std::sync::OnceLock::new(),
             cfg,
         })
     }
@@ -305,7 +312,7 @@ impl<'a> Draft<'a> {
             for ((c, bias), x) in corrected.iter_mut().zip(&head.out_bias).zip(position) {
                 *c += bias + x;
             }
-            let logits = model.logits(&corrected)?;
+            let logits = self.logits(model, &corrected)?;
             let best = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).expect("a vocabulary");
             // The draft's probability for its choice, and with it for the run of choices so far.
             let total: f64 = logits.iter().map(|l| ((l - logits[best]) as f64).exp()).sum();
@@ -318,6 +325,22 @@ impl<'a> Draft<'a> {
         }
         timing::since(Stage::DraftHead, started);
         Ok(proposal)
+    }
+
+    /// The main model's logits for a final state, near enough for choosing a proposal.
+    fn logits(&self, model: &Model, state: &[f32]) -> Result<Vec<f32>> {
+        let Some(unembed) = self.unembed.get_or_init(|| model.packed_unembed()) else {
+            return model.logits(state);
+        };
+        let started = std::time::Instant::now();
+        let cap = model.config().final_logit_softcapping;
+        let mut logits = unembed.apply(state);
+        logits.truncate(model.config().unpadded_vocab_size);
+        logits.iter_mut().for_each(|l| *l /= cap);
+        crate::accel::tanh_in_place(&mut logits);
+        logits.iter_mut().for_each(|l| *l *= cap);
+        timing::since(Stage::Logits, started);
+        Ok(logits)
     }
 
     /// Block attention: every block position attends to the context (the window before the block, in local

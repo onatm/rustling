@@ -137,8 +137,12 @@ The draft also rests when it is not paying for itself. A round costs the draft's
 every proposal, about half a token's time each on an M1 Max, so every eight rounds the accepted tokens are
 weighed against that cost. When they fall short, the next 32 tokens are generated one at a time, then the draft
 gets another try; each further losing try doubles the rest, up to 512 tokens. On a Q4_K_M conversion this took
-two prompts that drafting had slowed from 14.0 and 14.9 tokens/s to 13.1 and 12.9 back to 14.2 and 14.7, and a
-highly repetitive one still went from 14.5 to 16.4.
+two prompts that drafting had slowed from 14.0 and 14.9 tokens/s to 13.1 and 12.9 back to 14.2 and 14.7.
+
+The draft's own matrices are rounded to 8 bits when it loads and multiplied in integers, and on the checkpoint
+it reads an 8-bit copy of the output weights (460 MB more memory). On the Q4_K_M prompts measured, the same
+proposals were made and accepted as before. A highly repetitive prompt goes from 14.7 to 17.2 tokens/s on a Q4_K_M conversion and
+from 9.6 to 12.4 on the checkpoint.
 
 ## Server
 

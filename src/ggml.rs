@@ -195,6 +195,21 @@ impl Int8Activation {
     }
 }
 
+/// Packs `values`, whose length must be a multiple of 32, as a `Q8_0` row: per block, a half-float scale and 32
+/// signed bytes.
+pub fn encode_q8_0(values: &[f32]) -> Vec<u8> {
+    assert!(values.len().is_multiple_of(32), "{} values do not make whole blocks", values.len());
+    let mut row = Vec::with_capacity(values.len() / 32 * 34);
+    for block in values.as_chunks::<32>().0 {
+        let largest = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let scale = largest / 127.0;
+        let inverse = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        row.extend_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+        row.extend(block.iter().map(|v| (v * inverse).round_ties_even() as i8 as u8));
+    }
+    row
+}
+
 /// Rounds `x`, whose length must be a multiple of 32, to signed bytes.
 pub fn quantize_int8(x: &[f32]) -> Int8Activation {
     assert!(x.len().is_multiple_of(INT8_BLOCK), "{} values do not make whole blocks", x.len());
@@ -437,6 +452,19 @@ mod tests {
     }
 
     /// Rows taken from a published GGUF file must decode to exactly what the reference decoder gives.
+    #[test]
+    fn a_row_packed_as_q8_0_decodes_to_nearly_the_same_values() {
+        let values: Vec<f32> = (0..96).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013).collect();
+        let row = encode_q8_0(&values);
+        assert_eq!(row.len(), Format::Q8_0.row_bytes(96).unwrap());
+        let mut decoded = vec![0.0f32; 96];
+        Format::Q8_0.decode_row(&row, &mut decoded);
+        // Half a step of the largest value's 127 levels, plus the scale's own rounding to a half float.
+        let step = 0.65 / 127.0;
+        assert!(values.iter().zip(&decoded).all(|(v, d)| (v - d).abs() <= step * 0.51));
+        assert!(encode_q8_0(&[0.0; 32]).iter().all(|b| *b == 0));
+    }
+
     #[test]
     fn rows_decode_as_the_reference_does() {
         let rows: Vec<Row> = serde_json::from_str(include_str!("../tests/golden/ggml_rows.json")).unwrap();

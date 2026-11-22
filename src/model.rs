@@ -351,6 +351,12 @@ impl<'a> Model<'a> {
         self.gpu.is_some()
     }
 
+    /// The output weights rounded to bytes, for a reader that can do with approximate logits. Nothing when they
+    /// are quantised already.
+    pub(crate) fn packed_unembed(&self) -> Option<Mat<'static>> {
+        self.unembed.packed()
+    }
+
     pub fn config(&self) -> &TextConfig {
         &self.cfg
     }
@@ -1366,7 +1372,7 @@ pub(crate) struct Mat<'a> {
     pub(crate) cols: usize,
     pub(crate) format: Format,
     row_bytes: usize,
-    pub(crate) bytes: &'a [u8],
+    pub(crate) bytes: std::borrow::Cow<'a, [u8]>,
 }
 
 impl<'a> Mat<'a> {
@@ -1375,10 +1381,35 @@ impl<'a> Mat<'a> {
         let row_bytes = format.row_bytes(cols).with_context(|| format!("{name}: rows of {cols} in {format:?}"))?;
         ensure!(bytes.len() == rows * row_bytes, "{name}: expected {rows}x{cols}, found shape {shape:?}");
         ensure!(format != Format::F32 || weights.is_gguf(), "{name}: expected bfloat16");
-        Ok(Mat { rows, cols, format, row_bytes, bytes })
+        Ok(Mat { rows, cols, format, row_bytes, bytes: bytes.into() })
     }
 
-    pub(crate) fn row(&self, row: usize) -> &'a [u8] {
+    /// A copy with every row packed as `Q8_0`, so that it is multiplied in integer arithmetic: several times
+    /// faster than bfloat16, and off by a little. The matrix itself when it is quantised already, or its rows do
+    /// not make whole blocks.
+    pub(crate) fn rounded_to_bytes(self) -> Mat<'a> {
+        self.packed().unwrap_or(self)
+    }
+
+    /// The copy [`Mat::rounded_to_bytes`] makes, or nothing where that returns the matrix itself.
+    pub(crate) fn packed(&self) -> Option<Mat<'static>> {
+        if self.format.is_quantised() || !self.cols.is_multiple_of(crate::ggml::INT8_BLOCK) {
+            return None;
+        }
+        let format = Format::Q8_0;
+        let row_bytes = format.row_bytes(self.cols).expect("whole blocks");
+        let mut bytes = vec![0u8; self.rows * row_bytes];
+        bytes.par_chunks_exact_mut(row_bytes).zip(self.bytes.par_chunks_exact(self.row_bytes)).for_each_init(
+            || vec![0.0f32; self.cols],
+            |widened, (packed, row)| {
+                self.format.decode_row(row, widened);
+                packed.copy_from_slice(&crate::ggml::encode_q8_0(widened));
+            },
+        );
+        Some(Mat { rows: self.rows, cols: self.cols, format, row_bytes, bytes: bytes.into() })
+    }
+
+    pub(crate) fn row(&self, row: usize) -> &[u8] {
         &self.bytes[row * self.row_bytes..][..self.row_bytes]
     }
 
@@ -1430,7 +1461,7 @@ pub(crate) fn apply_many(gpu: Option<&Gpu>, jobs: &[(&Mat, &[f32])]) -> Vec<Seq>
         && jobs.iter().all(|(m, _)| m.cols % 16 == 0 && m.format == Format::Bf16)
     {
         let dense: Vec<DenseJob> =
-            jobs.iter().map(|(m, xs)| DenseJob { weights: m.bytes, rows: m.rows, cols: m.cols, xs }).collect();
+            jobs.iter().map(|(m, xs)| DenseJob { weights: &m.bytes, rows: m.rows, cols: m.cols, xs }).collect();
         let fast = gpu.fast() && jobs.iter().any(|(m, xs)| xs.len() / m.cols >= FAST_MIN_TOKENS);
         match if fast { gpu.dense_fast(&dense) } else { gpu.dense(&dense) } {
             Ok(outs) => return outs,
