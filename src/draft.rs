@@ -12,12 +12,17 @@
 //! multiplied in integers: a draft that is slightly off only gets fewer proposals accepted, it cannot change what
 //! is generated.
 
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result, ensure};
 use crate::ggml::Format;
 
+use rayon::prelude::*;
+
+use crate::accel::{self, Rows};
 use crate::checkpoint::Checkpoint;
 use crate::config::{Config, DraftConfig};
-use crate::model::{Mat, Model, Seq, apply_many, dot, rms_norm, sigmoid};
+use crate::model::{Mat, Model, Seq, apply_many, rms_norm, sigmoid};
 use crate::timing::{self, Stage};
 
 pub struct Draft<'a> {
@@ -34,13 +39,21 @@ pub struct Draft<'a> {
     /// A proposal ends where the draft's confidence in the whole run so far would fall below this.
     min_confidence: f32,
     /// The main model's output weights rounded to bytes, made on first use; nothing when the model's own are
-    /// quantised already. A proposal takes one vocabulary projection per token, which is most of the head's work.
-    unembed: std::sync::OnceLock<Option<Mat<'static>>>,
+    /// quantised already.
+    unembed: OnceLock<Option<Mat<'static>>>,
+    /// What each direction of the recurrent head's correction adds to every token's logit: the output weights
+    /// times the head's output matrix, `[vocabulary, rank]`, made on first use. With it a proposal projects its
+    /// positions onto the vocabulary once, all together, and each step adds a correction a ninth of that size,
+    /// where projecting every corrected state on its own was most of the draft's work.
+    corrections: OnceLock<Vec<f32>>,
 }
 
 /// A rejected proposal wastes the work of checking it and everything proposed after it, so only confident runs
 /// are worth proposing. Measured on an M1 Max, speed keeps improving up to about here and flattens beyond.
 pub const DEFAULT_MIN_CONFIDENCE: f32 = 0.8;
+
+/// Tokens per task when a correction is added to every token's logit.
+const CORRECTION_TOKENS: usize = 8192;
 
 struct Layer<'a> {
     local: bool,
@@ -183,7 +196,8 @@ impl<'a> Draft<'a> {
             head,
             frequencies,
             min_confidence: DEFAULT_MIN_CONFIDENCE,
-            unembed: std::sync::OnceLock::new(),
+            unembed: OnceLock::new(),
+            corrections: OnceLock::new(),
             cfg,
         })
     }
@@ -286,14 +300,28 @@ impl<'a> Draft<'a> {
         timing::since(Stage::DraftLayers, started);
         let started = std::time::Instant::now();
 
-        // The recurrent head, left to right over the mask positions.
+        // The recurrent head, left to right over the mask positions. A position's logits are the output weights
+        // applied to its hidden state plus the head's correction; the first part does not depend on the tokens
+        // chosen so far, so positions can share a pass over the weights.
         let head = &self.head;
         let rank = head.rank;
+        let (vocab, cap) = (model.config().unpadded_vocab_size, model.config().final_logit_softcapping);
+        let unembed = self.unembed.get_or_init(|| model.packed_unembed()).as_ref().unwrap_or(model.unembed());
+        let corrections = self.corrections.get_or_init(|| self.corrections(unembed, vocab));
+        let biased: Seq = hidden[h..].chunks_exact(h).flat_map(|x| x.iter().zip(&head.out_bias).map(|(x, bias)| x + bias)).collect();
+        // The first position alone, then the rest together once the draft has turned out sure of the first:
+        // where it is not, the proposal ends there and the rest would be wasted.
+        let mut uncorrected = unembed.apply(&biased[..h]);
+
         let mut memory = vec![0.0f32; rank];
         let mut previous = anchor;
         let mut proposal = Vec::with_capacity(block - 1);
         let mut confidence = 1.0f32;
-        for position in hidden.chunks_exact(h).skip(1) {
+        for (i, position) in hidden.chunks_exact(h).skip(1).enumerate() {
+            if i == 1 {
+                uncorrected.extend(unembed.apply(&biased[h..]));
+            }
+            let uncorrected = &uncorrected[i * unembed.rows..][..vocab];
             let row = &head.previous[previous as usize * rank * 2..][..rank * 2];
             let embedding = row.as_chunks::<2>().0.iter().map(|b| half::bf16::from_le_bytes(*b).to_f32());
             let input: Vec<f32> =
@@ -306,16 +334,23 @@ impl<'a> Draft<'a> {
                 let keep = sigmoid(*g);
                 *m = keep * *m + (1.0 - keep) * c.tanh();
             }
-            // The head's output corrects the hidden state before the shared output projection.
             let latent: Vec<f32> = output.iter().map(|o| o.tanh()).collect();
-            let mut corrected = head.out.apply_one(&latent);
-            for ((c, bias), x) in corrected.iter_mut().zip(&head.out_bias).zip(position) {
-                *c += bias + x;
-            }
-            let logits = self.logits(model, &corrected)?;
-            let best = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).expect("a vocabulary");
+            let mut logits = vec![0.0f32; vocab];
+            let latent = Rows { values: &latent, rows: rank, cols: 1, stride: 1 };
+            // Reading the table is what takes the time, so the cores share it.
+            logits.par_chunks_mut(CORRECTION_TOKENS).zip(corrections.par_chunks(CORRECTION_TOKENS * rank)).for_each(|(logits, table)| {
+                let table = Rows { values: table, rows: logits.len(), cols: rank, stride: rank };
+                accel::multiply(table, latent, false, 1.0, logits);
+            });
+            logits.iter_mut().zip(uncorrected).for_each(|(l, u)| *l = (*l + u) / cap);
+            accel::tanh_in_place(&mut logits);
+            logits.iter_mut().for_each(|l| *l *= cap);
+            let best = (0..vocab).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).expect("a vocabulary");
             // The draft's probability for its choice, and with it for the run of choices so far.
-            let total: f64 = logits.iter().map(|l| ((l - logits[best]) as f64).exp()).sum();
+            let top = logits[best];
+            logits.iter_mut().for_each(|l| *l -= top);
+            accel::exp_in_place(&mut logits);
+            let total: f64 = logits.iter().map(|l| *l as f64).sum();
             confidence *= (1.0 / total) as f32;
             if confidence < self.min_confidence {
                 break;
@@ -327,20 +362,19 @@ impl<'a> Draft<'a> {
         Ok(proposal)
     }
 
-    /// The main model's logits for a final state, near enough for choosing a proposal.
-    fn logits(&self, model: &Model, state: &[f32]) -> Result<Vec<f32>> {
-        let Some(unembed) = self.unembed.get_or_init(|| model.packed_unembed()) else {
-            return model.logits(state);
-        };
-        let started = std::time::Instant::now();
-        let cap = model.config().final_logit_softcapping;
-        let mut logits = unembed.apply(state);
-        logits.truncate(model.config().unpadded_vocab_size);
-        logits.iter_mut().for_each(|l| *l /= cap);
-        crate::accel::tanh_in_place(&mut logits);
-        logits.iter_mut().for_each(|l| *l *= cap);
-        timing::since(Stage::Logits, started);
-        Ok(logits)
+    /// The output weights times the head's output matrix, a row of `rank` values per token.
+    fn corrections(&self, unembed: &Mat, vocab: usize) -> Vec<f32> {
+        const TOKENS: usize = 256;
+        let (h, rank) = (self.hidden, self.head.rank);
+        let out = self.head.out.widened(0, h);
+        let mut table = vec![0.0f32; vocab * rank];
+        table.par_chunks_mut(TOKENS * rank).enumerate().for_each(|(chunk, table)| {
+            let count = table.len() / rank;
+            let rows = unembed.widened(chunk * TOKENS, count);
+            let rows = Rows { values: &rows, rows: count, cols: h, stride: h };
+            accel::multiply(rows, Rows { values: &out, rows: h, cols: rank, stride: rank }, false, 1.0, table);
+        });
+        table
     }
 
     /// Block attention: every block position attends to the context (the window before the block, in local
@@ -369,26 +403,101 @@ impl<'a> Draft<'a> {
         let first = if layer.local { state.tokens.saturating_sub(cfg.sliding_window_size) } else { 0 };
         let context_keys = &state.keys[l][first * kv_dim..];
         let context_values = &state.values[l][first * kv_dim..];
+        let context = context_keys.len() / kv_dim;
         let scaling = (dim as f32).powf(-0.5);
+        // A key head at a time, each on its own core: its query heads at every block position against all the
+        // keys, as matrix products. In the layer that sees the whole conversation this is most of a proposal's
+        // work once the context is long.
+        let rows = block * group;
+        let attend = |kv: usize| -> Vec<f32> {
+            let mut mine = vec![0.0f32; rows * dim];
+            for (i, mine) in mine.chunks_exact_mut(group * dim).enumerate() {
+                mine.copy_from_slice(&queries[i * q_dim + kv * group * dim..][..group * dim]);
+            }
+            let mine = Rows { values: &mine, rows, cols: dim, stride: dim };
+            // This head's band of a table holding every head's vectors for each token.
+            fn band(table: &[f32], kv: usize, dim: usize, stride: usize) -> Rows<'_> {
+                Rows { values: &table[kv * dim..], rows: table.len() / stride, cols: dim, stride }
+            }
+            let band = |table| band(table, kv, dim, kv_dim);
+            let (mut far, mut near) = (vec![0.0f32; rows * context], vec![0.0f32; rows * block]);
+            accel::multiply(mine, band(context_keys), true, scaling, &mut far);
+            accel::multiply(mine, band(&keys), true, scaling, &mut near);
+            // One softmax over the context and the block together.
+            for (far, near) in far.chunks_exact_mut(context).zip(near.chunks_exact_mut(block)) {
+                let max = far.iter().chain(near.iter()).copied().fold(f32::NEG_INFINITY, f32::max);
+                far.iter_mut().chain(near.iter_mut()).for_each(|s| *s -= max);
+                accel::exp_in_place(far);
+                accel::exp_in_place(near);
+                let total: f32 = far.iter().chain(near.iter()).sum();
+                far.iter_mut().chain(near.iter_mut()).for_each(|w| *w /= total);
+            }
+            let (mut attended, mut within) = (vec![0.0f32; rows * dim], vec![0.0f32; rows * dim]);
+            let weights = Rows { values: &far, rows, cols: context, stride: context };
+            accel::multiply(weights, band(context_values), false, 1.0, &mut attended);
+            let weights = Rows { values: &near, rows, cols: block, stride: block };
+            accel::multiply(weights, band(&values), false, 1.0, &mut within);
+            attended.iter_mut().zip(&within).for_each(|(a, w)| *a += w);
+            attended
+        };
+        let attended: Vec<Vec<f32>> = (0..kv_heads).into_par_iter().map(attend).collect();
         let mut out = vec![0.0f32; block * q_dim];
-        for (unit, out) in out.chunks_exact_mut(dim).enumerate() {
-            let (i, head) = (unit / heads, unit % heads);
-            let kv = head / group;
-            let query = &queries[i * q_dim + head * dim..][..dim];
-            let sources = [(context_keys, context_values), (&keys[..], &values[..])];
-            let scores: Vec<f32> = sources
-                .iter()
-                .flat_map(|(keys, _)| keys.chunks_exact(kv_dim).map(|key| dot(query, &key[kv * dim..][..dim]) * scaling))
-                .collect();
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let weights: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
-            let total: f32 = weights.iter().sum();
-            let all_values = sources.iter().flat_map(|(_, values)| values.chunks_exact(kv_dim));
-            for (weight, value) in weights.iter().zip(all_values) {
-                let p = weight / total;
-                out.iter_mut().zip(&value[kv * dim..][..dim]).for_each(|(o, v)| *o += p * v);
+        for (kv, attended) in attended.iter().enumerate() {
+            for (row, attended) in attended.chunks_exact(dim).enumerate() {
+                let unit = (row / group) * heads + kv * group + row % group;
+                out[unit * dim..][..dim].copy_from_slice(attended);
             }
         }
         layer.o.apply(&out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::{companion_dir, resolve_model};
+    use crate::model::{Activations, Backend, Options};
+
+    /// What a proposal costs with a long conversation behind it, without paying to process one: the draft's
+    /// context is filled with made-up keys and values, which cost its attention the same as real ones.
+    /// `cargo test --release --lib a_proposal_at_long_context -- --ignored --nocapture`; `CONTEXT` sets the length.
+    #[test]
+    #[ignore]
+    fn a_proposal_at_long_context() {
+        let context: usize = std::env::var("CONTEXT").ok().and_then(|v| v.parse().ok()).unwrap_or(12_000);
+        let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M".to_owned());
+        let path = resolve_model(Some(std::path::Path::new(&named))).unwrap();
+        let weights = Checkpoint::open(&path).unwrap();
+        let config = Config::load(&path).unwrap();
+        let model = Model::load(&config, &weights, Options { activations: Activations::Float, backend: Backend::Cpu }).unwrap();
+        let draft_weights = Checkpoint::open_file(&companion_dir(&path).unwrap().join("mtp.safetensors")).unwrap();
+        let draft = Draft::load(&config, &draft_weights).unwrap().with_min_confidence(0.0);
+
+        let kv_dim = draft.cfg.num_key_value_heads * draft.cfg.head_dim;
+        let made_up = |seed: usize| -> Vec<f32> {
+            (0..context * kv_dim).map(|i| (((i * 2_654_435_761 + seed) >> 7) % 2001) as f32 / 1000.0 - 1.0).collect()
+        };
+        let mut state = draft.new_state();
+        for l in 0..draft.layers.len() {
+            (state.keys[l], state.values[l]) = (made_up(l), made_up(l + 99));
+        }
+        state.head_context = vec![0.1; draft.hidden];
+        state.tokens = context;
+
+        draft.propose(&state, 17, &model).unwrap();
+        let mut best = f64::INFINITY;
+        let mut stages = Vec::new();
+        for round in 0..12 {
+            timing::take();
+            let started = std::time::Instant::now();
+            let proposal = draft.propose(&state, 100 + round, &model).unwrap();
+            let took = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(proposal.len(), draft.proposal_len());
+            if took < best {
+                best = took;
+                stages = timing::take().iter().filter(|(_, s)| *s > 0.0).map(|(stage, s)| format!("{stage:?} {:.1}", s * 1000.0)).collect();
+            }
+        }
+        eprintln!("a proposal at {context} tokens: {best:.1} ms at best ({})", stages.join(", "));
     }
 }

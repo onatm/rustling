@@ -66,9 +66,11 @@ const PROPOSED_COST: f32 = 0.55;
 /// Drafting is judged over this many rounds at a time.
 const TRIAL_ROUNDS: usize = 8;
 /// How many tokens the draft rests for after a losing trial. Each further losing trial doubles it, up to the
-/// limit, so text the draft cannot predict costs only an occasional trial.
+/// limit, so text the draft cannot predict costs only an occasional trial. The limit is short enough that the
+/// draft is soon back when the text turns predictable: a reply that reasons in prose and then writes out code
+/// would otherwise spend much of the code resting.
 const FIRST_REST: usize = 32;
-const LONGEST_REST: usize = 512;
+const LONGEST_REST: usize = 128;
 
 /// Decides when drafting is worth its cost. A round gains the tokens it had accepted and pays for the draft's
 /// work and for checking every proposal, accepted or not; when a trial of rounds comes out behind, the draft

@@ -140,7 +140,8 @@ hf download thinkingmachines/Inkling-2-Mini mtp.safetensors
 
 Each round the draft proposes up to seven next tokens, the main model runs them as one batch, and the leading
 ones it agrees with are kept; the rest are rolled back. What is generated follows the same distribution as
-without the draft, and with `--temperature 0` it is identical. Only the speed changes, and by how much depends
+without the draft, and with `--temperature 0` it is identical (to rounding with `--backend metal-fast`, which
+checks the batch with its faster attention). Only the speed changes, and by how much depends
 on how predictable the text is: a code prompt went from 8.7 to 11.7 tokens/s on an M1 Max, a prose prompt from
 9.35 to 9.5. The draft stops proposing where its own confidence in the run falls below `--draft-confidence`
 (default 0.8), because checking a wrong guess is expensive on a CPU.
@@ -148,11 +149,17 @@ on how predictable the text is: a code prompt went from 8.7 to 11.7 tokens/s on 
 The draft also rests when it is not paying for itself. A round costs the draft's own work plus the checking of
 every proposal, about half a token's time each on an M1 Max, so every eight rounds the accepted tokens are
 weighed against that cost. When they fall short, the next 32 tokens are generated one at a time, then the draft
-gets another try; each further losing try doubles the rest, up to 512 tokens. On a Q4_K_M conversion this took
+gets another try; each further losing try doubles the rest, up to 128 tokens. On a Q4_K_M conversion this took
 two prompts that drafting had slowed from 14.0 and 14.9 tokens/s to 13.1 and 12.9 back to 14.2 and 14.7.
 
+The draft's cost does not grow much with the conversation: its attention over the whole context is a handful of
+matrix products, and a proposal takes about 65 ms on an M1 Max at 600 tokens of context and at 15,000. With a
+15,000-token prompt of source code and a Q4_K_M conversion on `metal-fast`, a reply that reasons for a while and
+then writes out code went from 9.35 to 11.0 tokens/s (measured with other work running on the machine).
+
 The draft's own matrices are rounded to 8 bits when it loads and multiplied in integers, and on the checkpoint
-it reads an 8-bit copy of the output weights (460 MB more memory). On the Q4_K_M prompts measured, the same
+it reads an 8-bit copy of the output weights (460 MB more memory). A table of what its last step adds to each
+token's score, built at the first proposal, takes another 205 MB. On the Q4_K_M prompts measured, the same
 proposals were made and accepted as before. A highly repetitive prompt goes from 14.7 to 17.2 tokens/s on a Q4_K_M conversion and
 from 9.6 to 12.4 on the checkpoint.
 

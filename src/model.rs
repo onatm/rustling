@@ -58,9 +58,11 @@ const FAST_PROMPT_CHUNK: usize = 2048;
 const PROMPT_CHUNK: usize = 512;
 
 /// Batches of at least this many tokens take the fast attention, which pays off much sooner than the GPU does: the
-/// last stretch of a long prompt, after the part a cached one covered, is often a couple of hundred tokens.
+/// last stretch of a long prompt after the part a cached one covered, and the handful of tokens checked at a time
+/// with a draft model, where at 15,000 tokens of context it takes a third of the time. A single token is quicker
+/// on the exact path.
 #[cfg(target_os = "macos")]
-const FAST_ATTENTION_MIN_TOKENS: usize = 32;
+const FAST_ATTENTION_MIN_TOKENS: usize = 2;
 
 /// The most weights (tokens' heads times keys) the fast attention holds at once, which bounds its memory to a
 /// quarter of a gigabyte however long the context.
@@ -403,6 +405,11 @@ impl<'a> Model<'a> {
     /// are quantised already.
     pub(crate) fn packed_unembed(&self) -> Option<Mat<'static>> {
         self.unembed.packed()
+    }
+
+    /// The output weights: a row per token, padding included.
+    pub(crate) fn unembed(&self) -> &Mat<'a> {
+        &self.unembed
     }
 
     pub fn config(&self) -> &TextConfig {
@@ -1725,6 +1732,15 @@ impl<'a> Mat<'a> {
         &self.bytes[row * self.row_bytes..][..self.row_bytes]
     }
 
+    /// Rows `first..first + count` as floats, one after another.
+    pub(crate) fn widened(&self, first: usize, count: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; count * self.cols];
+        for (r, out) in out.chunks_exact_mut(self.cols).enumerate() {
+            self.format.decode_row(self.row(first + r), out);
+        }
+        out
+    }
+
     /// Whether the matrix is multiplied in integer arithmetic, against activations rounded to bytes.
     fn int8(&self) -> bool {
         self.format.is_quantised() && self.cols.is_multiple_of(crate::ggml::INT8_BLOCK)
@@ -1993,7 +2009,8 @@ mod tests {
 
     /// Token-by-token speed with a long context, without paying to process one: the state is filled with made-up
     /// keys and values, which cost attention the same as real ones.
-    /// `cargo test --release --lib decode_at_long_context -- --ignored --nocapture`; `CONTEXT` sets the length.
+    /// `cargo test --release --lib decode_at_long_context -- --ignored --nocapture`; `CONTEXT` sets the length
+    /// and `BATCH` how many tokens go through at a time.
     #[test]
     #[ignore]
     fn decode_at_long_context() {
@@ -2022,9 +2039,12 @@ mod tests {
             model.forward(&[17], &mut state, false).unwrap();
             crate::timing::take();
             let started = std::time::Instant::now();
-            let tokens = 20;
-            for token in 0..tokens {
-                model.forward(&[100 + token], &mut state, false).unwrap();
+            // `BATCH` tokens per pass, as when a draft's proposals are checked.
+            let batch: u32 = std::env::var("BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+            let tokens = 24;
+            for pass in 0..tokens / batch {
+                let ids: Vec<u32> = (0..batch).map(|i| 100 + pass * batch + i).collect();
+                model.forward(&ids, &mut state, false).unwrap();
             }
             let each = started.elapsed().as_secs_f64() * 1000.0 / tokens as f64;
             let stages: Vec<String> = crate::timing::take()
