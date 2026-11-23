@@ -13,6 +13,30 @@ use rustling::generate::session::Session;
 
 const GIB: usize = 1 << 30;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn gpu_branches_keep_a_cached_prefix_independent() {
+    use rustling::weights::checkpoint::{DEFAULT_MODEL, resolve_model};
+    let Ok(path) = resolve_model(Some(Path::new(DEFAULT_MODEL))) else { return };
+    let weights = Checkpoint::open(&path).unwrap();
+    let config = Config::load(&path).unwrap();
+    let model = Model::load(&config, &weights, Options { activations: Activations::Quantised, backend: Backend::MetalFast }).unwrap();
+    let prefix: Vec<u32> = (500..596).collect();
+    let mut reference = Session::new(&model);
+    reference.set_context(&prefix).unwrap();
+    let saved = reference.snapshot();
+    let mut session = Session::new(&model);
+    let mut cache = PromptCache::new(GIB);
+    for (i, suffix) in [vec![601, 602], vec![701, 702, 703], vec![801]].iter().enumerate() {
+        let prompt = [prefix.as_slice(), suffix].concat();
+        reference.restore(saved.clone()).unwrap();
+        reference.set_context(&prompt).unwrap();
+        let reused = cache.prepare(&mut session, &prompt, Some(prefix.len())).unwrap();
+        assert_eq!(reused, if i == 0 { 0 } else { prefix.len() });
+        assert!(session.logits().unwrap() == reference.logits().unwrap(), "branch {i} changed logits");
+    }
+}
+
 #[test]
 fn cached_prompts_give_the_same_state_as_fresh_ones() {
     let Ok(model_dir) = resolve_checkpoint() else {

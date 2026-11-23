@@ -53,6 +53,15 @@ impl Snapshot {
         &self.tokens
     }
 
+    pub(super) fn fork(&self, session: &Session, more: usize) -> Self {
+        Self {
+            state: session.model.fork_prefix(&self.state, more),
+            tokens: self.tokens.clone(),
+            last: self.last.clone(),
+            draft: self.draft.clone(),
+        }
+    }
+
     /// Roughly how much memory the snapshot holds.
     pub fn bytes(&self) -> usize {
         let draft = self.draft.as_ref().map_or(0, DraftState::bytes);

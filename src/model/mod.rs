@@ -461,6 +461,24 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// Copy a reusable prefix, preparing its KV tables directly for a short GPU extension.
+    pub(crate) fn fork_prefix(&self, state: &State, more: usize) -> State {
+        #[cfg(target_os = "macos")]
+        if (1..=decode::MAX_BATCH).contains(&more) && self.decodes_on_gpu() && !float_reference() {
+            let gpu = self.gpu.as_ref().expect("GPU decoder");
+            let visits = state.visits.iter().map(|v| Ok(VisitState {
+                keys: v.keys.clone_shared(gpu, more)?,
+                values: v.values.clone_shared(gpu, more)?,
+                conv_channels: v.conv_channels,
+                convs: v.convs.clone(),
+                first: v.first,
+            })).collect::<Result<Vec<_>>>();
+            // Under memory pressure retain the usual compact clone and decoder fallback.
+            if let Ok(visits) = visits { return State { position: state.position, visits }; }
+        }
+        state.clone()
+    }
+
     /// A fresh context with no tokens in it.
     pub fn new_state(&self) -> State {
         let cfg = &self.cfg;

@@ -191,12 +191,23 @@ impl Table {
     /// Copy the retained suffix of each head directly into a compact table.
     pub(super) fn clone_skipping(&self, skip: usize) -> Self {
         let rows = self.rows - skip;
-        let used = rows * self.dim;
-        let mut store = self.store.another(self.heads * used);
+        self.copy_into(self.store.another(self.heads * rows * self.dim), rows, skip)
+    }
+
+    /// Fork the cached rows into an independent GPU buffer with space for the imminent batch.
+    #[cfg(target_os = "macos")]
+    pub(super) fn clone_shared(&self, gpu: &Gpu, more: usize) -> anyhow::Result<Self> {
+        let capacity = self.capacity_for(more);
+        let shared = gpu.shared(self.heads * capacity * self.dim * 4)?;
+        Ok(self.copy_into(Store::Shared(shared), capacity, 0))
+    }
+
+    fn copy_into(&self, mut store: Store, capacity: usize, skip: usize) -> Self {
+        let rows = self.rows - skip;
         for head in 0..self.heads {
-            store.floats_mut()[head * used..][..used].copy_from_slice(&self.head(head)[skip * self.dim..]);
+            store.floats_mut()[head * capacity * self.dim..][..rows * self.dim].copy_from_slice(&self.head(head)[skip * self.dim..]);
         }
-        Self { heads: self.heads, dim: self.dim, rows, capacity: rows, store }
+        Self { heads: self.heads, dim: self.dim, rows, capacity, store }
     }
 }
 

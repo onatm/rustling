@@ -192,7 +192,10 @@ impl PromptCache {
                     // it. A point inside a prompt stays for the next conversation that shares it.
                     Some(match self.entries[index].tip {
                         true => self.entries.remove(index).snapshot,
-                        false => self.entries[index].snapshot.clone(),
+                        false => {
+                            let next = plan.boundaries.first().copied().unwrap_or(prompt.len());
+                            self.entries[index].snapshot.fork(session, next - plan.start)
+                        }
                     })
                 }
                 _ => None,
