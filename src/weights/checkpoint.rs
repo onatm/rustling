@@ -550,13 +550,7 @@ pub fn resolve_model(explicit: Option<&Path>) -> Result<PathBuf> {
         "{name} is not a directory, a .gguf file, or a model name like {BASE_MODEL} or {DEFAULT_MODEL}"
     );
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
-    let hub = match std::env::var_os("HF_HUB_CACHE") {
-        Some(path) => PathBuf::from(path),
-        None => match std::env::var_os("HF_HOME") {
-            Some(hf_home) => PathBuf::from(hf_home).join("hub"),
-            None => home.join(".cache/huggingface/hub"),
-        },
-    };
+    let hub = hub_cache()?;
     let snapshots = hub.join(format!("models--{}/snapshots", repo.replace('/', "--")));
     let snapshot = std::fs::read_dir(&snapshots)
         .ok()
@@ -610,13 +604,34 @@ pub fn companion_dir(model: &Path) -> Result<PathBuf> {
         return Ok(model.to_path_buf());
     }
     let base = std::env::var_os("RUSTLING_BASE_MODEL").map(PathBuf::from).unwrap_or_else(|| BASE_MODEL.into());
-    let dir = resolve_model(Some(&base)).with_context(|| {
-        format!(
-            "a GGUF file needs the config and tokenizer of the checkpoint it came from, {}; `rustling pull` \
-             fetches them",
-            base.display()
-        )
-    })?;
-    ensure!(dir.is_dir(), "{} is not a checkpoint directory", dir.display());
-    Ok(dir)
+    if base.is_dir() {
+        return Ok(base);
+    }
+    // Only the small files are needed, so a snapshot counts whether or not the checkpoint's weights are in it.
+    let name = base.to_string_lossy();
+    let snapshots = hub_cache()?.join(format!("models--{}/snapshots", name.replace('/', "--")));
+    let mut found: Vec<PathBuf> = std::fs::read_dir(&snapshots)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|dir| COMPANION_FILES.iter().all(|file| dir.join(file).is_file()))
+        .collect();
+    found.sort_by_key(|dir| dir.metadata().and_then(|m| m.modified()).ok());
+    found.pop().with_context(|| {
+        format!("a GGUF file needs the config and tokenizer of the checkpoint it came from, {name}; `rustling pull` fetches them")
+    })
+}
+
+/// What a GGUF file borrows from its checkpoint.
+const COMPANION_FILES: [&str; 3] = ["config.json", "tokenizer.json", "chat_template.jinja"];
+
+/// The Hugging Face cache: `$HF_HUB_CACHE`, or `hub` under `$HF_HOME`, or `~/.cache/huggingface/hub`.
+fn hub_cache() -> Result<PathBuf> {
+    Ok(match std::env::var_os("HF_HUB_CACHE") {
+        Some(path) => PathBuf::from(path),
+        None => match std::env::var_os("HF_HOME") {
+            Some(hf_home) => PathBuf::from(hf_home).join("hub"),
+            None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".cache/huggingface/hub"),
+        },
+    })
 }
