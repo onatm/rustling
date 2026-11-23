@@ -486,7 +486,7 @@ mod tests {
     #[ignore]
     fn a_proposal_at_long_context() {
         let context: usize = std::env::var("CONTEXT").ok().and_then(|v| v.parse().ok()).unwrap_or(12_000);
-        let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M".to_owned());
+        let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| crate::weights::checkpoint::DEFAULT_MODEL.to_owned());
         let path = resolve_model(Some(std::path::Path::new(&named))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
         let config = Config::load(&path).unwrap();

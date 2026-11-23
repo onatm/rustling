@@ -536,7 +536,7 @@ fn checkpoint_name(gguf: &str, full: bool) -> Option<(String, Layout)> {
 }
 
 /// The model used when none is named: a 4-bit conversion, which is what the GPU generates from.
-pub const DEFAULT_MODEL: &str = "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M";
+pub const DEFAULT_MODEL: &str = "unsloth/Inkling-2-Mini-GGUF:Q4_K_M";
 /// The published checkpoint. Conversions borrow its config, tokenizer and chat template.
 pub const BASE_MODEL: &str = "thinkingmachines/Inkling-2-Mini";
 

@@ -11,7 +11,7 @@ runs of tokens the reply repeats from the conversation.
 ## Requirements
 
 - An Apple silicon Mac. Nothing else is supported: the engine is built around Metal and tuned on these chips.
-- Memory: 17.5 GB for the model, 1 to 5 GB for a conversation depending on its length, and up to 15 GB more
+- Memory: 16.6 GB for the model, 1 to 5 GB for a conversation depending on its length, and up to 15 GB more
   while a long prompt is being processed. Measured on a 64 GB machine. 48 GB is comfortable; on 32 GB long
   prompts will push the model's own pages out of memory and slow down.
 - A Rust toolchain to build it.
@@ -23,10 +23,10 @@ cargo install --path .
 rustling chat
 ```
 
-The first run downloads the model (17.5 GB, a 4-bit conversion) to the Hugging Face cache, where other tools
+The first run downloads [Unsloth’s UD-Q4_K_M conversion](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (16.6 GB) to the Hugging Face cache, where other tools
 that use the Hub will find it too. `rustling pull` does only that, if you would rather fetch it ahead. A
 download that is interrupted starts again from the beginning; on an unreliable connection,
-`hf download lmstudio-community/Inkling-2-Mini-GGUF Inkling-2-Mini-Q4_K_M.gguf` can resume, and rustling finds
+`hf download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-UD-Q4_K_M.gguf` can resume, and rustling finds
 the file it leaves.
 
 To serve it to other programs:
@@ -122,7 +122,7 @@ RUSTLING_MODEL=thinkingmachines/Inkling-2-Mini rustling chat # or by environment
 ### Without the GPU
 
 ```sh
-rustling chat --backend cpu                              # about 15 tokens/s on an M1 Max
+rustling chat --backend cpu
 rustling pull --draft && rustling chat --backend cpu --draft   # the draft model helps on the CPU
 ```
 
@@ -174,7 +174,7 @@ It splits full attention across blocks of cached keys on the same GPU when gener
 with at least 32,768 visible keys. Prompt processing in large batches and speculative verification
 batches use the usual kernels. The different order of floating-point sums can change a reply.
 
-On an M1 Max with 64 GB, with the default model, against llama.cpp running the same file:
+The following measurements use the previous LM Studio Q4_K_M conversion. On an M1 Max with 64 GB, against llama.cpp running the same file:
 
 | | rustling | llama.cpp |
 |---|---|---|
@@ -191,7 +191,7 @@ file do, go faster than the figures above.
 
 ## Accuracy
 
-The default model is a 4-bit conversion, and the GPU computes in a different arithmetic from the CPU, so each
+The LM Studio Q4_K_M conversion was used for the measurements below. The GPU computes in a different arithmetic from the CPU, so each
 way of running it was scored against the published checkpoint: how often it picks the same most likely next
 token. The first row is the checkpoint itself in another, equally valid arithmetic, which shows how much
 disagreement is ordinary.
@@ -214,7 +214,7 @@ Everything has a default; these are the ones worth knowing. `rustling <command> 
 
 | Option | Default | What it does |
 |---|---|---|
-| `--model` | `lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M` | A model name, a `.gguf` file or a checkpoint directory. Names are downloaded when missing. Also `$RUSTLING_MODEL`. |
+| `--model` | `unsloth/Inkling-2-Mini-GGUF:Q4_K_M` | A model name, a `.gguf` file or a checkpoint directory. Names are downloaded when missing. Also `$RUSTLING_MODEL`. |
 | `--backend` | `auto` | `auto` uses the GPU; `cpu` does not. |
 | `--context` | by chip, see below | The most tokens a prompt and its reply may take together. |
 | `--max-tokens` | 4096 | The longest reply. |
@@ -264,12 +264,12 @@ and speed in tokens per second.
 
 | Model | Size | Notes |
 |---|---|---|
-| `lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M` | 17.5 GB | The default. The GPU generates from it. |
+| `unsloth/Inkling-2-Mini-GGUF:Q4_K_M` | 16.6 GB | The default. Uses Unsloth’s `Inkling-2-Mini-UD-Q4_K_M.gguf` on Metal or CPU. |
+| `lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M` | 17.5 GB | The previous default, selectable with `--model`. |
 | `thinkingmachines/Inkling-2-Mini` | 19 GB | The published checkpoint in its own formats, on the CPU with GPU help for long prompts. About 10 tokens/s. The reference for accuracy. |
 | `thinkingmachines/TML-d24-varloop-research` | | The variable-loop research checkpoint; `--passes` picks how many times the looped layers run. |
 
-Other GGUF conversions work when their tensors are F32, BF16, Q4_K, Q5_0, Q6_K or Q8_0, which is what a Q4_K_M
-file holds.
+The GGUF loader reads F32, BF16, NVFP4, Q4_K, Q5_0, Q5_K, Q6_K and Q8_0 tensors.
 
 ## Limits
 

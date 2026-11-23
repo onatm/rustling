@@ -13,7 +13,7 @@ use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options, State};
 use rustling::prompt::Prompter;
 
-const DEFAULT_GGUF: &str = "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M";
+const DEFAULT_GGUF: &str = rustling::weights::checkpoint::DEFAULT_MODEL;
 /// The tokens at the end of each text that the generating paths are also run over, one by one.
 const TAIL: usize = 2600;
 /// The size of the additions an agent makes between turns, which have a path of their own.

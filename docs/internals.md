@@ -7,7 +7,7 @@ are from an M1 Max with 64 GB unless they say otherwise. For installing and usin
 Two defaults have changed since most of this was written. The model used when none is named is the Q4_K_M
 conversion, not the checkpoint; and `--backend auto`, the default, now gives a GGUF file the fast GPU path that
 these notes call `metal-fast`. Where a passage says a feature needs `--backend metal-fast`, with a GGUF file it
-is simply on.
+is simply on. The default conversion is now Unsloth's UD-Q4_K_M; the historical Q4_K_M measurements below used LM Studio's file.
 
 ## Status
 
@@ -89,7 +89,7 @@ rustling --model unsloth/Inkling-2-Mini-GGUF:Q4_K_M chat
 rustling --model ~/models/Inkling-2-Mini-Q4_K_M.gguf serve
 ```
 
-- **Formats**: tensors stored as F32, BF16, Q4_K, Q5_0, Q6_K or Q8_0, which is what a Q4_K_M file holds. Other
+- **Formats**: tensors stored as F32, BF16, NVFP4, Q4_K, Q5_0, Q5_K, Q6_K or Q8_0. Other
   quantisations (the IQ and other K sizes) are refused with a message naming the tensor.
 - **Companion files**: the config, tokenizer and chat template still come from the published checkpoint.
   `rustling pull` fetches them with the file, without the checkpoint's weights. `$RUSTLING_BASE_MODEL` names a

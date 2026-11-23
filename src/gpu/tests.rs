@@ -91,16 +91,19 @@ fn dense_matches_the_cpu_kernel_exactly() {
 #[ignore]
 fn row_kernels() {
     use crate::weights::checkpoint::{Checkpoint, resolve_model};
-    let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
+    let path = resolve_model(Some(std::path::Path::new(crate::weights::checkpoint::DEFAULT_MODEL))).unwrap();
     let weights = Checkpoint::open(&path).unwrap();
     let gpu = Gpu::new(&weights.maps(), false).unwrap();
-    let kernels = gpu.kernels(include_str!("shaders/gguf.metal"), &["row_q4k", "row_q5_0", "row_q6k", "row_q8_0", "row_f32"]).unwrap();
+    let kernels = gpu.kernels(include_str!("shaders/gguf.metal"), &["row_q4k", "row_q5_0", "row_q6k", "row_q8_0", "row_f32", "row_nvfp4", "row_q5k", "row_bf16"]).unwrap();
     let index = |format: Format| match format {
         Format::Q4K => 0,
         Format::Q5_0 => 1,
         Format::Q6K => 2,
         Format::Q8_0 => 3,
-        other => panic!("{other:?}"),
+        Format::F32 => 4,
+        Format::Nvfp4 => 5,
+        Format::Q5K => 6,
+        Format::Bf16 => 7,
     };
     let word = |values: &[usize]| -> Vec<u8> { values.iter().flat_map(|v| (*v as u32).to_le_bytes()).collect() };
     // Buffers: inputs, outputs, the matrices' order, then the weights.
@@ -177,7 +180,7 @@ fn row_kernels() {
 fn prompt_parts() {
     use crate::weights::checkpoint::{Checkpoint, resolve_model};
     use std::time::Instant;
-    let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
+    let path = resolve_model(Some(std::path::Path::new(crate::weights::checkpoint::DEFAULT_MODEL))).unwrap();
     let weights = Checkpoint::open(&path).unwrap();
     let gpu = Gpu::new(&weights.maps(), true).unwrap();
     let tokens: usize = std::env::var("TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);

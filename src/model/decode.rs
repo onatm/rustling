@@ -846,7 +846,7 @@ mod tests {
     #[ignore]
     fn the_experts_of_a_short_batch_match_the_cpu_in_floats() {
         let _turn = my_turn();
-        let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
+        let path = resolve_model(Some(std::path::Path::new(crate::weights::checkpoint::DEFAULT_MODEL))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
         let config = Config::load(&path).unwrap();
         let options = Options { activations: Activations::Float, backend: Backend::MetalFast };
@@ -876,7 +876,7 @@ mod tests {
     #[ignore]
     fn a_batch_matches_tokens_one_at_a_time() {
         let _turn = my_turn();
-        let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
+        let path = resolve_model(Some(std::path::Path::new(crate::weights::checkpoint::DEFAULT_MODEL))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
         let config = Config::load(&path).unwrap();
         let options = Options { activations: Activations::Float, backend: Backend::MetalFast };
@@ -933,7 +933,7 @@ mod tests {
     fn profile_at_long_context() {
         let _turn = my_turn();
         let context: usize = std::env::var("CONTEXT").ok().and_then(|v| v.parse().ok()).unwrap_or(15_000);
-        let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
+        let path = resolve_model(Some(std::path::Path::new(crate::weights::checkpoint::DEFAULT_MODEL))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
         let config = Config::load(&path).unwrap();
         let options = Options { activations: Activations::Float, backend: Backend::MetalFast };
@@ -964,7 +964,7 @@ mod tests {
         use crate::generate::{sampler::{Sampler, SamplerConfig}, session::{Limits, Session}};
         use crate::prompt::Prompter;
         let _turn = my_turn();
-        let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
+        let path = resolve_model(Some(std::path::Path::new(crate::weights::checkpoint::DEFAULT_MODEL))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
         let config = Config::load(&path).unwrap();
         let model = Model::load(&config, &weights, Options { activations: Activations::Float, backend: Backend::MetalFast }).unwrap();
@@ -1011,7 +1011,7 @@ mod tests {
     #[ignore]
     fn keeps_its_tables_in_step_with_the_state() {
         let _turn = my_turn();
-        let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M".to_owned());
+        let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| crate::weights::checkpoint::DEFAULT_MODEL.to_owned());
         let path = resolve_model(Some(std::path::Path::new(&named))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
         let config = Config::load(&path).unwrap();
@@ -1081,7 +1081,7 @@ mod tests {
     #[ignore]
     fn matches_the_cpu_in_floats() {
         let _turn = my_turn();
-        let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M".to_owned());
+        let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| crate::weights::checkpoint::DEFAULT_MODEL.to_owned());
         let path = resolve_model(Some(std::path::Path::new(&named))).unwrap();
         let weights = Checkpoint::open(&path).unwrap();
         let config = Config::load(&path).unwrap();

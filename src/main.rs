@@ -27,7 +27,7 @@ use cli::inspect::*;
 #[command(about = "Inference engine for Inkling 2 Mini")]
 struct Cli {
     /// A model directory, a `.gguf` file, or a model name, which is downloaded if it is not on this machine.
-    /// Defaults to $RUSTLING_MODEL, then lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M.
+    /// Defaults to $RUSTLING_MODEL, then unsloth/Inkling-2-Mini-GGUF:Q4_K_M.
     #[arg(long, global = true)]
     model: Option<PathBuf>,
     /// How many times to run the looped layers, for a variable-loop checkpoint
@@ -87,7 +87,7 @@ enum Command {
     /// time; this is for fetching ahead.
     Pull {
         /// A model name, such as `thinkingmachines/Inkling-2-Mini` or a GGUF repository and quantisation like
-        /// `lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M`. Defaults to `--model`, then the default model.
+        /// `unsloth/Inkling-2-Mini-GGUF:Q4_K_M`. Defaults to `--model`, then the default model.
         name: Option<String>,
         /// Also fetch the draft model, which `--draft` needs.
         #[arg(long)]

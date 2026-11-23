@@ -39,7 +39,7 @@ pub fn ensure_model(explicit: Option<&Path>, draft: bool) -> Result<PathBuf> {
 }
 
 /// Downloads a model by name: a checkpoint repository such as `thinkingmachines/Inkling-2-Mini`, or a GGUF
-/// repository and the quantisation wanted from it, such as `lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M`. A GGUF
+/// repository and the quantisation wanted from it, such as `unsloth/Inkling-2-Mini-GGUF:Q4_K_M`. A GGUF
 /// file brings along the config and tokenizer of the checkpoint it was converted from.
 pub fn pull(name: &str, draft: bool) -> Result<()> {
     let (repo, quantisation) = match name.split_once(':') {

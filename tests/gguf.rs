@@ -9,7 +9,7 @@ use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options};
 use rustling::prompt::Prompter;
 
-const DEFAULT_GGUF: &str = "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M";
+const DEFAULT_GGUF: &str = rustling::weights::checkpoint::DEFAULT_MODEL;
 
 /// The converted weights are a lossy copy, so the two models cannot agree exactly. A wrong tensor mapping or a
 /// broken kernel would make them unrelated, which is what this guards against: over ordinary prose they must
