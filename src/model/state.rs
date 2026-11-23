@@ -151,12 +151,27 @@ impl VisitState {
 
     /// As [`VisitState::drop_stale`], for `batch` stale tokens or more.
     pub(super) fn drop_stale_from(&mut self, cfg: &TextConfig, local: bool, position: usize, batch: usize) {
-        let window_start = if local { (position + 1).saturating_sub(cfg.sliding_window_size) } else { 0 };
-        let stale = window_start.saturating_sub(self.first).min(self.keys.rows());
+        let stale = self.stale_rows(cfg, local, position);
         if stale >= batch {
             self.keys.drop_front(stale);
             self.values.drop_front(stale);
             self.first += stale;
+        }
+    }
+
+    fn stale_rows(&self, cfg: &TextConfig, local: bool, position: usize) -> usize {
+        let window_start = if local { (position + 1).saturating_sub(cfg.sliding_window_size) } else { 0 };
+        window_start.saturating_sub(self.first).min(self.keys.rows())
+    }
+
+    pub(super) fn clone_trimmed(&self, cfg: &TextConfig, local: bool, position: usize) -> Self {
+        let skip = self.stale_rows(cfg, local, position);
+        Self {
+            first: self.first + skip,
+            keys: self.keys.clone_skipping(skip),
+            values: self.values.clone_skipping(skip),
+            convs: self.convs.clone(),
+            conv_channels: self.conv_channels,
         }
     }
 }

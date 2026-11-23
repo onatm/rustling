@@ -187,17 +187,22 @@ impl Table {
             Store::Plain(_) => None,
         }
     }
+
+    /// Copy the retained suffix of each head directly into a compact table.
+    pub(super) fn clone_skipping(&self, skip: usize) -> Self {
+        let rows = self.rows - skip;
+        let used = rows * self.dim;
+        let mut store = self.store.another(self.heads * used);
+        for head in 0..self.heads {
+            store.floats_mut()[head * used..][..used].copy_from_slice(&self.head(head)[skip * self.dim..]);
+        }
+        Self { heads: self.heads, dim: self.dim, rows, capacity: rows, store }
+    }
 }
 
 impl Clone for Table {
-    /// A copy with room for just the rows in use.
     fn clone(&self) -> Self {
-        let mut store = self.store.another(self.heads * self.rows * self.dim);
-        let used = self.rows * self.dim;
-        for head in 0..self.heads {
-            store.floats_mut()[head * used..][..used].copy_from_slice(self.head(head));
-        }
-        Self { heads: self.heads, dim: self.dim, rows: self.rows, capacity: self.rows, store }
+        self.clone_skipping(0)
     }
 }
 
@@ -242,6 +247,26 @@ mod tests {
         assert!(table.shared_mut().is_some());
         assert_eq!(table.head(0), &[1., 2., 3., 4., 9., 10.]);
         assert_eq!(table.head(1), &[5., 6., 7., 8., 11., 12.]);
+        let mut suffix = table.clone_skipping(1);
+        assert!(suffix.shared_mut().is_some());
+        assert_eq!(suffix.head(0), &[3., 4., 9., 10.]);
+        assert_eq!(suffix.head(1), &[7., 8., 11., 12.]);
+    }
+
+    #[test]
+    fn suffix_copy_serializes_like_dropping_rows_from_a_full_copy() {
+        let mut table = Table::new(3, 2);
+        for t in 0..800 {
+            table.push(&std::array::from_fn::<_, 6, _>(|i| (6 * t + i) as f32));
+        }
+        table.drop_front(17);
+        for skip in [0, 1, 640, table.rows()] {
+            let mut reference = table.clone();
+            reference.drop_front(skip);
+            let copy = table.clone_skipping(skip);
+            assert_eq!(copy.capacity, table.rows() - skip);
+            assert_eq!(postcard::to_allocvec(&copy).unwrap(), postcard::to_allocvec(&reference).unwrap());
+        }
     }
 
     #[test]

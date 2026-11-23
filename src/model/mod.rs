@@ -443,12 +443,14 @@ impl<'a> Model<'a> {
     }
 
     /// A copy of `state` holding only what the tokens to come can read: the next pass would drop the rest
-    /// anyway. After a long prompt the sliding layers still hold the whole of its last chunk, four times their
-    /// window, which is most of what a copy would otherwise take.
+    /// anyway. Copy only the retained rows: after a long prompt a sliding layer's last chunk can be
+    /// several times larger than its window.
     pub fn trimmed(&self, state: &State) -> State {
-        let mut copy = state.clone();
-        self.trim(&mut copy);
-        copy
+        let visits = state.visits.iter()
+            .zip(self.cfg.visits())
+            .map(|(visit, at)| visit.clone_trimmed(&self.cfg, self.cfg.is_local(at.layer), state.position))
+            .collect();
+        State { position: state.position, visits }
     }
 
     /// Drops from `state` what the tokens to come cannot read; see [`Model::trimmed`].
