@@ -86,6 +86,9 @@ const PROPOSED_COST: f32 = 0.55;
 /// The same when tokens and batches both run on the GPU, where a batch shares less between its tokens: a token
 /// of a batch took 0.62 of a lone token's time with a short context and 0.66 at 15,000 tokens.
 const PROPOSED_COST_ON_GPU: f32 = 0.65;
+/// What a batch costs there on top of its tokens, which a round of copying pays: a third of a token's time. It
+/// is what makes two or three copied tokens not worth checking, where a long run is.
+const BATCH_COST_ON_GPU: f32 = 0.3;
 /// Drafting is judged over this many rounds at a time.
 const TRIAL_ROUNDS: usize = 8;
 /// How many tokens the draft rests for after a losing trial. Each further losing trial doubles it, up to the
@@ -391,7 +394,9 @@ impl<'m, 'a> Session<'m, 'a> {
         let hidden = self.model.config().hidden_size;
         // Each reply is judged afresh: what could not be predicted in the last one says little about this. The
         // draft and copying are judged apart, since text that defeats one may suit the other.
-        let proposed_cost = if self.model.decodes_on_gpu() { PROPOSED_COST_ON_GPU } else { PROPOSED_COST };
+        let on_gpu = self.model.decodes_on_gpu();
+        let proposed_cost = if on_gpu { PROPOSED_COST_ON_GPU } else { PROPOSED_COST };
+        let copy_cost = if on_gpu { BATCH_COST_ON_GPU } else { 0.0 };
         let mut pacing = Pacing::new(proposed_cost);
         let mut copying = Pacing::new(proposed_cost);
         // A draft's proposal is made on the CPU, which costs more than a token does once tokens come from the GPU.
@@ -475,7 +480,7 @@ impl<'m, 'a> Session<'m, 'a> {
                     self.drafting.copied_rounds += 1;
                     self.drafting.copied_proposed += proposal.len();
                     self.drafting.copied_accepted += accepted;
-                    copying.round(proposal.len(), accepted, 0.0);
+                    copying.round(proposal.len(), accepted, copy_cost);
                     pacing.passed(kept);
                 }
             }

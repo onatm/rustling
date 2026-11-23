@@ -110,8 +110,9 @@ struct RunArgs {
     /// Level name (none, minimal, low, medium, high, xhigh, max) or a number in 0.0..=0.99.
     #[arg(long)]
     effort: Option<String>,
-    /// The most tokens to generate per reply.
-    #[arg(long, default_value_t = 1024)]
+    /// The most tokens to generate per reply. A coding agent's turn can run to a few thousand: its reasoning,
+    /// then a whole file in a tool call.
+    #[arg(long, default_value_t = 4096)]
     max_tokens: usize,
     /// The context window: the most tokens a prompt and its reply may take together. Longer prompts are refused
     /// and replies stop when it is full. Unlimited by default (the model was trained with up to 1,048,576).

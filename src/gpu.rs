@@ -603,13 +603,12 @@ impl Gpu {
         let tokens = job.x.len() / hidden;
         ensure!(job.x.len() == tokens * hidden && job.routes.len() == tokens * chosen, "bad expert job");
         ensure!(hidden % 256 == 0 || hidden % 32 == 0, "bad expert width");
-        let run = EXPERT_RUN;
-
         // Rows: for each expert in use, its tokens in runs of `run`, the last padded.
         let mut tokens_of: Vec<Vec<(u32, u32)>> = vec![Vec::new(); experts];
         for (at, &(expert, _)) in job.routes.iter().enumerate() {
             tokens_of[expert as usize].push(((at / chosen) as u32, at as u32));
         }
+        let run = EXPERT_RUN;
         let order: Vec<u32> = (0..experts as u32).filter(|&e| !tokens_of[e as usize].is_empty()).collect();
         // Products as (position in `order`, first row).
         let mut products: Vec<(usize, usize)> = Vec::new();

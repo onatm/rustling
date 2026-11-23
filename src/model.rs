@@ -62,6 +62,13 @@ const FAST_PROMPT_CHUNK: usize = 4096;
 #[cfg(target_os = "macos")]
 const FAST_LOCAL_STRETCH: usize = 1024;
 
+/// From this many tokens a GGUF layer's experts run as one submission on the GPU, which unpacks every expert's
+/// weights: about 6 s a pass on an M1 Max however few tokens there are. A shorter batch does better with the GPU
+/// unpacking only the busiest experts and the CPU doing the rest: 282 tokens took 4.1 s that way against 6.1 s,
+/// and 1,202 tokens 12.5 s against 13.1 s.
+#[cfg(target_os = "macos")]
+const WHOLE_EXPERTS_MIN_TOKENS: usize = 1536;
+
 /// A stretch of fast attention goes to the GPU when its rows times its keys come to at least this.
 #[cfg(target_os = "macos")]
 const GPU_ATTENTION_MIN_WEIGHTS: usize = 1 << 20;
@@ -619,11 +626,10 @@ impl<'a> Model<'a> {
         false
     }
 
-    /// A token or a short batch on the GPU, when the model is set up for it: a GGUF file on the fast backend.
-    /// Nothing otherwise, or when the GPU fails, and the caller takes the CPU path with the state untouched.
+    /// The GPU decoder, built at first use; nothing when the model is not set up for it or building it failed.
     #[cfg(target_os = "macos")]
-    fn decode(&self, ids: &[u32], state: &mut State, taps: &[usize]) -> Result<Option<Forward>> {
-        let Some(gpu) = self.gpu.as_ref().filter(|_| self.decodes_on_gpu() && !float_reference()) else { return Ok(None) };
+    fn decoder(&self) -> Option<&std::sync::Mutex<decode::Decoder>> {
+        let gpu = self.gpu.as_ref().filter(|_| self.decodes_on_gpu())?;
         let decoder = self.decoder.get_or_init(|| match decode::Decoder::new(self, gpu) {
             Ok(decoder) => Some(std::sync::Mutex::new(decoder)),
             Err(error) => {
@@ -631,7 +637,15 @@ impl<'a> Model<'a> {
                 None
             }
         });
-        let Some(decoder) = decoder else { return Ok(None) };
+        decoder.as_ref()
+    }
+
+    /// A token or a short batch on the GPU, when the model is set up for it: a GGUF file on the fast backend.
+    /// Nothing otherwise, or when the GPU fails, and the caller takes the CPU path with the state untouched.
+    #[cfg(target_os = "macos")]
+    fn decode(&self, ids: &[u32], state: &mut State, taps: &[usize]) -> Result<Option<Forward>> {
+        let Some(gpu) = self.gpu.as_ref().filter(|_| self.decodes_on_gpu() && !float_reference()) else { return Ok(None) };
+        let Some(decoder) = self.decoder() else { return Ok(None) };
         let mut embedded = Vec::with_capacity(ids.len() * self.cfg.hidden_size);
         for &id in ids {
             embedded.extend(self.embed(id)?);
@@ -1322,11 +1336,13 @@ impl<'a> Model<'a> {
     fn experts_on_gpu(&self, layer: &Layer, x: &Seq, routes: &[(u32, f32)]) -> Option<Seq> {
         let cfg = &self.cfg;
         let experts = &layer.experts;
-        let gpu = self.gpu.as_ref().filter(|gpu| gpu.fast() && x.len() / cfg.hidden_size >= FAST_MIN_TOKENS)?;
+        let gpu = self.gpu.as_ref().filter(|gpu| gpu.fast() && x.len() / cfg.hidden_size >= WHOLE_EXPERTS_MIN_TOKENS)?;
         let (gate_up, down) = (experts.gate_up.ggml()?, experts.down.ggml()?);
         if experts.interleaved || float_reference() {
             return None;
         }
+        // A batch this short does not repay unpacking every expert's weights; the decoder's kernels multiply
+        // straight from the stored blocks.
         let job = WholeExperts {
             gate_up: (experts.gate_up.raw_parts().0, gate_up),
             down: (experts.down.raw_parts().0, down),
