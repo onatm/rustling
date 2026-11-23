@@ -33,6 +33,11 @@ pub(crate) struct RunArgs {
     /// Keep generating even when the output is repeating itself.
     #[arg(long)]
     pub(crate) allow_loops: bool,
+    /// Stop the model reasoning before it answers, by never letting it open a reasoning block. The model's own
+    /// lowest effort, `none`, only shortens its reasoning. Answers come sooner and are less considered; a model
+    /// that cannot reason is also less inclined to call tools, so this is not for coding agents.
+    #[arg(long)]
+    pub(crate) no_reasoning: bool,
     /// Use the draft model beside the checkpoint (`mtp.safetensors`) to propose several tokens at a time.
     /// The output is distributed as without it.
     #[arg(long)]
@@ -60,6 +65,15 @@ impl RunArgs {
         anyhow::ensure!((0.0..=1.0).contains(&self.top_p), "top-p must be between 0 and 1");
         let config = SamplerConfig { temperature: self.temperature, top_k: self.top_k, top_p: self.top_p };
         Ok(Sampler::new(config, self.seed))
+    }
+
+    /// The sampler for replies to prompts rendered by `prompter`: with `--no-reasoning`, one that cannot reason.
+    pub(crate) fn sampler_for(&self, prompter: &Prompter) -> Result<Sampler> {
+        let sampler = self.sampler()?;
+        Ok(match self.no_reasoning {
+            true => sampler.without(prompter.reasoning_token()?),
+            false => sampler,
+        })
     }
 
     pub(crate) fn model(&self) -> Options {
@@ -93,7 +107,9 @@ impl RunArgs {
 
     /// The reasoning effort as the chat template takes it: a number or a level name.
     pub(crate) fn effort(&self) -> Option<serde_json::Value> {
-        self.effort.as_deref().map(|e| match e.parse::<f64>() {
+        // Without reasoning, the prompt asks for none unless it was told otherwise.
+        let effort = self.effort.as_deref().or(self.no_reasoning.then_some("none"));
+        effort.map(|e| match e.parse::<f64>() {
             Ok(number) => serde_json::json!(number),
             Err(_) => serde_json::json!(e),
         })

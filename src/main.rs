@@ -212,6 +212,7 @@ fn main() -> Result<()> {
                 stop_on_loop: !run.allow_loops,
                 draft_confidence: run.draft.then_some(run.draft_confidence),
                 copying: !run.no_copying,
+                no_reasoning: run.no_reasoning,
                 passes: cli.passes,
                 context: run.window(),
                 cache_bytes: (cache_gb * (1u64 << 30) as f64) as usize,

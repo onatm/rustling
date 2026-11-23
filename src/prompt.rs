@@ -51,6 +51,15 @@ impl Prompter {
         Ok(rendered)
     }
 
+    /// The token that opens a reasoning block. Kept out of sampling, the model cannot reason and goes straight to
+    /// its answer; the model's own lowest effort only shortens the reasoning.
+    pub fn reasoning_token(&self) -> Result<u32> {
+        match self.encode("<|content_thinking|>")?[..] {
+            [token] => Ok(token),
+            _ => Err(anyhow!("the tokenizer does not have a single token for <|content_thinking|>")),
+        }
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self.tokenizer.encode(text, false).map_err(|e| anyhow!("tokenizing: {e}"))?;
         Ok(encoding.get_ids().to_vec())

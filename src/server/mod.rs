@@ -78,6 +78,8 @@ pub struct ServerOptions {
     pub draft_confidence: Option<f32>,
     /// Guess at coming tokens by copying from the context.
     pub copying: bool,
+    /// Never let a reply open a reasoning block, whatever effort the request asks for.
+    pub no_reasoning: bool,
     /// Overrides how many times the looped layers run, for a variable-loop checkpoint.
     pub passes: Option<usize>,
     /// The context window in tokens, prompt and reply together.

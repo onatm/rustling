@@ -56,6 +56,17 @@ rustling chat --context 32768 --max-tokens 8192 # a larger window and longer rep
 `--effort` is how much the model reasons before it replies: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`
 or `max`, or a number from 0 to 0.99. In a chat, `/reset` starts over and `/exit` quits.
 
+Even `none` leaves a little reasoning: the model was built that way, and its makers say so. To have none at all:
+
+```sh
+rustling chat --no-reasoning                    # answers start at once
+rustling serve --no-reasoning                   # for every request
+```
+
+This keeps the model from ever opening a reasoning block. Answers come sooner and are less considered, and a
+model that cannot reason is less inclined to call tools: asked for the weather with a weather tool on hand, it
+offered to look instead of looking. Leave it off for coding agents.
+
 ### One reply
 
 ```sh
@@ -194,6 +205,7 @@ Everything has a default; these are the ones worth knowing. `rustling <command> 
 | `--backend` | `auto` | `auto` uses the GPU; `cpu` does not. |
 | `--context` | by chip, see below | The most tokens a prompt and its reply may take together. |
 | `--max-tokens` | 4096 | The longest reply. |
+| `--no-reasoning` | reasoning on | Never let the model reason before answering. `--effort none` only shortens it. |
 | `--draft` | off | Use the model's draft model to propose several tokens at a time. Only helps when generating on the CPU; with the GPU it is not used. |
 | `--no-copying` | copying on | Stop proposing tokens copied from the conversation. |
 | `--cache-gb`, `--cache-dir` | 4, none | How much memory processed prompts may take, and where to keep them between runs (`serve`). |

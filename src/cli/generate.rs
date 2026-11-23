@@ -74,7 +74,7 @@ pub(crate) fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, t
     let started = Instant::now();
     let mut generated: Vec<u32> = Vec::new();
     let mut printed = 0;
-    let (_, stop) = session.generate(&mut run.sampler()?, run.limits(), config.eos_token_id, |token, logits| {
+    let (_, stop) = session.generate(&mut run.sampler_for(&prompter)?, run.limits(), config.eos_token_id, |token, logits| {
         generated.push(token);
         if top {
             let mut order: Vec<usize> = (0..logits.len()).collect();

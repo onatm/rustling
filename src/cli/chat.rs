@@ -10,7 +10,7 @@ pub(crate) fn chat(model_dir: &std::path::Path, system: Option<&str>, run: &RunA
     let checkpoint = Checkpoint::open(model_dir)?;
     let prompter = Prompter::load(model_dir)?;
     let model = Model::load(&config, &checkpoint, run.model())?;
-    let mut sampler = run.sampler()?;
+    let mut sampler = run.sampler_for(&prompter)?;
     let draft_weights = run.draft_weights(model_dir)?;
     let draft = draft_weights
         .as_ref()

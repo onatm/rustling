@@ -24,6 +24,8 @@ impl Default for SamplerConfig {
 pub struct Sampler {
     config: SamplerConfig,
     rng: StdRng,
+    /// A token that is never chosen, whatever its logit.
+    banned: Option<u32>,
 }
 
 impl Sampler {
@@ -33,7 +35,14 @@ impl Sampler {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => rand::make_rng(),
         };
-        Self { config, rng }
+        Self { config, rng, banned: None }
+    }
+
+    /// The same sampler, never choosing `token`. This is how reasoning is switched off: the token that opens a
+    /// reasoning block is taken out, and the model goes on to its next choice, an answer or a tool call.
+    pub fn without(mut self, token: u32) -> Self {
+        self.banned = Some(token);
+        self
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
@@ -84,6 +93,14 @@ impl Sampler {
     /// The tokens sampling can choose from, with unnormalised probabilities, after temperature, top-k and top-p.
     fn candidates(&self, logits: &[f32]) -> Candidates {
         let SamplerConfig { temperature, top_k, top_p } = self.config;
+        let without_banned;
+        let logits = match self.banned.filter(|&token| (token as usize) < logits.len()) {
+            Some(token) => {
+                without_banned = { let mut copy = logits.to_vec(); copy[token as usize] = f32::NEG_INFINITY; copy };
+                &without_banned[..]
+            }
+            None => logits,
+        };
         let descending = |a: &u32, b: &u32| logits[*b as usize].total_cmp(&logits[*a as usize]);
         if temperature <= 0.0 || top_k == 1 {
             return Candidates::Greedy((0..logits.len() as u32).min_by(descending).expect("logits are not empty"));
@@ -152,6 +169,16 @@ mod tests {
     /// Logits whose softmax is exactly `probabilities`.
     fn logits_for(probabilities: &[f32]) -> Vec<f32> {
         probabilities.iter().map(|p| p.ln()).collect()
+    }
+
+    #[test]
+    fn a_banned_token_is_never_chosen() {
+        let logits = [0.1, 2.0, -1.0, 1.9];
+        let mut greedy = Sampler::new(SamplerConfig { temperature: 0.0, ..Default::default() }, Some(1)).without(1);
+        assert_eq!(greedy.sample(&logits), 3);
+        assert_eq!(greedy.verify(&logits, 1), Verdict::Replaced(3));
+        let mut sampled = Sampler::new(SamplerConfig::default(), Some(1)).without(1);
+        assert!((0..2_000).all(|_| sampled.sample(&logits) != 1));
     }
 
     #[test]

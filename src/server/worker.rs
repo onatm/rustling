@@ -247,12 +247,14 @@ pub(crate) fn handle(
     // Template errors (an unknown role, a bad effort level) are the client's to fix.
     // The header, system messages and tool declarations, is what other conversations with the same setup start
     // with. It renders on its own to a prefix of the whole prompt.
+    // Without reasoning, the prompt asks for none unless the request says otherwise.
+    let effort = request.reasoning_effort.clone().or_else(|| options.no_reasoning.then(|| json!("none")));
     let leading = messages.iter().take_while(|message| message["role"] == "system").count();
     let header = prompter
-        .render(&Value::Array(messages[..leading].to_vec()), request.tools.as_ref(), request.reasoning_effort.as_ref())
+        .render(&Value::Array(messages[..leading].to_vec()), request.tools.as_ref(), effort.as_ref())
         .ok();
     let rendered = prompter
-        .render(&Value::Array(messages), request.tools.as_ref(), request.reasoning_effort.as_ref())
+        .render(&Value::Array(messages), request.tools.as_ref(), effort.as_ref())
         .map_err(|e| Failure::bad_request(format!("{e:#}")))?;
     let ids = prompter.encode(&rendered)?;
     let header = match header {
@@ -306,6 +308,9 @@ pub(crate) fn handle(
 
     // Streamed text is the growth of the reply's reasoning and content; tool calls go out whole once closed.
     let mut sampler = Sampler::new(sampling, request.seed);
+    if options.no_reasoning {
+        sampler = sampler.without(prompter.reasoning_token()?);
+    }
     let mut generated: Vec<u32> = Vec::new();
     let (mut reasoning_sent, mut content_sent, mut calls_sent) = (0, 0, 0);
     let mut hit_stop = false;
