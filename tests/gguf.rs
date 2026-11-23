@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use rustling::weights::checkpoint::{Checkpoint, resolve_model};
+use rustling::weights::checkpoint::{Checkpoint, resolve_checkpoint, resolve_model};
 use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options};
 use rustling::prompt::Prompter;
@@ -17,7 +17,7 @@ const DEFAULT_GGUF: &str = "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M";
 #[test]
 fn a_gguf_conversion_predicts_what_the_checkpoint_does() {
     let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| DEFAULT_GGUF.to_owned());
-    let (Ok(gguf_path), Ok(model_dir)) = (resolve_model(Some(Path::new(&named))), resolve_model(None)) else {
+    let (Ok(gguf_path), Ok(model_dir)) = (resolve_model(Some(Path::new(&named))), resolve_checkpoint()) else {
         eprintln!("skipping: needs the checkpoint and {named}");
         return;
     };

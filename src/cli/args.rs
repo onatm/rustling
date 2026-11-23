@@ -47,8 +47,9 @@ pub(crate) struct RunArgs {
     /// Expert arithmetic: `quantised` as the model was trained, or `float` as transformers computes it.
     #[arg(long, value_enum, default_value_t = ActivationsArg::Quantised)]
     pub(crate) activations: ActivationsArg,
-    /// Where the heavy matrix products run: `auto` uses the GPU for large batches when there is one, with
-    /// results identical to the CPU's. `metal-fast` is quicker on long prompts but not bit-identical.
+    /// Where the model runs. `auto` uses the GPU when there is one: for a GGUF file that means prompts and
+    /// generation both; for a checkpoint, large batches with results identical to the CPU's. `metal-fast` is the
+    /// checkpoint's quicker path for long prompts, not bit-identical. `cpu` uses no GPU.
     #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
     pub(crate) backend: BackendArg,
 }
@@ -73,7 +74,7 @@ impl RunArgs {
                 let path = rustling::weights::checkpoint::companion_dir(model_dir)?.join("mtp.safetensors");
                 anyhow::ensure!(
                     path.exists(),
-                    "{} is missing; fetch it with `hf download thinkingmachines/Inkling-2-Mini mtp.safetensors`",
+                    "{} is missing; fetch it with `rustling pull --draft`",
                     path.display()
                 );
                 Ok(Some(Checkpoint::open_file(&path)?))
@@ -154,7 +155,7 @@ pub(crate) fn load_config(model_dir: &std::path::Path) -> Result<Config> {
 /// Whether a draft model can speed this model up; says why not when it cannot.
 pub(crate) fn drafting_pays(model: &Model) -> bool {
     if model.decodes_on_gpu() {
-        eprintln!("--draft is not used: tokens are generated on the GPU, where one costs less than checking a proposal");
+        tracing::warn!("--draft is not used: tokens are generated on the GPU, where one costs less than checking a proposal");
     }
     !model.decodes_on_gpu()
 }

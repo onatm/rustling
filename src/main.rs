@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::Result;
 use safetensors::SafeTensors;
 use clap::{Parser, Subcommand};
-use rustling::weights::checkpoint::{Checkpoint, ExpertFormat, ExpertMatrix, resolve_model};
+use rustling::weights::checkpoint::{Checkpoint, ExpertFormat, ExpertMatrix, DEFAULT_MODEL};
 use rustling::config::Config;
 use rustling::generate::draft::Draft;
 use rustling::model::{Activations, Backend, Model, Options};
@@ -26,8 +26,8 @@ use cli::inspect::*;
 #[derive(Parser)]
 #[command(about = "Inference engine for Inkling 2 Mini")]
 struct Cli {
-    /// Model directory, or a model name to find in the Hugging Face cache. Defaults to $RUSTLING_MODEL, then
-    /// thinkingmachines/Inkling-2-Mini.
+    /// A model directory, a `.gguf` file, or a model name, which is downloaded if it is not on this machine.
+    /// Defaults to $RUSTLING_MODEL, then lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M.
     #[arg(long, global = true)]
     model: Option<PathBuf>,
     /// How many times to run the looped layers, for a variable-loop checkpoint
@@ -38,12 +38,61 @@ struct Cli {
     /// an efficiency core holds up the rest, and to every core elsewhere.
     #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..))]
     threads: Option<u64>,
+    /// How much to report on stderr: `info` gives loading, prompt and reply speeds; `debug` adds progress through
+    /// long prompts and the rendered prompt; `warn` only problems; `off` nothing. Also `$RUSTLING_LOG`.
+    #[arg(long, global = true, value_enum, env = "RUSTLING_LOG", default_value_t = LogLevel::Info)]
+    log_level: LogLevel,
     #[command(subcommand)]
     command: Command,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+/// Sends the log to stderr at the level asked for. A server's lines carry the time; a command's do not.
+fn start_logging(level: LogLevel, timed: bool) {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::LevelFilter;
+    let level = match level {
+        LogLevel::Off => LevelFilter::OFF,
+        LogLevel::Error => LevelFilter::ERROR,
+        LogLevel::Warn => LevelFilter::WARN,
+        LogLevel::Info => LevelFilter::INFO,
+        LogLevel::Debug => LevelFilter::DEBUG,
+        LogLevel::Trace => LevelFilter::TRACE,
+    };
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    // The libraries underneath, the Hub client above all, log a good deal of their own: only their problems.
+    let ours = tracing_subscriber::filter::Targets::new().with_default(LevelFilter::WARN.min(level)).with_target("rustling", level);
+    // Colour only where someone is looking: a log sent to a file should hold plain text.
+    let coloured = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let log = tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_target(false).with_ansi(coloured);
+    match timed {
+        true => tracing_subscriber::registry().with(log.with_filter(ours)).init(),
+        false => tracing_subscriber::registry().with(log.without_time().with_filter(ours)).init(),
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
+    /// Download a model to the Hugging Face cache. The commands that run a model do this themselves the first
+    /// time; this is for fetching ahead.
+    Pull {
+        /// A model name, such as `thinkingmachines/Inkling-2-Mini` or a GGUF repository and quantisation like
+        /// `lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M`. Defaults to `--model`, then the default model.
+        name: Option<String>,
+        /// Also fetch the draft model, which `--draft` needs.
+        #[arg(long)]
+        draft: bool,
+    },
     /// Summarise the config, the layer visit order and the checkpoint's tensors.
     Inspect,
     /// Decode one expert and print statistics of its weights.
@@ -115,13 +164,36 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // The Hub client reports download statistics to Hugging Face unless told not to. Nothing else here phones
+    // home, so neither does that, unless the user has asked for it by name.
+    if std::env::var_os("HF_XET_TELEMETRY_ENABLED").is_none() {
+        // SAFETY: nothing else is running yet to read the environment at the same time.
+        unsafe { std::env::set_var("HF_HUB_DISABLE_TELEMETRY", "1") };
+    }
     let cli = Cli::parse();
-    let model_dir = resolve_model(cli.model.as_deref())?;
+    start_logging(cli.log_level, matches!(cli.command, Command::Serve { .. }));
+    let drafting = match &cli.command {
+        Command::Generate { run, .. } | Command::Chat { run, .. } | Command::Serve { run, .. } => run.draft,
+        _ => false,
+    };
+    let model_dir = match &cli.command {
+        Command::Pull { name, draft } => {
+            let named = name.clone().or_else(|| cli.model.as_ref().map(|model| model.to_string_lossy().into_owned()));
+            let name = named.or_else(|| std::env::var("RUSTLING_MODEL").ok()).unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+            return rustling::weights::hub::pull(&name, *draft);
+        }
+        // What these look at is the published checkpoint's own formats.
+        Command::Expert { .. } | Command::Probe { .. } | Command::Compare { .. } if cli.model.is_none() => {
+            rustling::weights::checkpoint::resolve_checkpoint()?
+        }
+        _ => rustling::weights::hub::ensure_model(cli.model.as_deref(), drafting)?,
+    };
     PASSES.set(cli.passes).expect("set once");
     if let Some(threads) = cli.threads.map(|threads| threads as usize).or_else(performance_cores) {
         rayon::ThreadPoolBuilder::new().num_threads(threads).build_global()?;
     }
     match cli.command {
+        Command::Pull { .. } => unreachable!("handled above"),
         Command::Inspect => inspect(&model_dir),
         Command::Expert { layer, expert } => expert_stats(&model_dir, layer, expert),
         Command::Prompt { text, effort } => prompt(&model_dir, &text, effort.as_deref()),

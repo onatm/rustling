@@ -771,8 +771,8 @@ impl<'a> Model<'a> {
 /// Where the heavy matrix products run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    /// The GPU for large batches when there is one, otherwise the CPU. Either way the results are the same,
-    /// bit for bit.
+    /// The GPU when there is one, otherwise the CPU. For a checkpoint that is the exact kernels on large
+    /// batches, with the CPU's results bit for bit; for a GGUF file, which has no exact kernels, the fast path.
     #[default]
     Auto,
     Cpu,
@@ -792,11 +792,12 @@ pub struct Options {
 #[cfg(target_os = "macos")]
 fn open_gpu(checkpoint: &Checkpoint, backend: Backend) -> Result<Option<Gpu>> {
     // The exact GPU kernels read the checkpoint's own formats, so a GGUF file has only the fast path.
-    if checkpoint.is_gguf() && backend != Backend::MetalFast {
+    if checkpoint.is_gguf() && !matches!(backend, Backend::MetalFast | Backend::Auto) {
         ensure!(backend != Backend::Metal, "GGUF weights have no exact Metal kernels; use `metal-fast` or the CPU");
         return Ok(None);
     }
     match backend {
+        Backend::Auto if checkpoint.is_gguf() => Ok(Gpu::new(&checkpoint.maps(), true).ok()),
         Backend::Cpu => Ok(None),
         Backend::Auto => Ok(Gpu::new(&checkpoint.maps(), false).ok()),
         Backend::Metal => Gpu::new(&checkpoint.maps(), false).map(Some).context("setting up Metal"),
@@ -817,7 +818,7 @@ fn open_gpu(_checkpoint: &Checkpoint, backend: Backend) -> Result<Option<Gpu>> {
 #[cfg(target_os = "macos")]
 fn gpu_failed(error: &anyhow::Error) {
     static REPORTED: std::sync::Once = std::sync::Once::new();
-    REPORTED.call_once(|| eprintln!("Metal backend failed, continuing on the CPU: {error:#}"));
+    REPORTED.call_once(|| tracing::warn!("Metal backend failed, continuing on the CPU: {error:#}"));
 }
 
 /// Which arithmetic the expert layers use for their inputs.

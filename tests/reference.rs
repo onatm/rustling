@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use rustling::weights::checkpoint::{Checkpoint, resolve_model};
+use rustling::weights::checkpoint::{Checkpoint, resolve_checkpoint};
 use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options};
 use safetensors::SafeTensors;
@@ -22,7 +22,7 @@ fn relative(ours: &[f32], reference: &[f32]) -> f64 {
 #[test]
 fn float_path_tracks_transformers() {
     let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/hidden_default.safetensors");
-    let (Ok(bytes), Ok(model_dir)) = (std::fs::read(&golden), resolve_model(None)) else {
+    let (Ok(bytes), Ok(model_dir)) = (std::fs::read(&golden), resolve_checkpoint()) else {
         eprintln!("skipping: needs the model and {}", golden.display());
         return;
     };

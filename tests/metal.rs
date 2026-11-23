@@ -2,14 +2,14 @@
 //! on this machine or there is no GPU. Run with `--release`.
 #![cfg(target_os = "macos")]
 
-use rustling::weights::checkpoint::{Checkpoint, resolve_model};
+use rustling::weights::checkpoint::{Checkpoint, resolve_checkpoint};
 use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options};
 use rustling::prompt::Prompter;
 
 #[test]
 fn metal_matches_cpu_exactly() {
-    let Ok(model_dir) = resolve_model(None) else {
+    let Ok(model_dir) = resolve_checkpoint() else {
         eprintln!("skipping: model not found");
         return;
     };
@@ -52,7 +52,7 @@ fn metal_matches_cpu_exactly() {
 ///   path being broken, which would send agreement towards zero.
 #[test]
 fn the_fast_path_tracks_the_exact_one() {
-    let Ok(model_dir) = resolve_model(None) else {
+    let Ok(model_dir) = resolve_checkpoint() else {
         eprintln!("skipping: model not found");
         return;
     };

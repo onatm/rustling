@@ -35,7 +35,7 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
         _ => None,
     };
     if draft.is_some() && model.decodes_on_gpu() {
-        eprintln!("--draft is not used: tokens are generated on the GPU, where one costs less than checking a proposal");
+        tracing::warn!("--draft is not used: tokens are generated on the GPU, where one costs less than checking a proposal");
     }
     let draft = draft.filter(|_| !model.decodes_on_gpu());
     // Bring the weights into memory and run a token through the model, so the first request is not the slow one.
@@ -50,12 +50,12 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
         (false, false) => "CPU",
     };
     let drafting = if draft.is_some() { ", with the draft model" } else { "" };
-    eprintln!(
+    tracing::info!(
         "model loaded ({backend}{drafting}); read {:.1} GB and warmed up in {:.1}s",
         bytes as f64 / 1e9,
         started.elapsed().as_secs_f32()
     );
-    eprintln!("context window: {} tokens", options.context);
+    tracing::info!("context window: {} tokens", options.context);
     let _ = ready.send(Ok(()));
 
     let mut session = match &draft {
@@ -78,14 +78,14 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
         Some(dir) => match PromptCache::load(dir, &fingerprint, options.cache_bytes) {
             Ok(cache) => cache,
             Err(error) => {
-                eprintln!("starting with an empty prompt cache: {error:#}");
+                tracing::warn!("starting with an empty prompt cache: {error:#}");
                 PromptCache::new(options.cache_bytes)
             }
         },
         None => PromptCache::new(options.cache_bytes),
     };
     if !cache.is_empty() {
-        eprintln!("prompt cache: {} processed prompts, {:.1} GiB", cache.len(), cache.bytes() as f64 / GIB);
+        tracing::info!("prompt cache: {} processed prompts, {:.1} GiB", cache.len(), cache.bytes() as f64 / GIB);
     }
 
     let mut memory = Memory::default();
@@ -96,7 +96,7 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
         let handled =
             handle(number, &job, &options, &config, &prompter, &mut session, &mut cache, &mut memory, &mut calls);
         if let Err(failure) = handled {
-            eprintln!("[{number}] failed ({}): {}", failure.status.as_u16(), failure.message);
+            tracing::warn!("[{number}] failed ({}): {}", failure.status.as_u16(), failure.message);
             // The receiver may already be gone, when the failure is the client hanging up.
             let _ = events.blocking_send(Event::Failed { status: failure.status, message: failure.message });
         }
@@ -107,8 +107,8 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
         cache.keep(&session);
         let (count, bytes) = (cache.len(), cache.bytes());
         match cache.save(dir, &fingerprint) {
-            Ok(()) => eprintln!("saved {count} processed prompts ({:.1} GiB) to {}", bytes as f64 / GIB, dir.display()),
-            Err(error) => eprintln!("could not save the prompt cache: {error:#}"),
+            Ok(()) => tracing::info!("saved {count} processed prompts ({:.1} GiB) to {}", bytes as f64 / GIB, dir.display()),
+            Err(error) => tracing::warn!("could not save the prompt cache: {error:#}"),
         }
     }
 }
@@ -267,18 +267,14 @@ pub(crate) fn handle(
         )));
     }
     send(Event::Started)?;
-    eprintln!(
-        "[{number}] {} messages, {} tools, {} prompt tokens",
-        request.messages.len(),
-        request.tools.as_ref().and_then(Value::as_array).map_or(0, Vec::len),
-        ids.len()
-    );
+    let tools = request.tools.as_ref().and_then(Value::as_array).map_or(0, Vec::len);
+    tracing::info!("[{number}] {} messages, {tools} tools, {} prompt tokens", request.messages.len(), ids.len());
     let started = std::time::Instant::now();
     let mut reported = started;
     let mut watch = |processed: usize| {
         if reported.elapsed().as_secs() >= 5 {
             reported = std::time::Instant::now();
-            eprintln!("[{number}] prompt: {processed} of {} tokens after {:.0}s", ids.len(), started.elapsed().as_secs_f32());
+            tracing::debug!("[{number}] prompt: {processed} of {} tokens after {:.0}s", ids.len(), started.elapsed().as_secs_f32());
         }
         // A client that has gone away is not worth finishing the prompt for; what was processed stays.
         !job.events.is_closed()
@@ -291,7 +287,7 @@ pub(crate) fn handle(
     })?;
     let prompt_seconds = started.elapsed().as_secs_f32();
     let processed = ids.len() - cached_tokens;
-    eprintln!(
+    tracing::info!(
         "[{number}] prompt: {cached_tokens} tokens reused, {processed} processed in {prompt_seconds:.1}s ({:.0} tokens/s)",
         rate(processed, prompt_seconds)
     );
@@ -386,7 +382,7 @@ pub(crate) fn handle(
         ),
         false => String::new(),
     };
-    eprintln!(
+    tracing::info!(
         "[{number}] reply: {} tokens in {seconds:.1}s ({:.1} tokens/s), {finish_reason}{drafting}{copied}",
         generated.len(),
         rate(generated.len(), seconds)

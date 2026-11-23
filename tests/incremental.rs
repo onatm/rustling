@@ -1,14 +1,14 @@
 //! Incremental decoding must give the same states as one pass over the whole sequence, however the tokens are
 //! split across calls. Skipped when the model is not on this machine. Run with `--release`: debug builds are slow.
 
-use rustling::weights::checkpoint::{Checkpoint, resolve_model};
+use rustling::weights::checkpoint::{Checkpoint, resolve_checkpoint};
 use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options};
 use rustling::prompt::Prompter;
 
 #[test]
 fn stepping_matches_one_pass() {
-    let Ok(model_dir) = resolve_model(None) else {
+    let Ok(model_dir) = resolve_checkpoint() else {
         eprintln!("skipping: model not found");
         return;
     };

@@ -1,7 +1,7 @@
 //! The draft model, and copying from the context, must only change speed. Needs the model, and `mtp.safetensors` for the drafting test; skipped
 //! otherwise. Run with `--release`.
 
-use rustling::weights::checkpoint::{Checkpoint, resolve_model};
+use rustling::weights::checkpoint::{Checkpoint, resolve_checkpoint};
 use rustling::config::Config;
 use rustling::generate::draft::Draft;
 use rustling::model::{Activations, Backend, Model, Options};
@@ -17,7 +17,7 @@ struct Loaded {
 }
 
 fn load() -> Option<Loaded> {
-    let model_dir = resolve_model(None).ok()?;
+    let model_dir = resolve_checkpoint().ok()?;
     let checkpoint = Checkpoint::open(&model_dir).ok()?;
     Some(Loaded {
         config: Config::load(&model_dir).ok()?,

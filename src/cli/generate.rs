@@ -28,13 +28,17 @@ pub(crate) fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, t
     let prompter = Prompter::load(model_dir)?;
     let started = Instant::now();
     let model = Model::load(&config, &checkpoint, run.model())?;
-    let backend = if model.uses_gpu() { "Metal for large batches" } else { "CPU" };
-    eprintln!("loaded in {:.1}s ({backend})", started.elapsed().as_secs_f32());
+    let backend = match (model.uses_gpu(), model.decodes_on_gpu()) {
+        (_, true) => "Metal for long prompts and for generating",
+        (true, false) => "Metal for large batches",
+        (false, false) => "CPU",
+    };
+    tracing::info!("loaded in {:.1}s ({backend})", started.elapsed().as_secs_f32());
 
     let messages = serde_json::json!([{ "role": "user", "content": text }]);
     let rendered = prompter.render(&messages, None, run.effort().as_ref())?;
     let prompt_ids = prompter.encode(&rendered)?;
-    eprintln!("{rendered}");
+    tracing::debug!("{rendered}");
 
     // The prompt goes through in one call; after that each new token is a call of its own.
     let draft_weights = run.draft_weights(model_dir)?;
@@ -54,15 +58,15 @@ pub(crate) fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, t
         print_stage_times("prompt");
         let redone = rustling::model::GPU_EXPERTS_REDONE.load(std::sync::atomic::Ordering::Relaxed);
         if redone > 0 {
-            eprintln!("{redone} experts were recomputed on the CPU after the GPU returned NaN");
+            tracing::info!("{redone} experts were recomputed on the CPU after the GPU returned NaN");
         }
         let redone = rustling::model::GPU_ATTENTION_REDONE.load(std::sync::atomic::Ordering::Relaxed);
         if redone > 0 {
-            eprintln!("{redone} stretches of attention were recomputed on the CPU after the GPU returned NaN");
+            tracing::info!("{redone} stretches of attention were recomputed on the CPU after the GPU returned NaN");
         }
         let redone = rustling::model::GPU_PRODUCTS_REDONE.load(std::sync::atomic::Ordering::Relaxed);
         if redone > 0 {
-            eprintln!("{redone} batches of matrix products were recomputed on the CPU after the GPU returned NaN");
+            tracing::info!("{redone} batches of matrix products were recomputed on the CPU after the GPU returned NaN");
         }
     }
 
@@ -96,17 +100,17 @@ pub(crate) fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, t
         print_stage_times("generation");
     }
     if let Some(note) = stop_note(stop, run.limits()) {
-        eprintln!("{note}");
+        tracing::info!("{note}");
     }
     let drafting = session.drafting();
     if drafting.copied_proposed > 0 {
-        eprintln!(
+        tracing::info!(
             "copied: {} of {} proposed tokens accepted in {} rounds",
             drafting.copied_accepted, drafting.copied_proposed, drafting.copied_rounds
         );
     }
     if draft.is_some() {
-        eprintln!(
+        tracing::info!(
             "draft: {} of {} proposed tokens accepted over {} rounds ({:.1} tokens per round); rested for {} tokens",
             drafting.accepted,
             drafting.proposed,
@@ -115,7 +119,7 @@ pub(crate) fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, t
             drafting.rested
         );
     }
-    eprintln!(
+    tracing::info!(
         "prompt: {} tokens in {prompt_seconds:.1}s; generated {} tokens in {seconds:.1}s ({:.2} tokens/s)",
         prompt_ids.len(),
         generated.len(),

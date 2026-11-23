@@ -92,10 +92,10 @@ pub(crate) fn chat(model_dir: &std::path::Path, system: Option<&str>, run: &RunA
         }
         messages.push(reply_message(&segments));
         if let Some(note) = stop_note(stop, run.limits()) {
-            eprintln!("{DIM}{note}{RESET}");
+            tracing::info!("{note}");
         }
-        eprintln!(
-            "{DIM}{} new prompt tokens in {prompt_seconds:.1}s ({reused} reused); {} tokens at {:.1}/s{RESET}",
+        tracing::info!(
+            "{} new prompt tokens in {prompt_seconds:.1}s ({reused} reused); {} tokens at {:.1}/s",
             ids.len() - reused,
             generated.len(),
             generated.len() as f32 / seconds

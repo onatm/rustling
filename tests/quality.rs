@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use rustling::weights::checkpoint::{Checkpoint, resolve_model};
+use rustling::weights::checkpoint::{Checkpoint, resolve_checkpoint, resolve_model};
 use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options, State};
 use rustling::prompt::Prompter;
@@ -101,7 +101,7 @@ fn paths_against_the_checkpoint() {
     let files = std::env::var("RUSTLING_QUALITY").expect("RUSTLING_QUALITY names the texts, separated by commas");
     let named = std::env::var("RUSTLING_GGUF").unwrap_or_else(|_| DEFAULT_GGUF.to_owned());
     let gguf_path = resolve_model(Some(Path::new(&named))).unwrap();
-    let model_dir = resolve_model(None).unwrap();
+    let model_dir = resolve_checkpoint().unwrap();
     let (converted, original) = (Checkpoint::open(&gguf_path).unwrap(), Checkpoint::open(&model_dir).unwrap());
     assert!(converted.is_gguf() && !original.is_gguf());
     let config = Config::load(&gguf_path).unwrap();

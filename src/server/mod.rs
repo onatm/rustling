@@ -173,7 +173,7 @@ pub fn serve(model_dir: &Path, options: ServerOptions) -> Result<()> {
             .route("/v1/responses", post(responses))
             .with_state(App { jobs, model });
         let listener = tokio::net::TcpListener::bind(&address).await.with_context(|| format!("binding {address}"))?;
-        eprintln!("listening on http://{address}/v1");
+        tracing::info!("listening on http://{address}/v1");
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;

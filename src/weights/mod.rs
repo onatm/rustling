@@ -2,4 +2,5 @@
 
 pub mod checkpoint;
 pub mod ggml;
+pub mod hub;
 pub mod quant;

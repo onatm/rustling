@@ -514,8 +514,15 @@ fn checkpoint_name(gguf: &str, full: bool) -> Option<(String, Layout)> {
     Some((name, Layout::Same))
 }
 
-/// The model whose snapshot is used when none is named.
-const DEFAULT_MODEL: &str = "thinkingmachines/Inkling-2-Mini";
+/// The model used when none is named: a 4-bit conversion, which is what the GPU generates from.
+pub const DEFAULT_MODEL: &str = "lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M";
+/// The published checkpoint. Conversions borrow its config, tokenizer and chat template.
+pub const BASE_MODEL: &str = "thinkingmachines/Inkling-2-Mini";
+
+/// The published checkpoint among the downloaded models, for the tests and tools that need it and no other.
+pub fn resolve_checkpoint() -> Result<PathBuf> {
+    resolve_model(Some(Path::new(BASE_MODEL)))
+}
 
 /// Finds the model's weights: a checkpoint directory, or a GGUF file.
 ///
@@ -526,7 +533,7 @@ const DEFAULT_MODEL: &str = "thinkingmachines/Inkling-2-Mini";
 ///   `unsloth/Inkling-2-Mini-GGUF:Q4_K_M`.
 ///
 /// Names are looked up among the models already downloaded: the Hugging Face cache, then LM Studio's models.
-/// With nothing given, Inkling 2 Mini from the cache.
+/// With nothing given, [`DEFAULT_MODEL`]. Nothing is downloaded here; see [`super::hub::ensure_model`].
 pub fn resolve_model(explicit: Option<&Path>) -> Result<PathBuf> {
     let named = explicit.map(Path::to_path_buf).or_else(|| std::env::var_os("RUSTLING_MODEL").map(PathBuf::from));
     let name = match named {
@@ -540,7 +547,7 @@ pub fn resolve_model(explicit: Option<&Path>) -> Result<PathBuf> {
     };
     ensure!(
         repo.split('/').count() == 2,
-        "{name} is not a directory, a .gguf file, or a model name like {DEFAULT_MODEL} or org/repo-GGUF:Q4_K_M"
+        "{name} is not a directory, a .gguf file, or a model name like {BASE_MODEL} or {DEFAULT_MODEL}"
     );
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
     let hub = match std::env::var_os("HF_HUB_CACHE") {
@@ -586,7 +593,7 @@ pub fn resolve_model(explicit: Option<&Path>) -> Result<PathBuf> {
         seen.extend(ggufs.iter().filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned())));
     }
     match seen.is_empty() {
-        true => bail!("{repo} is not among the downloaded models; fetch it with `hf download {repo}`"),
+        true => bail!("{repo} is not among the downloaded models; fetch it with `rustling pull {name}`"),
         false => bail!("{name} does not pick out one file; {repo} has: {}", seen.join(", ")),
     }
 }
@@ -602,11 +609,11 @@ pub fn companion_dir(model: &Path) -> Result<PathBuf> {
     if !is_gguf(model) {
         return Ok(model.to_path_buf());
     }
-    let base = std::env::var_os("RUSTLING_BASE_MODEL").map(PathBuf::from).unwrap_or_else(|| DEFAULT_MODEL.into());
+    let base = std::env::var_os("RUSTLING_BASE_MODEL").map(PathBuf::from).unwrap_or_else(|| BASE_MODEL.into());
     let dir = resolve_model(Some(&base)).with_context(|| {
         format!(
-            "a GGUF file needs the config and tokenizer of the checkpoint it came from; fetch them with \
-             `hf download {} --include '*.json' '*.jinja'`",
+            "a GGUF file needs the config and tokenizer of the checkpoint it came from, {}; `rustling pull` \
+             fetches them",
             base.display()
         )
     })?;
