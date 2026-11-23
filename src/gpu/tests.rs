@@ -567,3 +567,51 @@ fn experts_match_the_cpu_kernel_exactly() {
         }
     }
 }
+
+/// Whether Apple's matrix product is quicker over 16-bit floats, at the shape of an expert's first product.
+/// `cargo test --release --lib half_products -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn half_products() {
+    let gpu = Gpu::new(&[], true).unwrap();
+    for (count, vectors, rows, cols) in [(128usize, 256usize, 2304usize, 2304usize), (128, 256, 2304, 1152), (1, 4096, 3072, 2304)] {
+        for half in [false, true] {
+            let size = if half { 2 } else { 4 };
+            let fill = |floats: usize| -> Buffer {
+                // 0.5 in either width, so the sums are ordinary numbers.
+                let bytes: Vec<u8> = match half {
+                    true => (0..floats).flat_map(|_| 0x3800u16.to_le_bytes()).collect(),
+                    false => (0..floats).flat_map(|_| 0.5f32.to_le_bytes()).collect(),
+                };
+                copied(&gpu.device, &bytes).unwrap()
+            };
+            let (left, right) = (fill(count * vectors * cols), fill(count * rows * cols));
+            let out = empty(&gpu.device, count * vectors * rows * size).unwrap();
+            let mut best = f64::MAX;
+            for _ in 0..4 {
+                let started = std::time::Instant::now();
+                objc2::rc::autoreleasepool(|_| {
+                    let commands = gpu.queue.commandBuffer().unwrap();
+                    gpu.product_as(&commands, (&left, 0, vectors, cols), (&right, 0, rows, cols), (&out, 0), count, true, 1.0, half);
+                    commands.commit();
+                    commands.waitUntilCompleted();
+                    finish(&commands).unwrap();
+                });
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            // SAFETY: the buffer holds at least one value of either width.
+            let first = unsafe {
+                let pointer = out.contents().as_ptr();
+                if half { half::f16::from_bits(*(pointer as *const u16)).to_f32() } else { *(pointer as *const f32) }
+            };
+            let products = (count * vectors * rows * cols) as f64;
+            eprintln!(
+                "{count} x ({vectors} x {cols}) . ({rows} x {cols})^T, {}: {:.1} ms, {:.0} G products/s, first value {first} (expected {})",
+                if half { "16-bit" } else { "32-bit" },
+                best * 1e3,
+                products / best / 1e9,
+                0.25 * cols as f32
+            );
+        }
+    }
+}

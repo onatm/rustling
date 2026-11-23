@@ -494,17 +494,34 @@ impl Gpu {
         transposed: bool,
         scale: f64,
     ) {
+        self.product_as(commands, left, right, out, count, transposed, scale, false)
+    }
+
+    /// [`Gpu::product`] over 32-bit floats, or with `half` over 16-bit ones.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn product_as(
+        &self,
+        commands: &ProtocolObject<dyn MTLCommandBuffer>,
+        left: (&Buffer, usize, usize, usize),
+        right: (&Buffer, usize, usize, usize),
+        out: (&Buffer, usize),
+        count: usize,
+        transposed: bool,
+        scale: f64,
+        half: bool,
+    ) {
         use objc2::AnyThread;
         use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication};
         let ((left, left_offset, vectors, cols), (right, right_offset, right_rows, right_cols)) = (left, right);
         // How many columns the result has.
         let rows = if transposed { right_rows } else { right_cols };
+        let size = if half { 2 } else { 4 };
         // SAFETY: the callers size each buffer for `count` matrices of the stated shape past its offset, and hold
         // the buffers until the command buffer completes.
         unsafe {
             let matrix = |buffer: &Buffer, offset: usize, r: usize, c: usize| {
                 let descriptor = MPSMatrixDescriptor::matrixDescriptorWithRows_columns_matrices_rowBytes_matrixBytes_dataType(
-                    r, c, count, c * 4, r * c * 4, MPSDataType::Float32,
+                    r, c, count, c * size, r * c * size, if half { MPSDataType::Float16 } else { MPSDataType::Float32 },
                 );
                 MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(), buffer, offset, &descriptor)
             };

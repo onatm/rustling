@@ -174,7 +174,7 @@ On an M1 Max with 64 GB, with the default model, against llama.cpp running the s
 | Generating, short conversation | 24 tokens/s | 21 tokens/s |
 | Generating, 15,000 tokens of context | 21 tokens/s | 18 tokens/s |
 | Processing a 2,400-token prompt | 21 s | 19 s |
-| Processing a 15,000-token prompt | 118 s | 182 s |
+| Processing a 15,000-token prompt | 102 s | 182 s |
 
 On an M4 Max, generation in a short conversation runs at about 50 tokens/s.
 
