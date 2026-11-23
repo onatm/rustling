@@ -351,7 +351,9 @@ fn the_fast_attention_matches_plain_sums() {
 fn the_whole_expert_step_matches_plain_sums() {
     use crate::weights::ggml::encode_q8_0;
     let gpu = Gpu::new(&[], true).unwrap();
-    let (experts, hidden, units, chosen, tokens) = (5usize, 64usize, 32usize, 2usize, 300usize);
+    // One full run followed by a 17-row direct tail. The other experts' padded runs therefore
+    // start at non-multiples of PRODUCT_RUN; check both layouts and their combined results.
+    let (experts, hidden, units, chosen, tokens) = (5usize, 64usize, 32usize, 2usize, 273usize);
     let decoded = |rows: usize, cols: usize, seed: u64| -> (Vec<u8>, Vec<f32>) {
         let bytes: Vec<u8> = floats(rows * cols, seed).chunks_exact(cols).flat_map(encode_q8_0).collect();
         let mut values = vec![0.0f32; rows * cols];

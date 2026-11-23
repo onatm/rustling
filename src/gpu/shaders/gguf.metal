@@ -262,3 +262,23 @@ ROW_KERNEL(row_q8_0, unit_q8_0, 32, p.cols / 32 * 34)
 ROW_KERNEL(row_q5_0, unit_q5_0, 32, p.cols / 32 * 22)
 ROW_KERNEL(row_q6k, unit_q6k, 64, p.cols / 256 * 210)
 ROW_KERNEL(row_f32, unit_f32, 32, p.cols * 4)
+
+// A short run of one expert's tokens. Read compressed weights directly rather than padding the
+// input to an MPS matrix of 256 rows. Each SIMD group computes four output rows for one token.
+#define TAIL_KERNEL(name, dot_unit, width, bytes)                                            \
+    kernel void name(const device uchar* w [[buffer(0)]], const device float* x [[buffer(1)]], \
+                     device float* out [[buffer(2)]], constant uint2& shape [[buffer(3)]],     \
+                     uint3 group [[threadgroup_position_in_grid]],                            \
+                     ushort lane [[thread_index_in_threadgroup]]) {                           \
+        uint rows = shape.x, cols = shape.y, row = group.x * 4 + lane / 8;                    \
+        float sum = 0;                                                                        \
+        for (uint u = lane % 8; u < cols / width; u += 8)                                     \
+            sum += dot_unit(w + ulong(row) * (bytes), x + group.y * cols, u);                 \
+        for (ushort d = 4; d; d /= 2) sum += simd_shuffle_xor(sum, d);                        \
+        if (lane % 8 == 0) out[group.y * rows + row] = sum;                                   \
+    }
+
+TAIL_KERNEL(tail_q4k, unit_q4k, 64, cols / 256 * 144)
+TAIL_KERNEL(tail_q5_0, unit_q5_0, 32, cols / 32 * 22)
+TAIL_KERNEL(tail_q6k, unit_q6k, 64, cols / 256 * 210)
+TAIL_KERNEL(tail_q8_0, unit_q8_0, 32, cols / 32 * 34)

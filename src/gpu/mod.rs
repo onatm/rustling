@@ -54,6 +54,8 @@ pub struct Gpu {
     widen_mxfp8: Pipeline,
     /// Unpacking kernels for a GGUF file's block formats: Q4_K, Q5_0, Q6_K, Q8_0.
     widen_ggml: [Pipeline; 4],
+    /// Direct products for short expert tails, in the same format order as `widen_ggml`.
+    tail_ggml: [Pipeline; 4],
     /// Turns a long batch's attention scores into weights.
     prompt_weights: Pipeline,
     /// The steps between a long batch's two expert products: gather, activation, weighted sum.
@@ -208,6 +210,7 @@ impl Gpu {
                 .map_err(|e| anyhow!("building kernel {name}: {}", e.localizedDescription()))
         };
         let widen_ggml = [pipeline("widen_q4k")?, pipeline("widen_q5_0")?, pipeline("widen_q6k")?, pipeline("widen_q8_0")?];
+        let tail_ggml = [pipeline("tail_q4k")?, pipeline("tail_q5_0")?, pipeline("tail_q6k")?, pipeline("tail_q8_0")?];
         let source = NSString::from_str(include_str!("shaders/attend.metal"));
         let library = device
             .newLibraryWithSource_options_error(&source, Some(&options))
@@ -232,6 +235,7 @@ impl Gpu {
             widen_nvfp4,
             widen_mxfp8,
             widen_ggml,
+            tail_ggml,
             prompt_weights,
             expert_steps,
             gates: Mutex::new(()),

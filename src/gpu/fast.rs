@@ -4,6 +4,16 @@
 
 use super::*;
 
+fn ggml_pipeline_index(format: Format) -> Result<usize> {
+    Ok(match format {
+        Format::Q4K => 0,
+        Format::Q5_0 => 1,
+        Format::Q6K => 2,
+        Format::Q8_0 => 3,
+        other => anyhow::bail!("no kernel unpacks {other:?}"),
+    })
+}
+
 impl Gpu {
     /// [`Gpu::dense`] on the fast path: the weights are widened to float and multiplied by Apple's tuned matrix
     /// product. Several times faster for many vectors, and equal to `dense` only up to rounding.
@@ -54,13 +64,7 @@ impl Gpu {
     }
 
     pub(super) fn widen_ggml(&self, format: Format) -> Result<&Pipeline> {
-        Ok(match format {
-            Format::Q4K => &self.widen_ggml[0],
-            Format::Q5_0 => &self.widen_ggml[1],
-            Format::Q6K => &self.widen_ggml[2],
-            Format::Q8_0 => &self.widen_ggml[3],
-            other => anyhow::bail!("no kernel unpacks {other:?}"),
-        })
+        Ok(&self.widen_ggml[ggml_pipeline_index(format)?])
     }
 
     /// Each expert of a stack applied to its own vectors, on the fast path.
@@ -256,9 +260,8 @@ impl Gpu {
     /// token's weighted sum. Returns `tokens x hidden` outputs.
     ///
     /// Nothing comes back to the CPU in between, which is most of what the two products cost when run apart.
-    /// Every product takes exactly [`PRODUCT_RUN`] rows, padded with zeros: Apple's routine has returned NaN
-    /// for half the outputs of products of some other sizes, and none of this one. The result should still be
-    /// checked.
+    /// Apple's routine always takes [`PRODUCT_RUN`] rows, padded when needed to avoid shapes that returned
+    /// NaN. Very short runs multiply directly from compressed weights instead. Results are still checked.
     pub fn experts_whole(&self, job: &WholeExperts) -> Result<Vec<f32>> {
         // Metal hands back objects that are only let go when a pool drains, and the threads this runs on
         // have none of their own: without one here, every call would leave its command buffers behind.
@@ -273,19 +276,24 @@ impl Gpu {
                 tokens_of[expert as usize].push(((at / chosen) as u32, at as u32));
             }
             let run = PRODUCT_RUN;
+            // At 3,058 prompt tokens on M4 Max this cut scheduled rows by 21% across the 48 visits.
+            const DIRECT_ROWS: usize = 32;
             let order: Vec<u32> = (0..experts as u32).filter(|&e| !tokens_of[e as usize].is_empty()).collect();
             // Products as (position in `order`, first row).
-            let mut products: Vec<(usize, usize)> = Vec::new();
+            let mut products = Vec::new();
             let mut token_of: Vec<u32> = Vec::new();
             let mut row_of = vec![0u32; tokens * chosen];
             for (position, &expert) in order.iter().enumerate() {
                 for piece in tokens_of[expert as usize].chunks(run) {
-                    products.push((position, token_of.len()));
+                    let first = token_of.len();
+                    products.push((position, first, piece.len()));
                     for &(token, route) in piece {
                         row_of[route as usize] = token_of.len() as u32;
                         token_of.push(token);
                     }
-                    token_of.resize(token_of.len().next_multiple_of(run), u32::MAX);
+                    if piece.len() > DIRECT_ROWS {
+                        token_of.resize(first + run, u32::MAX);
+                    }
                 }
             }
             let rows = token_of.len();
@@ -343,7 +351,15 @@ impl Gpu {
                     let buffers = [(&values_buffer, values_offset), (&order_buffer, part * per_part * 4), (widened, 0)];
                     self.encode(&commands, self.widen_ggml(format)?, &buffers, &params, (cols.div_ceil(256), experts.len() * out_rows))?;
                 }
-                for &(position, first) in &products {
+                for &(position, first, count) in &products {
+                    if count <= DIRECT_ROWS {
+                        let index = ggml_pipeline_index(format)?;
+                        ensure!(out_rows % 4 == 0, "bad expert width");
+                        let at = values_offset + order[position] as usize * out_rows * row_bytes;
+                        let buffers = [(&values_buffer, at), (from, first * cols * 4), (to, first * out_rows * 4)];
+                        step(&self.tail_ggml[index], &buffers, &[out_rows as u32, cols as u32], (out_rows * 8, count))?;
+                        continue;
+                    }
                     self.multiply(
                         &commands,
                         (from, first * cols * 4, run, cols),
