@@ -308,7 +308,21 @@ impl Gpu {
                 }
             }
             let rows = token_of.len();
-            let weights: Vec<f32> = job.routes.iter().map(|&(_, weight)| weight).collect();
+            ensure!(job.scales.iter().all(|s| s.is_empty() || s.len() == 4 * experts), "bad expert scales");
+            let scale = |slot: usize, expert: usize| {
+                let scales = job.scales[slot];
+                if scales.is_empty() { 1.0 } else { f32::from_le_bytes(scales[4 * expert..][..4].try_into().unwrap()) }
+            };
+            // Keep MPS products at alpha=1. Specializing a product for every expert's
+            // floating-point alpha is expensive; fold the scales into activation and combine.
+            let weights: Vec<f32> = job.routes.iter().map(|&(e, w)| w * scale(1, e as usize)).collect();
+            let gate_scales = if job.scales[0].is_empty() { None } else {
+                let mut laid = vec![1.0; rows];
+                for (route, &(e, _)) in job.routes.iter().enumerate() {
+                    laid[row_of[route] as usize] = scale(0, e as usize);
+                }
+                Some(copied(&self.device, &laid)?)
+            };
 
             let buffer = |slot: usize, bytes: usize| self.scratch(80 + slot, bytes);
             let (x, token_buffer, laid) = (buffer(0, tokens * hidden * 4)?, buffer(1, rows * 4)?, buffer(2, rows * hidden * 4)?);
@@ -349,9 +363,6 @@ impl Gpu {
             let stack = |values: &[u8], format: Format, (out_rows, cols): (usize, usize), from: &Buffer, to: &Buffer, slot: usize| -> Result<()> {
                 let row_bytes = format.row_bytes(cols).context("rows do not make whole blocks")?;
                 ensure!(values.len() == experts * out_rows * row_bytes, "bad expert stack");
-                let scales = job.scales[slot];
-                ensure!(scales.is_empty() || scales.len() == 4*experts, "bad expert scales");
-                let scale = |expert: usize| if scales.is_empty() { 1.0 } else { f32::from_le_bytes(scales[4*expert..][..4].try_into().unwrap()) };
                 let (values_buffer, values_offset) = self.weights(values)?;
                 let per_part = (WIDENED_BYTES / (out_rows * cols * 4)).max(1);
                 let widened: Vec<Buffer> = order
@@ -372,16 +383,14 @@ impl Gpu {
                             ensure!(out_rows % 4 == 0, "bad expert width");
                             let at = values_offset + expert * out_rows * row_bytes;
                             let buffers = [(&values_buffer, at), (from, first * cols * 4), (to, first * out_rows * 4)];
-                            step(&self.tail_ggml[index], &buffers, &[out_rows as u32, cols as u32, scale(expert).to_bits()], (out_rows * 8, count))?;
+                            step(&self.tail_ggml[index], &buffers, &[out_rows as u32, cols as u32], (out_rows * 8, count))?;
                         }
-                        Matrix::Widened(position) => self.product(
+                        Matrix::Widened(position) => self.multiply(
                             &commands,
                             (from, first * cols * 4, run, cols),
                             (&widened[position / per_part], (position % per_part) * out_rows * cols * 4, out_rows, cols),
                             (to, first * out_rows * 4),
                             1,
-                            true,
-                            scale(order[position] as usize) as f64,
                         ),
                     }
                 }
@@ -390,8 +399,8 @@ impl Gpu {
 
             step(&self.expert_steps[0], &[(&x, 0), (&token_buffer, 0), (&laid, 0)], &[hidden as u32], (hidden / 4, rows))?;
             stack(job.gate_up.0, job.gate_up.1, (2 * units, hidden), &laid, &wide, 0)?;
-            let params = [units as u32, job.gate_cap.to_bits(), job.up_cap.to_bits(), 0];
-            step(&self.expert_steps[1], &[(&wide, 0), (&active, 0)], &params, (units, rows))?;
+            let params = [units as u32, job.gate_cap.to_bits(), job.up_cap.to_bits(), u32::from(gate_scales.is_some())];
+            step(&self.expert_steps[1], &[(&wide, 0), (&active, 0), (gate_scales.as_ref().unwrap_or(&weight_buffer), 0)], &params, (units, rows))?;
             stack(job.down.0, job.down.1, (hidden, units), &active, &wide, 1)?;
             let buffers = [(&wide, 0), (&row_buffer, 0), (&weight_buffer, 0), (&out, 0)];
             step(&self.expert_steps[2], &buffers, &[hidden as u32, chosen as u32], (hidden / 4, tokens))?;

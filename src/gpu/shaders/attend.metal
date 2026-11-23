@@ -101,19 +101,20 @@ struct ExpertActivationParams {
     uint units;
     float gate_cap;
     float up_cap;
-    // Whether a row holds its gate and up units alternately, or all the gate units first.
-    uint interleaved;
+    uint scaled;
 };
 
 // softcap(gate) * sigmoid(gate) * softcap(up) for every unit of every row. The grid is units x rows.
 kernel void expert_activation(const device float* products [[buffer(0)]],
                               device float* out [[buffer(1)]],
-                              constant ExpertActivationParams& p [[buffer(2)]],
+                              const device float* scales [[buffer(2)]],
+                              constant ExpertActivationParams& p [[buffer(3)]],
                               uint2 id [[thread_position_in_grid]]) {
     if (id.x >= p.units) return;
     const device float* row = products + ulong(id.y) * 2 * p.units;
-    float gate = p.interleaved != 0 ? row[2 * id.x] : row[id.x];
-    float up = p.interleaved != 0 ? row[2 * id.x + 1] : row[p.units + id.x];
+    float scale = p.scaled != 0 ? scales[id.y] : 1.f;
+    float gate = row[id.x] * scale;
+    float up = row[p.units + id.x] * scale;
     out[ulong(id.y) * p.units + id.x] =
         tanh(gate / p.gate_cap) * p.gate_cap / (1.0f + exp(-gate)) * tanh(up / p.up_cap) * p.up_cap;
 }

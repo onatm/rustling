@@ -322,7 +322,7 @@ kernel void expert_scale(device float* product [[buffer(0)]], const device uint*
         for (uint u = lane % 8; u < cols / width; u += 8)                                     \
             sum += dot_unit(w + ulong(row) * (bytes), x + group.y * cols, u);                 \
         for (ushort d = 4; d; d /= 2) sum += simd_shuffle_xor(sum, d);                        \
-        if (lane % 8 == 0) out[group.y * rows + row] = sum * as_type<float>(shape[2]);        \
+        if (lane % 8 == 0) out[group.y * rows + row] = sum;                                   \
     }
 
 TAIL_KERNEL(tail_q4k, unit_q4k, 64, cols / 256 * 144)
