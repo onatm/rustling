@@ -131,8 +131,39 @@ static inline float q5k_value(const device uchar* b, uint i) {
         for (uint i=0; i<32; i++) sum += value(b, (u%(width/32))*32+i)*x[u*32+i];              \
         return sum;                                                                            \
     }
-EXTRA_BLOCK(nvfp4, 64, 36, nv_value)
 EXTRA_BLOCK(q5k, 256, 176, q5k_value)
+
+static inline void widen_nvfp4_part(const device uchar* block, uint part, device float* out) {
+    for (uint i = 0; i < 32; i++) out[i] = nv_value(block, part * 32 + i);
+}
+WIDEN_KERNEL(widen_nvfp4, 64, 36)
+
+// Doubled E2M1 magnitudes (0,1,2,3,4,6,8,12) fit in a nibble each.
+static inline float4 nv_codes(uint4 n) {
+    uint4 magnitude = (uint4(0xc8643210u) >> (4u * (n & 7u))) & 15u;
+    return float4(select(int4(magnitude), -int4(magnitude), (n & 8u) != 0u));
+}
+
+static inline float unit_nvfp4(const device uchar* row, const device float* x, uint unit) {
+    const device uchar* block = row + (unit / 2) * 36;
+    float4 acc = 0;
+    for (uint k = 0; k < 2; k++) {
+        uint s = (unit % 2) * 2 + k;
+        uint code = block[s];
+        // Shift UE4M3 into half's exponent/mantissa fields. The bias difference
+        // contributes 2^8; the doubled magnitudes above consume one factor of two.
+        float scale = code == 127 ? 0.f : float(as_type<half>(ushort((code & 127) << 7))) * 128.f;
+        const device packed_uchar4* q = (const device packed_uchar4*)(block + 4 + s * 8);
+        const device packed_float4* v = (const device packed_float4*)(x + unit * 32 + k * 16);
+        float4 sum = 0;
+        for (uint j = 0; j < 2; j++) {
+            uint4 bytes = uint4(uchar4(q[j]));
+            sum += nv_codes(bytes & 15u) * float4(v[j]) + nv_codes(bytes >> 4) * float4(v[2 + j]);
+        }
+        acc += scale * sum;
+    }
+    return acc.x + acc.y + acc.z + acc.w;
+}
 
 static inline float unit_bf16(const device uchar* row, const device float* x, uint u) {
     const device ushort* w = (const device ushort*)row + 32*u;

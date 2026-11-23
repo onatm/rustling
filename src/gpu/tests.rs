@@ -85,6 +85,36 @@ fn dense_matches_the_cpu_kernel_exactly() {
     }
 }
 
+#[test]
+fn nvfp4_row_kernel_matches_decoded_weights_for_every_scale() {
+    let gpu = Gpu::new(&[], true).unwrap();
+    let kernels = gpu.kernels(include_str!("shaders/gguf.metal"), &["row_nvfp4"]).unwrap();
+    let mut weights = Vec::new();
+    for code in 0..=u8::MAX {
+        weights.extend((0..4).map(|s| code.wrapping_add(s)));
+        weights.extend((0..32).map(|i| ((i % 16) | ((15 - i % 16) << 4)) as u8));
+    }
+    let (w, offset) = gpu.wrap(&weights).unwrap();
+    let mut buffers = [w, gpu.shared(64 * 4).unwrap(), gpu.shared(256 * 4).unwrap(), gpu.shared(4).unwrap()];
+    let step = Step {
+        kernel: 0, buffers: vec![(0, offset), (1, 0), (2, 0), (3, 0)],
+        params: [256u32, 64, 256 * 36, 4, 0, 0, 0].into_iter().flat_map(u32::to_le_bytes).collect(),
+        grid: Grid::Groups(64, 1),
+    };
+    // One-hot inputs expose nibble order and scale conversion without reduction rounding.
+    for col in 0..64 {
+        let x = buffers[1].floats_mut();
+        x.fill(0.);
+        x[col] = 1.;
+        gpu.run(&[&kernels], std::slice::from_ref(&step), &buffers, [0, 0], 1).unwrap();
+        for (row, block) in weights.chunks_exact(36).enumerate() {
+            let mut decoded = [0.; 64];
+            Format::Nvfp4.decode_row(block, &mut decoded);
+            assert_eq!(buffers[2].floats()[row], decoded[col], "row {row}, column {col}");
+        }
+    }
+}
+
 /// What a token's matrix products cost with a group of 32 threads sharing 1, 2, 4 or 8 rows, and what a
 /// dispatch costs by itself: `cargo test --release --lib gpu::tests::row_kernels -- --ignored --nocapture`.
 #[test]
