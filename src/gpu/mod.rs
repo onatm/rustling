@@ -34,9 +34,12 @@ type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 /// The most bytes of unpacked expert weights kept in one buffer.
 const WIDENED_BYTES: usize = 1 << 30;
 
-/// The most input vectors given to one expert product on the fast path. With runs of 512 a few products of a
+/// How many rows the left operand of a fast product has where it must not fail: every expert product, and the
+/// plain products when they are redone. Apple's matrix product has returned NaN for half the outputs of products
+/// of some other sizes, repeatably for a given sequence of work, and none of this one. Longer operands go
+/// through in runs of this many rows, the last padded with zeros. With runs of 512 a few expert products of a
 /// 3,774-token prompt still came back with NaN; with 256 none did.
-const EXPERT_RUN: usize = 256;
+const PRODUCT_RUN: usize = 256;
 
 /// Apple silicon pages; `newBufferWithBytesNoCopy` needs whole pages.
 const PAGE: usize = 16384;

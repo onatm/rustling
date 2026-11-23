@@ -66,7 +66,8 @@ pub(crate) fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, t
         }
         let redone = rustling::model::GPU_PRODUCTS_REDONE.load(std::sync::atomic::Ordering::Relaxed);
         if redone > 0 {
-            tracing::info!("{redone} batches of matrix products were recomputed on the CPU after the GPU returned NaN");
+            let on_cpu = rustling::model::GPU_PRODUCTS_ON_CPU.load(std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("{redone} batches of matrix products were recomputed after the GPU returned NaN, {on_cpu} of them on the CPU");
         }
     }
 

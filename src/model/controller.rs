@@ -21,9 +21,11 @@ impl Controller<'_> {
                     rms_norm(b, None, eps);
                 },
             );
-            match gpu.gates_fast(&pairs, &self.down.bytes, &self.forget.bytes, &self.gain.bytes, (self.down.rows, h)) {
+            // A merge that comes back with NaN is redone in short runs, then on the CPU (see `Gpu::dense_fast`).
+            for in_runs in [false, true] {
+            match gpu.gates_fast(&pairs, &self.down.bytes, &self.forget.bytes, &self.gain.bytes, (self.down.rows, h), in_runs) {
                 Ok((forget, gain)) if !forget.par_iter().chain(&gain).all(|value| value.is_finite()) => {
-                    GPU_PRODUCTS_REDONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    products_redone(in_runs);
                 }
                 Ok((mut forget, mut gain)) => {
                     let mut merged = vec![0.0f32; hidden.len()];
@@ -38,7 +40,11 @@ impl Controller<'_> {
                         });
                     return merged;
                 }
-                Err(error) => gpu_failed(&error),
+                Err(error) => {
+                    gpu_failed(&error);
+                    break;
+                }
+            }
             }
         }
         #[cfg(not(target_os = "macos"))]

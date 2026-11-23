@@ -116,12 +116,19 @@ pub(crate) fn apply_many(gpu: Option<&Gpu>, jobs: &[(&Mat, &[f32])]) -> Vec<Seq>
             .iter()
             .map(|(m, xs)| DenseJob { format: m.format, weights: &m.bytes, rows: m.rows, cols: m.cols, xs })
             .collect();
-        match if fast { gpu.dense_fast(&dense) } else { gpu.dense(&dense) } {
-            // The fast product now and then returns NaN (see `Gpu::experts_fast`), which nothing downstream
-            // would catch: it would sit in the state and spoil every token after it.
-            Ok(outs) if !fast || outs.par_iter().all(|out| out.iter().all(|value| value.is_finite())) => return outs,
-            Ok(_) => drop(GPU_PRODUCTS_REDONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
-            Err(error) => gpu_failed(&error),
+        // The fast product now and then returns NaN (see `Gpu::dense_fast`), which nothing downstream would
+        // catch: it would sit in the state and spoil every token after it. A batch that comes back so is redone
+        // in short runs, still on the GPU, and only then on the CPU.
+        let sound = |outs: &Vec<Seq>| outs.par_iter().all(|out| out.iter().all(|value| value.is_finite()));
+        for in_runs in [false, true] {
+            match if fast { gpu.dense_fast(&dense, in_runs) } else { gpu.dense(&dense) } {
+                Ok(outs) if !fast || sound(&outs) => return outs,
+                Ok(_) => products_redone(in_runs),
+                Err(error) => {
+                    gpu_failed(&error);
+                    break;
+                }
+            }
         }
         }
     }

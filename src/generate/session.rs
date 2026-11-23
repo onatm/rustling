@@ -402,7 +402,7 @@ impl<'m, 'a> Session<'m, 'a> {
         let mut pacing = Pacing::new(proposed_cost);
         let mut copying = Pacing::new(proposed_cost);
         // A draft's proposal is made on the CPU, which costs more than a token does once tokens come from the GPU.
-        let proposing = !self.model.decodes_on_gpu();
+        let proposing = !self.model.decodes_on_gpu() || crate::generate::draft::tried_on_gpu();
         let mut lookup = Lookup::new(&self.context);
         let mut logits = self.logits()?;
         let mut next = sampler.sample(&logits);

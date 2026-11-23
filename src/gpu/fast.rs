@@ -7,7 +7,11 @@ use super::*;
 impl Gpu {
     /// [`Gpu::dense`] on the fast path: the weights are widened to float and multiplied by Apple's tuned matrix
     /// product. Several times faster for many vectors, and equal to `dense` only up to rounding.
-    pub fn dense_fast(&self, jobs: &[DenseJob]) -> Result<Vec<Vec<f32>>> {
+    ///
+    /// The product takes all of a job's vectors at once, which is quickest and which Apple's routine now and
+    /// then answers with NaN; the caller checks. `in_runs` takes them [`PRODUCT_RUN`] at a time instead, about a
+    /// fifth slower over a long prompt and not known to fail: the way to redo a batch that came back wrong.
+    pub fn dense_fast(&self, jobs: &[DenseJob], in_runs: bool) -> Result<Vec<Vec<f32>>> {
         // Metal hands back objects that are only let go when a pool drains, and the threads this runs on
         // have none of their own: without one here, every call would leave its command buffers behind.
         objc2::rc::autoreleasepool(|_| {
@@ -31,10 +35,15 @@ impl Gpu {
                     let buffers = [(&weights, offset), (&first, 0), (&widened, 0)];
                     self.encode(&commands, self.widen_ggml(job.format)?, &buffers, &params, (job.cols.div_ceil(256), job.rows))?;
                 }
-                let x = copied(&self.device, job.xs)?;
-                let out = self.scratch(2 * index + 1, vectors * job.rows * 4)?;
+                // A fresh buffer is zeroed, which is the padding of the last run.
+                let run = if in_runs { PRODUCT_RUN } else { vectors.max(1) };
+                let padded = vectors.next_multiple_of(run);
+                let x = empty(&self.device, padded * job.cols * 4)?;
+                // SAFETY: the buffer is shared-mode and at least `job.xs.len()` floats long.
+                unsafe { std::ptr::copy_nonoverlapping(job.xs.as_ptr(), x.contents().as_ptr() as *mut f32, job.xs.len()) };
+                let out = self.scratch(2 * index + 1, padded * job.rows * 4)?;
                 // out = x . widened^T: one row per vector.
-                self.multiply(&commands, (&x, 0, vectors, job.cols), (&widened, 0, job.rows, job.cols), (&out, 0), 1);
+                self.multiply_runs(&commands, (&x, vectors, job.cols), (&widened, 0, job.rows, job.cols), &out, run);
                 outputs.push((out, vectors * job.rows));
             }
             commands.commit();
@@ -107,7 +116,7 @@ impl Gpu {
 
             // Products as (position in `order`, first vector, vectors): an expert's vectors in runs of at most
             // `run`, since Apple's product has returned NaN for runs of around nine hundred.
-            let run = EXPERT_RUN;
+            let run = PRODUCT_RUN;
             let groups: Vec<(usize, usize, usize)> = order
                 .iter()
                 .enumerate()
@@ -196,8 +205,17 @@ impl Gpu {
 
     /// The gates of a message merge for a long batch: `forget = F (D pair)` and `gain = G (D pair)` for every
     /// token's `pair`, where the three matrices are plain floats of `rank x width`, `hidden x rank` and
-    /// `hidden x rank`. Returns the two, `tokens x hidden` each, before their `tanh`.
-    pub fn gates_fast(&self, pairs: &[f32], down: &[u8], forget: &[u8], gain: &[u8], (rank, hidden): (usize, usize)) -> Result<(Vec<f32>, Vec<f32>)> {
+    /// `hidden x rank`. Returns the two, `tokens x hidden` each, before their `tanh`. `in_runs` is as for
+    /// [`Gpu::dense_fast`].
+    pub fn gates_fast(
+        &self,
+        pairs: &[f32],
+        down: &[u8],
+        forget: &[u8],
+        gain: &[u8],
+        (rank, hidden): (usize, usize),
+        in_runs: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         // Metal hands back objects that are only let go when a pool drains, and the threads this runs on
         // have none of their own: without one here, every call would leave its command buffers behind.
         objc2::rc::autoreleasepool(|_| {
@@ -210,16 +228,22 @@ impl Gpu {
             // Merges run side by side on the CPU; here they share scratch buffers and take turns.
             let _turn = self.gates.lock().expect("gate lock");
             let buffer = |slot: usize, floats: usize| self.scratch(96 + slot, floats * 4);
-            let (x, low) = (buffer(0, tokens * width)?, buffer(1, tokens * rank)?);
-            let (forgets, gains) = (buffer(2, tokens * hidden)?, buffer(3, tokens * hidden)?);
-            // SAFETY: the buffer is shared-mode, at least `pairs.len()` floats long, and nothing else uses it until
-            // the submission below completes.
-            unsafe { std::ptr::copy_nonoverlapping(pairs.as_ptr(), x.contents().as_ptr() as *mut f32, pairs.len()) };
+            let run = if in_runs { PRODUCT_RUN } else { tokens.max(1) };
+            let padded = tokens.next_multiple_of(run);
+            let (x, low) = (buffer(0, padded * width)?, buffer(1, padded * rank)?);
+            let (forgets, gains) = (buffer(2, padded * hidden)?, buffer(3, padded * hidden)?);
+            // SAFETY: the buffer is shared-mode, at least `padded * width` floats long, and nothing else uses it
+            // until the submission below completes. The rows past the last token are the padding, zeroed.
+            unsafe {
+                let floats = x.contents().as_ptr() as *mut f32;
+                std::ptr::copy_nonoverlapping(pairs.as_ptr(), floats, pairs.len());
+                std::ptr::write_bytes(floats.add(pairs.len()), 0, (padded - tokens) * width);
+            }
             let ((down, down_at), (forget, forget_at), (gain, gain_at)) = (self.weights(down)?, self.weights(forget)?, self.weights(gain)?);
             let commands = self.queue.commandBuffer().context("creating a command buffer")?;
-            self.multiply(&commands, (&x, 0, tokens, width), (&down, down_at, rank, width), (&low, 0), 1);
-            self.multiply(&commands, (&low, 0, tokens, rank), (&forget, forget_at, hidden, rank), (&forgets, 0), 1);
-            self.multiply(&commands, (&low, 0, tokens, rank), (&gain, gain_at, hidden, rank), (&gains, 0), 1);
+            self.multiply_runs(&commands, (&x, tokens, width), (&down, down_at, rank, width), &low, run);
+            self.multiply_runs(&commands, (&low, tokens, rank), (&forget, forget_at, hidden, rank), &forgets, run);
+            self.multiply_runs(&commands, (&low, tokens, rank), (&gain, gain_at, hidden, rank), &gains, run);
             commands.commit();
             commands.waitUntilCompleted();
             finish(&commands)?;
@@ -232,7 +256,7 @@ impl Gpu {
     /// token's weighted sum. Returns `tokens x hidden` outputs.
     ///
     /// Nothing comes back to the CPU in between, which is most of what the two products cost when run apart.
-    /// Every product takes exactly [`EXPERT_RUN`] rows, padded with zeros: Apple's routine has returned NaN
+    /// Every product takes exactly [`PRODUCT_RUN`] rows, padded with zeros: Apple's routine has returned NaN
     /// for half the outputs of products of some other sizes, and none of this one. The result should still be
     /// checked.
     pub fn experts_whole(&self, job: &WholeExperts) -> Result<Vec<f32>> {
@@ -248,7 +272,7 @@ impl Gpu {
             for (at, &(expert, _)) in job.routes.iter().enumerate() {
                 tokens_of[expert as usize].push(((at / chosen) as u32, at as u32));
             }
-            let run = EXPERT_RUN;
+            let run = PRODUCT_RUN;
             let order: Vec<u32> = (0..experts as u32).filter(|&e| !tokens_of[e as usize].is_empty()).collect();
             // Products as (position in `order`, first row).
             let mut products: Vec<(usize, usize)> = Vec::new();
@@ -439,6 +463,22 @@ impl Gpu {
         count: usize,
     ) {
         self.product(commands, left, right, out, count, true, 1.0);
+    }
+
+    /// Encodes `out = left . right^T` for a `left` of any number of rows, as products of `run` rows each.
+    /// `left` is `(buffer, rows, cols)` and `out` a buffer, both from their starts and both long enough for the
+    /// rows rounded up to a whole run; `left`'s rows past the last are the padding and should be zero.
+    pub(super) fn multiply_runs(
+        &self,
+        commands: &ProtocolObject<dyn MTLCommandBuffer>,
+        (left, rows, cols): (&Buffer, usize, usize),
+        right: (&Buffer, usize, usize, usize),
+        out: &Buffer,
+        run: usize,
+    ) {
+        for from in (0..rows).step_by(run) {
+            self.multiply(commands, (left, from * cols * 4, run, cols), right, (out, from * right.2 * 4), 1);
+        }
     }
 
     /// Encodes `out = scale * left . right` (or `left . right^T` with `transposed`) for `count` matrices laid

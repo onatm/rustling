@@ -154,10 +154,11 @@ pub(crate) fn load_config(model_dir: &std::path::Path) -> Result<Config> {
 
 /// Whether a draft model can speed this model up; says why not when it cannot.
 pub(crate) fn drafting_pays(model: &Model) -> bool {
-    if model.decodes_on_gpu() {
+    let pays = !model.decodes_on_gpu() || rustling::generate::draft::tried_on_gpu();
+    if !pays {
         tracing::warn!("--draft is not used: tokens are generated on the GPU, where one costs less than checking a proposal");
     }
-    !model.decodes_on_gpu()
+    pays
 }
 
 /// The context window for each generation of Apple silicon, when none is asked for. Time decides it, not memory:

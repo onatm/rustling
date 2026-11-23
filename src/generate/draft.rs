@@ -52,6 +52,12 @@ pub struct Draft<'a> {
 /// are worth proposing. Measured on an M1 Max, speed keeps improving up to about here and flattens beyond.
 pub const DEFAULT_MIN_CONFIDENCE: f32 = 0.8;
 
+/// Whether to propose with the draft even when tokens are generated on the GPU, where a proposal made on the CPU
+/// costs more than the tokens it saves. For measuring that: set `RUSTLING_DRAFT_ON_GPU`.
+pub fn tried_on_gpu() -> bool {
+    std::env::var_os("RUSTLING_DRAFT_ON_GPU").is_some()
+}
+
 /// Tokens per task when a correction is added to every token's logit.
 const CORRECTION_TOKENS: usize = 8192;
 

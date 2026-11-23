@@ -53,9 +53,18 @@ pub static GPU_EXPERTS_REDONE: std::sync::atomic::AtomicUsize = std::sync::atomi
 /// How many stretches of attention had to be recomputed on the CPU, for the timing report.
 pub static GPU_ATTENTION_REDONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// How many batches of plain matrix products, and of the controllers' merges, had to be recomputed on the CPU
-/// because the GPU's fast product returned values that are not numbers.
+/// How many batches of plain matrix products, and of the controllers' merges, had to be recomputed because the
+/// GPU's fast product returned values that are not numbers.
 pub static GPU_PRODUCTS_REDONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many of those came back wrong from the GPU a second time, in short runs, and went to the CPU.
+pub static GPU_PRODUCTS_ON_CPU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts a batch of fast products that came back with NaN: at the first try, or at the second in short runs.
+fn products_redone(in_runs: bool) {
+    let count = if in_runs { &GPU_PRODUCTS_ON_CPU } else { &GPU_PRODUCTS_REDONE };
+    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Prompt tokens per pass on the fast path. Unpacking the weights for the GPU costs the same however many tokens
 /// follow, so long passes pay off: a 2,400-token prompt took 29 s in passes of 512 and 23 s in passes of 2,048,

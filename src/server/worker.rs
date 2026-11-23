@@ -34,10 +34,11 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
         },
         _ => None,
     };
-    if draft.is_some() && model.decodes_on_gpu() {
+    let drafting_pays = !model.decodes_on_gpu() || rustling::generate::draft::tried_on_gpu();
+    if draft.is_some() && !drafting_pays {
         tracing::warn!("--draft is not used: tokens are generated on the GPU, where one costs less than checking a proposal");
     }
-    let draft = draft.filter(|_| !model.decodes_on_gpu());
+    let draft = draft.filter(|_| drafting_pays);
     // Bring the weights into memory and run a token through the model, so the first request is not the slow one.
     let started = std::time::Instant::now();
     let bytes = checkpoint.read_through();
@@ -291,6 +292,16 @@ pub(crate) fn handle(
         "[{number}] prompt: {cached_tokens} tokens reused, {processed} processed in {prompt_seconds:.1}s ({:.0} tokens/s)",
         rate(processed, prompt_seconds)
     );
+    // Work the GPU got wrong and that was done again: worth knowing about, since it costs time.
+    let redone = |count: &std::sync::atomic::AtomicUsize| count.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let (products, on_cpu) = (redone(&rustling::model::GPU_PRODUCTS_REDONE), redone(&rustling::model::GPU_PRODUCTS_ON_CPU));
+    let (experts, attention) = (redone(&rustling::model::GPU_EXPERTS_REDONE), redone(&rustling::model::GPU_ATTENTION_REDONE));
+    if products + experts + attention > 0 {
+        tracing::warn!(
+            "[{number}] the GPU returned NaN and work was redone: {products} batches of products ({on_cpu} of them on the \
+             CPU), {experts} experts, {attention} stretches of attention"
+        );
+    }
     let started = std::time::Instant::now();
 
     // Streamed text is the growth of the reply's reasoning and content; tool calls go out whole once closed.

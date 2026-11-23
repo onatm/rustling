@@ -187,8 +187,9 @@ fn paths_against_the_checkpoint() {
         runs.push(Run { name: "file, additions", from: tail, states, logits: None });
         let redone = |count: &std::sync::atomic::AtomicUsize| count.load(std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "  redone on the CPU so far: {} batches of products, {} experts, {} stretches of attention",
+            "  redone so far: {} batches of products ({} of them on the CPU), {} experts, {} stretches of attention",
             redone(&rustling::model::GPU_PRODUCTS_REDONE),
+            redone(&rustling::model::GPU_PRODUCTS_ON_CPU),
             redone(&rustling::model::GPU_EXPERTS_REDONE),
             redone(&rustling::model::GPU_ATTENTION_REDONE)
         );

@@ -147,7 +147,7 @@ fn prompt_parts() {
         jobs.push(DenseJob { format, weights: bytes, rows, cols, xs: &xs[..tokens * cols] });
         dense_products += rows * cols * tokens;
     }
-    let seconds = best(&|| drop(gpu.dense_fast(&jobs).unwrap()));
+    let seconds = best(&|| drop(gpu.dense_fast(&jobs, false).unwrap()));
     eprintln!("projections, {tokens} tokens: {:.0} ms, {:.0} G products/s", seconds * 1e3, dense_products as f64 / seconds / 1e9);
 
     // Every expert with the same share of the tokens' eight choices.
@@ -217,12 +217,17 @@ fn bench() {
 #[test]
 fn the_fast_dense_path_matches_to_rounding() {
     let gpu = Gpu::new(&[], true).unwrap();
-    let (rows, cols, vectors) = (40, 2304, 70);
+    // More vectors than a run, and not a whole number of runs.
+    let (rows, cols, vectors) = (40, 2304, 300);
     let weights: Vec<u8> =
         bytes(rows * cols * 2, 5).as_chunks::<2>().0.iter().flat_map(|b| [b[0], 0x3C | (b[1] & 0x83)]).collect();
     let xs = floats(vectors * cols, 6);
     let job = [DenseJob { format: Format::Bf16, weights: &weights, rows, cols, xs: &xs }];
-    let (fast, exact) = (gpu.dense_fast(&job).unwrap().remove(0), gpu.dense(&job).unwrap().remove(0));
+    let (fast, exact) = (gpu.dense_fast(&job, false).unwrap().remove(0), gpu.dense(&job).unwrap().remove(0));
+    // Taken a run at a time, the products are the same sums.
+    let in_runs = gpu.dense_fast(&job, true).unwrap().remove(0);
+    assert_eq!(in_runs.len(), fast.len());
+    assert!(in_runs.iter().zip(&fast).all(|(a, b)| (a - b).abs() <= 1e-3 * (1.0 + b.abs())), "runs differ from the whole");
     // Compared with the size of the terms summed: a result near zero from cancellation is still that accurate.
     for v in 0..vectors {
         for r in 0..rows {
@@ -400,10 +405,12 @@ fn the_whole_expert_step_matches_plain_sums() {
 #[test]
 fn the_fast_gates_match_plain_sums() {
     let gpu = Gpu::new(&[], true).unwrap();
-    let (tokens, width, rank, hidden) = (7usize, 48usize, 6usize, 20usize);
+    let (tokens, width, rank, hidden) = (263usize, 48usize, 6usize, 20usize);
     let (pairs, down, forget, gain) = (floats(tokens * width, 1), floats(rank * width, 2), floats(hidden * rank, 3), floats(hidden * rank, 4));
     let raw = |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
-    let (forgets, gains) = gpu.gates_fast(&pairs, &raw(&down), &raw(&forget), &raw(&gain), (rank, hidden)).unwrap();
+    for in_runs in [false, true] {
+    let (forgets, gains) = gpu.gates_fast(&pairs, &raw(&down), &raw(&forget), &raw(&gain), (rank, hidden), in_runs).unwrap();
+    assert_eq!((forgets.len(), gains.len()), (tokens * hidden, tokens * hidden));
     for t in 0..tokens {
         let low: Vec<f32> = (0..rank).map(|r| (0..width).map(|c| down[r * width + c] * pairs[t * width + c]).sum()).collect();
         for i in 0..hidden {
@@ -412,6 +419,7 @@ fn the_fast_gates_match_plain_sums() {
             let expected: f32 = (0..rank).map(|r| gain[i * rank + r] * low[r]).sum();
             assert!((gains[t * hidden + i] - expected).abs() < 1e-4, "gain, token {t}, {i}");
         }
+    }
     }
 }
 
@@ -424,7 +432,7 @@ fn the_fast_paths_unpack_gguf_blocks() {
         let (rows, cols, vectors) = (37, 768, 5);
         let weights: Vec<u8> = (0..rows).flat_map(|r| random_row(format, cols, (100 * f + r) as u32)).collect();
         let xs = floats(vectors * cols, 40 + f as u64);
-        let out = gpu.dense_fast(&[DenseJob { format, weights: &weights, rows, cols, xs: &xs }]).unwrap().remove(0);
+        let out = gpu.dense_fast(&[DenseJob { format, weights: &weights, rows, cols, xs: &xs }], false).unwrap().remove(0);
         for (i, x) in xs.chunks_exact(cols).enumerate() {
             assert_close(format, &weights, cols, x, &out[i * rows..][..rows], "dense");
         }
