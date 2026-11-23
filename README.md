@@ -166,8 +166,23 @@ a token does. `--draft` says so and is ignored.
 
 `--context <TOKENS>` on `generate`, `chat` and `serve` limits how many tokens a prompt and its reply may take
 together. A prompt that does not fit is refused (the server answers 400), and a reply stops when the window is
-full. Without it there is no limit short of the model's 1,048,576, and memory and time per token grow with the
-context.
+full. Memory and time per token grow with the context.
+
+Without the flag the window depends on the chip, sized so that a prompt filling it is still processed in about
+two minutes. Only the M1 figure is measured (on an M1 Max); the others scale it by each generation's GPU and are
+estimates until someone measures them.
+
+| Chip | Default window |
+|---|---|
+| M1 | 16,384 |
+| M2 | 20,480 |
+| M3 | 24,576 |
+| M4 | 32,768 |
+| M5 | 40,960 |
+| anything else | 16,384 |
+
+The model itself takes up to 1,048,576 tokens, and `--context 1048576` removes the limit in practice. Each token
+of context costs 64 KB of memory, on top of a fixed 0.3 GB.
 
 ## Variable-loop checkpoint
 

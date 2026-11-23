@@ -115,7 +115,9 @@ struct RunArgs {
     #[arg(long, default_value_t = 4096)]
     max_tokens: usize,
     /// The context window: the most tokens a prompt and its reply may take together. Longer prompts are refused
-    /// and replies stop when it is full. Unlimited by default (the model was trained with up to 1,048,576).
+    /// and replies stop when it is full. The default depends on the chip (16,384 on an M1, more on later ones),
+    /// chosen so that a prompt filling the window is still processed in a couple of minutes; the model itself
+    /// takes up to 1,048,576.
     #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u64).range(2..))]
     context: Option<u64>,
     /// Sampling temperature; 0 always takes the most likely token. The model's own default is 1.
@@ -183,7 +185,7 @@ impl RunArgs {
 
     /// The context window in tokens.
     fn window(&self) -> usize {
-        self.context.map_or(usize::MAX, |tokens| tokens as usize)
+        self.context.map_or_else(default_context, |tokens| tokens as usize)
     }
 
     fn limits(&self) -> Limits {
@@ -257,6 +259,46 @@ fn drafting_pays(model: &Model) -> bool {
         eprintln!("--draft is not used: tokens are generated on the GPU, where one costs less than checking a proposal");
     }
     !model.decodes_on_gpu()
+}
+
+/// The context window for each generation of Apple silicon, when none is asked for. Time decides it, not memory:
+/// a prompt that fills the window should be processed in about two minutes, which on an M1 Max is 16,384 tokens.
+/// Only that entry is measured; the later ones scale it by how much faster each generation's GPU is, roughly.
+const CONTEXT_BY_CHIP: [(&str, usize); 5] =
+    [("Apple M1", 16_384), ("Apple M2", 20_480), ("Apple M3", 24_576), ("Apple M4", 32_768), ("Apple M5", 40_960)];
+/// For a chip the table does not know: the first entry's.
+const CONTEXT_OTHERWISE: usize = 16_384;
+
+/// The context window for a chip named as the system names it, such as "Apple M1 Max".
+fn context_for(chip: &str) -> usize {
+    let known = CONTEXT_BY_CHIP.iter().find(|(name, _)| {
+        // "Apple M1" must not claim an "Apple M10".
+        chip.strip_prefix(name).is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
+    });
+    known.map_or(CONTEXT_OTHERWISE, |&(_, tokens)| tokens)
+}
+
+fn default_context() -> usize {
+    let chip = match cfg!(target_os = "macos") {
+        true => std::process::Command::new("sysctl").args(["-n", "machdep.cpu.brand_string"]).output().ok(),
+        false => None,
+    };
+    context_for(chip.and_then(|output| String::from_utf8(output.stdout).ok()).as_deref().unwrap_or("").trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_context_follows_the_chip() {
+        assert_eq!(context_for("Apple M1 Max"), 16_384);
+        assert_eq!(context_for("Apple M4 Max"), 32_768);
+        assert_eq!(context_for("Apple M5"), 40_960);
+        assert_eq!(context_for("Apple M10 Max"), CONTEXT_OTHERWISE);
+        assert_eq!(context_for("Intel(R) Core(TM) i9"), CONTEXT_OTHERWISE);
+        assert_eq!(context_for(""), CONTEXT_OTHERWISE);
+    }
 }
 
 /// How many performance cores an Apple silicon machine has; nothing elsewhere, or if the system will not say.
@@ -492,6 +534,10 @@ fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, top: bool, t
         let redone = rustling::model::GPU_ATTENTION_REDONE.load(std::sync::atomic::Ordering::Relaxed);
         if redone > 0 {
             eprintln!("{redone} stretches of attention were recomputed on the CPU after the GPU returned NaN");
+        }
+        let redone = rustling::model::GPU_PRODUCTS_REDONE.load(std::sync::atomic::Ordering::Relaxed);
+        if redone > 0 {
+            eprintln!("{redone} batches of matrix products were recomputed on the CPU after the GPU returned NaN");
         }
     }
 

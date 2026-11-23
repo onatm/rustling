@@ -308,7 +308,7 @@ impl<'m, 'a> Session<'m, 'a> {
     pub fn set_context_watched(&mut self, ids: &[u32], progress: &mut dyn FnMut(usize) -> bool) -> Result<usize> {
         anyhow::ensure!(
             ids.len() < self.window,
-            "the prompt is {} tokens, which leaves no room in a context window of {}",
+            "the prompt is {} tokens, which leaves no room in a context window of {} (--context sets a larger one)",
             ids.len(),
             self.window
         );

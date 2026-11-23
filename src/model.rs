@@ -53,6 +53,10 @@ pub static GPU_EXPERTS_REDONE: std::sync::atomic::AtomicUsize = std::sync::atomi
 /// How many stretches of attention had to be recomputed on the CPU, for the timing report.
 pub static GPU_ATTENTION_REDONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many batches of plain matrix products, and of the controllers' merges, had to be recomputed on the CPU
+/// because the GPU's fast product returned values that are not numbers.
+pub static GPU_PRODUCTS_REDONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Prompt tokens per pass on the fast path. Unpacking the weights for the GPU costs the same however many tokens
 /// follow, so long passes pay off: a 2,400-token prompt took 29 s in passes of 512 and 23 s in passes of 2,048,
 /// and a 15,000-token one 211 s in passes of 2,048 and 175 s in passes of 4,096. Longer made no difference.
@@ -242,6 +246,20 @@ impl State {
             .map(|v| v.convs.iter().map(Vec::len).sum::<usize>())
             .sum();
         floats * size_of::<f32>() + self.visits.iter().map(|v| v.keys.bytes() + v.values.bytes()).sum::<usize>()
+    }
+
+    /// The size of what each visit holds: the root of the summed squares of its keys, its values and its
+    /// convolution inputs. Anything not finite in a visit shows as a size that is not finite, and two states
+    /// that should be alike can be compared visit by visit.
+    pub fn sizes(&self) -> Vec<[f64; 3]> {
+        let size = |values: &mut dyn Iterator<Item = &f32>| values.map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+        self.visits
+            .iter()
+            .map(|visit| {
+                let table = |table: &Table| size(&mut (0..table.heads()).flat_map(|head| table.head(head)));
+                [table(&visit.keys), table(&visit.values), size(&mut visit.convs.iter().flatten())]
+            })
+            .collect()
     }
 
     /// Whether the state has the shape `model` expects, as a check on one read back from disk.
@@ -2021,6 +2039,9 @@ impl Controller<'_> {
                 },
             );
             match gpu.gates_fast(&pairs, &self.down.bytes, &self.forget.bytes, &self.gain.bytes, (self.down.rows, h)) {
+                Ok((forget, gain)) if !forget.par_iter().chain(&gain).all(|value| value.is_finite()) => {
+                    GPU_PRODUCTS_REDONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 Ok((mut forget, mut gain)) => {
                     let mut merged = vec![0.0f32; hidden.len()];
                     (merged.par_chunks_mut(h), forget.par_chunks_mut(h), gain.par_chunks_mut(h), hidden.par_chunks(h), message.par_chunks(h))
@@ -2172,7 +2193,10 @@ pub(crate) fn apply_many(gpu: Option<&Gpu>, jobs: &[(&Mat, &[f32])]) -> Vec<Seq>
             .map(|(m, xs)| DenseJob { format: m.format, weights: &m.bytes, rows: m.rows, cols: m.cols, xs })
             .collect();
         match if fast { gpu.dense_fast(&dense) } else { gpu.dense(&dense) } {
-            Ok(outs) => return outs,
+            // The fast product now and then returns NaN (see `Gpu::experts_fast`), which nothing downstream
+            // would catch: it would sit in the state and spoil every token after it.
+            Ok(outs) if !fast || outs.par_iter().all(|out| out.iter().all(|value| value.is_finite())) => return outs,
+            Ok(_) => drop(GPU_PRODUCTS_REDONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
             Err(error) => gpu_failed(&error),
         }
         }

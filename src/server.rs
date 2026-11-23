@@ -671,6 +671,7 @@ fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Jo
         bytes as f64 / 1e9,
         started.elapsed().as_secs_f32()
     );
+    eprintln!("context window: {} tokens", options.context);
     let _ = ready.send(Ok(()));
 
     let mut session = match &draft {
