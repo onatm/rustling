@@ -476,10 +476,10 @@ impl<'a> Model<'a> {
         self.run(ids, state, trace, &[])
     }
 
-    /// On M4 Max two decoder batches beat the hybrid path for a short fresh GGUF prompt.
-    /// Cached additions and larger batches did not consistently benefit.
+    /// Use at most two GPU decoder batches for a fresh short prompt. Cached additions and
+    /// larger prompts keep their usual chunk size.
     pub(crate) fn prompt_piece(&self, reused: usize, remaining: usize) -> usize {
-        if reused == 0 && remaining <= 2 * decode::MAX_BATCH && self.decodes_on_gpu() && self.gpu.as_ref().is_some_and(Gpu::is_m4_max) {
+        if reused == 0 && remaining <= 2 * decode::MAX_BATCH && self.decodes_on_gpu() {
             decode::MAX_BATCH
         } else {
             self.prompt_chunk()
