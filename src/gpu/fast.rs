@@ -278,15 +278,24 @@ impl Gpu {
             let run = PRODUCT_RUN;
             // At 3,058 prompt tokens on M4 Max this cut scheduled rows by 21% across the 48 visits.
             const DIRECT_ROWS: usize = 32;
-            let order: Vec<u32> = (0..experts as u32).filter(|&e| !tokens_of[e as usize].is_empty()).collect();
-            // Products as (position in `order`, first row).
+            #[derive(Clone, Copy)]
+            enum Matrix {
+                Direct(usize),  // Expert ID in the compressed stack.
+                Widened(usize), // Position in the compact unpacking order.
+            }
+            let mut order = Vec::new();
             let mut products = Vec::new();
             let mut token_of: Vec<u32> = Vec::new();
             let mut row_of = vec![0u32; tokens * chosen];
-            for (position, &expert) in order.iter().enumerate() {
-                for piece in tokens_of[expert as usize].chunks(run) {
+            for (expert, routed) in tokens_of.iter().enumerate() {
+                let position = order.len();
+                if routed.len() > DIRECT_ROWS {
+                    order.push(expert as u32);
+                }
+                for piece in routed.chunks(run) {
                     let first = token_of.len();
-                    products.push((position, first, piece.len()));
+                    let matrix = if piece.len() > DIRECT_ROWS { Matrix::Widened(position) } else { Matrix::Direct(expert) };
+                    products.push((matrix, first, piece.len()));
                     for &(token, route) in piece {
                         row_of[route as usize] = token_of.len() as u32;
                         token_of.push(token);
@@ -313,7 +322,7 @@ impl Gpu {
                 std::ptr::copy_nonoverlapping(row_of.as_ptr(), row_buffer.contents().as_ptr() as *mut u32, row_of.len());
                 std::ptr::copy_nonoverlapping(weights.as_ptr(), weight_buffer.contents().as_ptr() as *mut f32, weights.len());
             }
-            let order_buffer = copied(&self.device, &order)?;
+            let order_buffer = (!order.is_empty()).then(|| copied(&self.device, &order)).transpose()?;
 
             let commands = self.queue.commandBuffer().context("creating a command buffer")?;
             let step = |pipeline: &Pipeline, buffers: &[(&Buffer, usize)], params: &[u32], grid: (usize, usize)| -> Result<()> {
@@ -348,25 +357,26 @@ impl Gpu {
                 ensure!(widened.len() <= 16, "too many experts for the scratch buffers");
                 for (part, (experts, widened)) in order.chunks(per_part).zip(&widened).enumerate() {
                     let params = [out_rows as u32, cols as u32, experts.len() as u32];
-                    let buffers = [(&values_buffer, values_offset), (&order_buffer, part * per_part * 4), (widened, 0)];
+                    let buffers = [(&values_buffer, values_offset), (order_buffer.as_ref().expect("nonempty order"), part * per_part * 4), (widened, 0)];
                     self.encode(&commands, self.widen_ggml(format)?, &buffers, &params, (cols.div_ceil(256), experts.len() * out_rows))?;
                 }
-                for &(position, first, count) in &products {
-                    if count <= DIRECT_ROWS {
-                        let index = ggml_pipeline_index(format)?;
-                        ensure!(out_rows % 4 == 0, "bad expert width");
-                        let at = values_offset + order[position] as usize * out_rows * row_bytes;
-                        let buffers = [(&values_buffer, at), (from, first * cols * 4), (to, first * out_rows * 4)];
-                        step(&self.tail_ggml[index], &buffers, &[out_rows as u32, cols as u32], (out_rows * 8, count))?;
-                        continue;
+                for &(matrix, first, count) in &products {
+                    match matrix {
+                        Matrix::Direct(expert) => {
+                            let index = ggml_pipeline_index(format)?;
+                            ensure!(out_rows % 4 == 0, "bad expert width");
+                            let at = values_offset + expert * out_rows * row_bytes;
+                            let buffers = [(&values_buffer, at), (from, first * cols * 4), (to, first * out_rows * 4)];
+                            step(&self.tail_ggml[index], &buffers, &[out_rows as u32, cols as u32], (out_rows * 8, count))?;
+                        }
+                        Matrix::Widened(position) => self.multiply(
+                            &commands,
+                            (from, first * cols * 4, run, cols),
+                            (&widened[position / per_part], (position % per_part) * out_rows * cols * 4, out_rows, cols),
+                            (to, first * out_rows * 4),
+                            1,
+                        ),
                     }
-                    self.multiply(
-                        &commands,
-                        (from, first * cols * 4, run, cols),
-                        (&widened[position / per_part], (position % per_part) * out_rows * cols * 4, out_rows, cols),
-                        (to, first * out_rows * 4),
-                        1,
-                    );
                 }
                 Ok(())
             };

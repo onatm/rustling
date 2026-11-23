@@ -365,8 +365,12 @@ fn the_whole_expert_step_matches_plain_sums() {
     let (gate_up, gate_up_values) = decoded(experts * 2 * units, hidden, 1);
     let (down, down_values) = decoded(experts * hidden, units, 2);
     let x = floats(tokens * hidden, 3);
-    // Most tokens to one expert, so that it takes more than one run of rows, and one expert unused.
-    let routes: Vec<(u32, f32)> = (0..tokens).flat_map(|t| [(0u32, 0.75f32), (1 + (t % 3) as u32, 0.25 + t as f32 / 1000.0)]).collect();
+    // Expert 0 is direct-only, 1 has both kinds of run, 2 and 3 are widened, and 4 is unused.
+    // The first 16 tokens alone also exercise a submission with no widening at all.
+    let routes: Vec<(u32, f32)> = (0..tokens).flat_map(|t| {
+        let other = if t < 32 { 0 } else { 2 + (t % 2) as u32 };
+        [(1u32, 0.75f32), (other, 0.25 + t as f32 / 1000.0)]
+    }).collect();
     let job = WholeExperts {
         gate_up: (&gate_up, Format::Q8_0),
         down: (&down, Format::Q8_0),
@@ -380,6 +384,7 @@ fn the_whole_expert_step_matches_plain_sums() {
         up_cap: 25.0,
     };
     let out = gpu.experts_whole(&job).unwrap();
+    let short = gpu.experts_whole(&WholeExperts { x: &x[..16 * hidden], routes: &routes[..16 * chosen], ..job }).unwrap();
     let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f32>();
     for t in [0, 1, 255, 256, 257, tokens - 1] {
         let input = &x[t * hidden..][..hidden];
@@ -400,6 +405,9 @@ fn the_whole_expert_step_matches_plain_sums() {
         for (c, expected) in expected.iter().enumerate() {
             let got = out[t * hidden + c];
             assert!((got - expected).abs() < 1e-3 * (1.0 + expected.abs()), "token {t}, {c}: {got} against {expected}");
+            if t < 16 {
+                assert!((short[t * hidden + c] - expected).abs() < 1e-3 * (1.0 + expected.abs()), "direct-only token {t}, {c}");
+            }
         }
     }
 }
