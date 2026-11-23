@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use rustling::checkpoint::resolve_model;
+use rustling::weights::checkpoint::resolve_model;
 use rustling::prompt::Prompter;
 
 #[test]

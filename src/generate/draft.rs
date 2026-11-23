@@ -15,12 +15,12 @@
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, ensure};
-use crate::ggml::Format;
+use crate::weights::ggml::Format;
 
 use rayon::prelude::*;
 
 use crate::accel::{self, Rows};
-use crate::checkpoint::Checkpoint;
+use crate::weights::checkpoint::Checkpoint;
 use crate::config::{Config, DraftConfig};
 use crate::model::{Mat, Model, Seq, apply_many, rms_norm, sigmoid};
 use crate::timing::{self, Stage};
@@ -470,7 +470,7 @@ impl<'a> Draft<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::{companion_dir, resolve_model};
+    use crate::weights::checkpoint::{companion_dir, resolve_model};
     use crate::model::{Activations, Backend, Options};
 
     /// What a proposal costs with a long conversation behind it, without paying to process one: the draft's

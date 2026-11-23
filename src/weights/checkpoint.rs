@@ -9,8 +9,8 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 
-use crate::ggml::Format;
-use crate::quant;
+use crate::weights::ggml::Format;
+use crate::weights::quant;
 
 /// How a tensor's values are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -17,7 +17,7 @@
 use anyhow::{Context, Result, ensure};
 
 use super::{Controller, KvConv, Mat, Model, RESIDUAL_NORM_EPS, State};
-use crate::ggml::Format;
+use crate::weights::ggml::Format;
 use crate::gpu::{Gpu, Grid, Kernels, Shared, Step};
 
 /// Tokens the full layers' tables hold at first; they double when a conversation outgrows them.
@@ -528,8 +528,8 @@ impl Decoder {
         buffers.append(&mut builder.weights);
         Ok(Self {
             kernels: [
-                gpu.kernels(include_str!("../gguf.metal"), &ROW_KERNELS)?,
-                gpu.kernels(include_str!("../decode.metal"), &STEP_KERNELS)?,
+                gpu.kernels(include_str!("../gpu/shaders/gguf.metal"), &ROW_KERNELS)?,
+                gpu.kernels(include_str!("../gpu/shaders/decode.metal"), &STEP_KERNELS)?,
             ],
             steps,
             buffers,
@@ -741,7 +741,7 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::{Checkpoint, resolve_model};
+    use crate::weights::checkpoint::{Checkpoint, resolve_model};
     use crate::config::Config;
     use crate::model::{Activations, Backend, FLOAT_REFERENCE, Options};
 

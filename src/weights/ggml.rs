@@ -6,7 +6,7 @@
 
 use half::f16;
 
-use crate::quant;
+use crate::weights::quant;
 
 /// How a row of weights is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn rows_decode_as_the_reference_does() {
-        let rows: Vec<Row> = serde_json::from_str(include_str!("../tests/golden/ggml_rows.json")).unwrap();
+        let rows: Vec<Row> = serde_json::from_str(include_str!("../../tests/golden/ggml_rows.json")).unwrap();
         assert_eq!(rows.len(), 4);
         for row in rows {
             let format = match row.format.as_str() {

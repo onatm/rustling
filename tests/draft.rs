@@ -1,13 +1,13 @@
 //! The draft model, and copying from the context, must only change speed. Needs the model, and `mtp.safetensors` for the drafting test; skipped
 //! otherwise. Run with `--release`.
 
-use rustling::checkpoint::{Checkpoint, resolve_model};
+use rustling::weights::checkpoint::{Checkpoint, resolve_model};
 use rustling::config::Config;
-use rustling::draft::Draft;
+use rustling::generate::draft::Draft;
 use rustling::model::{Activations, Backend, Model, Options};
 use rustling::prompt::Prompter;
-use rustling::sampler::{Sampler, SamplerConfig};
-use rustling::session::{Limits, Session};
+use rustling::generate::sampler::{Sampler, SamplerConfig};
+use rustling::generate::session::{Limits, Session};
 
 struct Loaded {
     config: Config,

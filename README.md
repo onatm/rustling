@@ -8,26 +8,26 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | Piece | State |
 |---|---|
 | Config and layer visit order (`src/config.rs`) | done |
-| Memory-mapped checkpoint, NVFP4 / MXFP8 expert decoding (`src/checkpoint.rs`, `src/quant.rs`) | done |
+| Memory-mapped checkpoint, NVFP4 / MXFP8 expert decoding (`src/weights/checkpoint.rs`, `src/weights/quant.rs`) | done |
 | Chat template and tokenizer (`src/prompt.rs`) | done |
 | Reference dumps from transformers (`tools/golden.py`) | done |
-| Text-only forward pass in f32 (`src/model.rs`) | done; matches transformers to within its bfloat16 rounding noise (see below) |
+| Text-only forward pass in f32 (`src/model/`) | done; matches transformers to within its bfloat16 rounding noise (see below) |
 | Incremental decoding with per-visit KV and convolution state | done |
-| NEON kernels that multiply straight from NVFP4, MXFP8 and bfloat16 weights (`src/quant.rs`) | done |
+| NEON kernels that multiply straight from NVFP4, MXFP8 and bfloat16 weights (`src/weights/quant.rs`) | done |
 | Batched prompt processing: tokens share each pass over the weights, with results independent of batching | done; about 30 tokens/s for a 561-token prompt |
-| Metal backend for large batches, bit-identical to the CPU (`src/gpu.rs`, `src/shaders.metal`) | done and the default; a 2,114-token prompt in 56 s against 80 s on the CPU |
+| Metal backend for large batches, bit-identical to the CPU (`src/gpu/`) | done and the default; a 2,114-token prompt in 56 s against 80 s on the CPU |
 | Fast path for prompts of 256 tokens or more, not bit-identical: tuned matrix products on the GPU and for attention | done, opt-in with `--backend metal-fast`; a 2,413-token prompt in 35 s against 85 s on the CPU (measured before the changes below), and for a Q4_K_M conversion a 2,424-token prompt in 21 s and a 15,194-token one in 118 s |
-| Sampler: temperature, top-k, top-p, seed (`src/sampler.rs`) | done |
-| Multi-turn chat that reuses the conversation's state, with a stop on repeating output (`src/session.rs`) | done |
+| Sampler: temperature, top-k, top-p, seed (`src/generate/sampler.rs`) | done |
+| Multi-turn chat that reuses the conversation's state, with a stop on repeating output (`src/generate/session.rs`) | done |
 | OpenAI-compatible HTTP server: chat completions, streaming, tool calls (`src/server.rs`) | done |
-| Processed prompts reused across conversations and restarts (`src/cache.rs`) | done |
-| DSpark draft model: proposes several tokens at a time for the main model to check (`src/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, and it rests where it would slow things down |
-| Copying from the context: text the reply repeats is proposed in runs and checked in one batch (`src/lookup.rs`) | done, on by default; a reply that writes out code from a 15,000-token prompt went from 9.4 to 14.8 tokens/s |
+| Processed prompts reused across conversations and restarts (`src/generate/cache.rs`) | done |
+| DSpark draft model: proposes several tokens at a time for the main model to check (`src/generate/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, and it rests where it would slow things down |
+| Copying from the context: text the reply repeats is proposed in runs and checked in one batch (`src/generate/lookup.rs`) | done, on by default; a reply that writes out code from a 15,000-token prompt went from 9.4 to 14.8 tokens/s |
 | Quantised expert activations with an integer dot-product kernel, as the model was trained | done and the default; about 10 tokens/s. `--activations float` gives the transformers arithmetic |
 | Variable-loop checkpoint with a chosen pass count (`--passes`) | done; 16 tokens/s at 1 pass, 12 at 2, 9 at 3 |
-| GGUF conversions (Q4_K, Q5_0, Q6_K, Q8_0 blocks), multiplied in integer arithmetic (`src/ggml.rs`) | done; Q4_K_M at about 15 tokens/s against 10 for the checkpoint. The GPU only on the fast path |
+| GGUF conversions (Q4_K, Q5_0, Q6_K, Q8_0 blocks), multiplied in integer arithmetic (`src/weights/ggml.rs`) | done; Q4_K_M at about 15 tokens/s against 10 for the checkpoint. The GPU only on the fast path |
 | Context window limit (`--context`) | done |
-| Whole tokens on the GPU from a GGUF file, one submission each (`src/model/decode.rs`, `src/decode.metal`) | done, with `--backend metal-fast`; Q4_K_M at 24 tokens/s on a short prompt and 20 at 15,000 tokens of context, against 15 and 9.4 on the CPU |
+| Whole tokens on the GPU from a GGUF file, one submission each (`src/model/decode.rs`, `src/gpu/shaders/decode.metal`) | done, with `--backend metal-fast`; Q4_K_M at 24 tokens/s on a short prompt and 20 at 15,000 tokens of context, against 15 and 9.4 on the CPU |
 | Vision tower | later |
 
 ## Usage

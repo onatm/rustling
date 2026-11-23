@@ -24,7 +24,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::session::{Session, Snapshot};
+use crate::generate::session::{Session, Snapshot};
 
 /// A header shorter than this is not worth a snapshot of its own.
 const MIN_HEADER_TOKENS: usize = 64;

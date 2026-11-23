@@ -16,7 +16,7 @@ pub struct Prompter {
 
 impl Prompter {
     pub fn load(model_dir: &Path) -> Result<Self> {
-        let model_dir = &crate::checkpoint::companion_dir(model_dir)?;
+        let model_dir = &crate::weights::checkpoint::companion_dir(model_dir)?;
         let path = model_dir.join("chat_template.jinja");
         let source = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
 

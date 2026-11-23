@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use rustling::checkpoint::{Checkpoint, resolve_model};
+use rustling::weights::checkpoint::{Checkpoint, resolve_model};
 use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options};
 use rustling::prompt::Prompter;

@@ -4,10 +4,10 @@
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::draft::{Draft, DraftState};
-use crate::lookup::Lookup;
+use crate::generate::draft::{Draft, DraftState};
+use crate::generate::lookup::Lookup;
 use crate::model::{Model, State};
-use crate::sampler::{Sampler, Verdict};
+use crate::generate::sampler::{Sampler, Verdict};
 
 pub struct Session<'m, 'a> {
     model: &'m Model<'a>,
@@ -72,7 +72,7 @@ pub struct Drafting {
     pub accepted: usize,
     /// Tokens generated one at a time while the draft was resting because it had not been paying for itself.
     pub rested: usize,
-    /// Tokens proposed by copying from the context ([`crate::lookup`]), and how many of them stood.
+    /// Tokens proposed by copying from the context ([`crate::generate::lookup`]), and how many of them stood.
     pub copied_proposed: usize,
     pub copied_accepted: usize,
     pub copied_rounds: usize,
@@ -184,7 +184,7 @@ impl<'m, 'a> Session<'m, 'a> {
     }
 
     /// Whether to guess at coming tokens by copying what followed the same tokens earlier in the context
-    /// ([`crate::lookup`]), for the model to check in one batch. On unless turned off; like a draft model it
+    /// ([`crate::generate::lookup`]), for the model to check in one batch. On unless turned off; like a draft model it
     /// changes the speed and not what is generated.
     pub fn with_copying(mut self, copying: bool) -> Self {
         self.copying = copying;

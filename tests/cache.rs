@@ -4,12 +4,12 @@
 
 use std::path::Path;
 
-use rustling::cache::PromptCache;
-use rustling::checkpoint::{Checkpoint, resolve_model};
+use rustling::generate::cache::PromptCache;
+use rustling::weights::checkpoint::{Checkpoint, resolve_model};
 use rustling::config::Config;
 use rustling::model::{Activations, Backend, Model, Options};
 use rustling::prompt::Prompter;
-use rustling::session::Session;
+use rustling::generate::session::Session;
 
 const GIB: usize = 1 << 30;
 

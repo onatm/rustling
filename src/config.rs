@@ -83,7 +83,7 @@ pub struct LoopConfig {
 
 impl Config {
     pub fn load(model_dir: &Path) -> Result<Self> {
-        let path = crate::checkpoint::companion_dir(model_dir)?.join("config.json");
+        let path = crate::weights::checkpoint::companion_dir(model_dir)?.join("config.json");
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let config: Config = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         config.text_config.validate()?;
