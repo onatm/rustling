@@ -322,6 +322,21 @@ static inline float unit_f32(const device uchar* row, const device float* x, uin
     return acc.x + acc.y + acc.z + acc.w;
 }
 
+// The two controller gates share a rank-64 input. Each pair of lanes reduces
+// the two 32-value halves of a row, then writes the merged state directly.
+kernel void merge_gates_f32_64(const device uchar* forget [[buffer(0)]], const device uchar* gain [[buffer(1)]],
+                               const device float* low [[buffer(2)]], const device float* hidden [[buffer(3)]],
+                               const device float* message [[buffer(4)]], device float* out [[buffer(5)]],
+                               constant uint& stride [[buffer(6)]], uint3 group [[threadgroup_position_in_grid]],
+                               ushort lane [[thread_index_in_threadgroup]]) {
+    uint shift = group.z * stride, row = group.x * 16 + lane / 2;
+    float f = unit_f32(forget + row * 256, low + shift, lane % 2);
+    float g = unit_f32(gain + row * 256, low + shift, lane % 2);
+    f += simd_shuffle_xor(f, 1);
+    g += simd_shuffle_xor(g, 1);
+    if (lane % 2 == 0) out[shift + row] = (1.f - tanh(f)) * hidden[shift + row] + tanh(g) * message[shift + row];
+}
+
 struct RowParams {
     uint rows;
     uint cols;

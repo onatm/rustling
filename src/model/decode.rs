@@ -39,9 +39,10 @@ const SCORES: usize = 2;
 const TABLES: usize = 3;
 
 // Kernels, by their place in the two lists they are built from.
-const ROW_KERNELS: [&str; 10] = ["row_q4k", "row_q5_0", "row_q6k", "row_q8_0", "row_f32", "row_bf16", "row_nvfp4", "row_q5k", "expert_scale", "q8_attention_projections"];
+const ROW_KERNELS: [&str; 11] = ["row_q4k", "row_q5_0", "row_q6k", "row_q8_0", "row_f32", "row_bf16", "row_nvfp4", "row_q5k", "expert_scale", "q8_attention_projections", "merge_gates_f32_64"];
 const EXPERT_SCALE: usize = 8;
 const Q8_ATTENTION_PROJECTIONS: usize = 9;
+const MERGE_GATES_F32_64: usize = 10;
 const STEP_KERNELS: [&str; 16] = [
     "rms_norm", "scale_clip", "residual_read", "merge", "conv", "distance_bias", "attention_scores",
     "attention_weights", "attention_values", "store", "route", "activation", "combine", "soft_cap", "attention_blocks", "attention_reduce",
@@ -311,6 +312,13 @@ impl<'m, 'a> Builder<'m, 'a> {
         self.norm_into(hidden, pair, None, h, 1, eps);
         self.norm_into(message, pair + h, None, h, 1, eps);
         let low = self.product(&controller.down, pair)?;
+        if h % 16 == 0 && [&controller.forget, &controller.gain].iter().all(|m| m.format == Format::F32 && m.cols == 64) {
+            let out = self.alloc(h);
+            let mut buffers = vec![self.weight(&controller.forget.bytes)?, self.weight(&controller.gain.bytes)?];
+            buffers.extend([low, hidden, message, out].map(|at| (SCRATCH, at * 4)));
+            self.step(MERGE_GATES_F32_64, buffers, &[], Grid::Groups(h / 16, 1));
+            return Ok(out);
+        }
         let (forget, gain) = (self.product(&controller.forget, low)?, self.product(&controller.gain, low)?);
         let out = self.alloc(h);
         let buffers = [hidden, message, forget, gain, out].map(|at| (SCRATCH, at * 4)).to_vec();
