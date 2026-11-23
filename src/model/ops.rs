@@ -47,17 +47,19 @@ pub(super) fn per_token<T: Send>(tokens: usize, work: impl Fn(usize) -> T + Sync
 
 /// Prepends the convolution's remembered inputs to `x` and remembers the most recent of the result.
 /// Returns the joined context and how many remembered vectors lead it.
-pub(super) fn with_history(history: &mut Vec<f32>, x: &[f32], channels: usize, k: usize) -> (Vec<f32>, usize) {
+pub(super) fn with_history(history: &mut ConvHistory, x: &[f32], channels: usize, k: usize) -> (Vec<f32>, usize) {
     let seen = history.len() / channels;
-    let context = [history.as_slice(), x].concat();
+    let (front, back) = history.as_slices();
+    let context = [front, back, x].concat();
     let keep = (k - 1 + MAX_ROLLBACK).min(context.len() / channels) * channels;
-    *history = context[context.len() - keep..].to_vec();
+    history.clear();
+    history.extend(context[context.len() - keep..].iter().copied());
     (context, seen)
 }
 
 /// Causal depthwise convolution with a residual: `(conv(x) + x) / sqrt(kernel + 1)`. `weight` is
 /// `[channels, kernel]` with the last tap on the current token. `history` carries the inputs of earlier calls.
-pub(super) fn static_conv(x: &[f32], weight: &[f32], channels: usize, k: usize, history: &mut Vec<f32>) -> Seq {
+pub(super) fn static_conv(x: &[f32], weight: &[f32], channels: usize, k: usize, history: &mut ConvHistory) -> Seq {
     let scale = 1.0 / ((k + 1) as f32).sqrt();
     let (context, seen) = with_history(history, x, channels, k);
     let mut out = vec![0.0f32; x.len()];

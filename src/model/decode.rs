@@ -658,7 +658,12 @@ impl Decoder {
             for ((history, at), channels) in visit.convs.iter().zip(slots.histories).zip(visit.conv_channels) {
                 // The most recent inputs, ending where the kernel expects the latest.
                 let wanted = ((k - 1) * channels).min(history.len());
-                floats[at + (k - 1) * channels - wanted..][..wanted].copy_from_slice(&history[history.len() - wanted..]);
+                let dest = &mut floats[at + (k - 1) * channels - wanted..][..wanted];
+                let (front, back) = history.as_slices();
+                let from_back = back.len().min(wanted);
+                let (a, b) = dest.split_at_mut(wanted - from_back);
+                a.copy_from_slice(&front[front.len() - a.len()..]);
+                b.copy_from_slice(&back[back.len() - from_back..]);
             }
         }
 
@@ -1102,6 +1107,13 @@ mod tests {
         single(&mut state, ids(1)[0], "the original");
         single(&mut copy, ids(1)[0], "a copy");
         single(&mut state, ids(1)[0], "the original again");
+        // Persist wrapped convolution histories in logical order, then continue from disk.
+        let bytes = postcard::to_allocvec(&state).unwrap();
+        let mut restored: State = postcard::from_bytes(&bytes).unwrap();
+        let next = ids(1);
+        let expected = model.forward(&next, &mut state, false).unwrap();
+        let actual = model.forward(&next, &mut restored, false).unwrap();
+        assert!(expected.logits == actual.logits, "resuming a serialized state changed the next logits");
         eprintln!("{checked} tokens matched at position {}", state.position());
     }
 

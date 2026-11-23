@@ -1,6 +1,10 @@
 //! What the tokens seen so far leave behind for the tokens to come, and stepping back in it.
 
 use super::*;
+use std::collections::VecDeque;
+
+// Serde writes VecDeque in logical order, with the same sequence format as Vec.
+pub(super) type ConvHistory = VecDeque<f32>;
 
 /// Everything the tokens seen so far left behind for the tokens to come.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -20,7 +24,7 @@ impl State {
         let floats: usize = self
             .visits
             .iter()
-            .map(|v| v.convs.iter().map(Vec::len).sum::<usize>())
+            .map(|v| v.convs.iter().map(ConvHistory::len).sum::<usize>())
             .sum();
         floats * size_of::<f32>() + self.visits.iter().map(|v| v.keys.bytes() + v.values.bytes()).sum::<usize>()
     }
@@ -81,7 +85,7 @@ pub struct Mark {
 #[derive(Clone)]
 pub(super) struct VisitMark {
     pub(super) first: usize,
-    pub(super) convs: [Vec<f32>; 4],
+    pub(super) convs: [ConvHistory; 4],
     /// The keys and values, for a visit that drops old ones.
     pub(super) window: Option<(Table, Table)>,
 }
@@ -123,7 +127,7 @@ pub(super) struct VisitState {
     pub(super) first: usize,
     /// The recent inputs of the key, value, post-attention and post-MLP convolutions: the `kernel - 1` they
     /// need, and up to [`MAX_ROLLBACK`] more so recent tokens can be taken back.
-    pub(super) convs: [Vec<f32>; 4],
+    pub(super) convs: [ConvHistory; 4],
     /// The width of each convolution's input.
     pub(super) conv_channels: [usize; 4],
 }
@@ -133,9 +137,9 @@ impl VisitState {
     #[cfg(target_os = "macos")]
     pub(super) fn push_conv_inputs(&mut self, cfg: &TextConfig, conv_inputs: [&[f32]; 4]) {
         for ((history, input), channels) in self.convs.iter_mut().zip(conv_inputs).zip(self.conv_channels) {
-            history.extend_from_slice(input);
             let keep = (cfg.sconv_kernel_size - 1 + MAX_ROLLBACK) * channels;
-            history.drain(..history.len().saturating_sub(keep));
+            history.drain(..(history.len() + input.len()).saturating_sub(keep));
+            history.extend(input.iter().copied());
         }
     }
 
@@ -156,4 +160,3 @@ impl VisitState {
         }
     }
 }
-

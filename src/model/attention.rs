@@ -394,7 +394,7 @@ impl KvConv<'_> {
         dynamic_input: &Seq,
         channels: usize,
         cfg: &TextConfig,
-        history: &mut Vec<f32>,
+        history: &mut ConvHistory,
         bf16: bool,
     ) -> Seq {
         let k = cfg.sconv_kernel_size;

@@ -923,13 +923,13 @@ mod tests {
     #[test]
     fn static_conv_is_causal_and_ends_on_the_current_token() {
         // One channel, kernel 2, taps [previous, current] = [10, 1].
-        let out = static_conv(&[1.0, 2.0, 3.0], &[10.0, 1.0], 1, 2, &mut Vec::new());
+        let out = static_conv(&[1.0, 2.0, 3.0], &[10.0, 1.0], 1, 2, &mut ConvHistory::new());
         let scale = 1.0 / 3f32.sqrt();
         let expected = [(1.0 + 1.0) * scale, (10.0 + 2.0 + 2.0) * scale, (20.0 + 3.0 + 3.0) * scale];
         assert_eq!(out, expected);
 
         // Fed one token at a time, the history carries the earlier inputs across calls.
-        let mut history = Vec::new();
+        let mut history = ConvHistory::new();
         let stepped: Vec<f32> =
             [1.0, 2.0, 3.0].iter().flat_map(|x| static_conv(&[*x], &[10.0, 1.0], 1, 2, &mut history)).collect();
         assert_eq!(stepped, expected);
