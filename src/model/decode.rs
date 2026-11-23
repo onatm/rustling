@@ -208,6 +208,9 @@ impl<'m, 'a> Builder<'m, 'a> {
         let weights = self.weight(bytes)?;
         // More rows to a group of threads for a large product, where starting threads is what costs.
         let together = match rows * matrices {
+            // The short-context decode benchmark favors more lanes per row for these products.
+            _ if format == Format::Q8_0 && matrices == 1 && rows < 16384 => 2,
+            _ if format == Format::Nvfp4 && matrices > 1 => 4,
             work if work >= 16384 => 8,
             work if work >= 1024 => 4,
             _ => 1,
