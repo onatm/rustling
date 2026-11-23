@@ -26,6 +26,13 @@ pub struct Sampler {
     rng: StdRng,
     /// A token that is never chosen, whatever its logit.
     banned: Option<u32>,
+    scratch: Scratch,
+}
+
+#[derive(Default)]
+struct Scratch {
+    /// Weights in token-ID order when top-k leaves the entire vocabulary.
+    weights: Vec<f64>,
 }
 
 impl Sampler {
@@ -35,7 +42,7 @@ impl Sampler {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => rand::make_rng(),
         };
-        Self { config, rng, banned: None }
+        Self { config, rng, banned: None, scratch: Scratch::default() }
     }
 
     /// The same sampler, never choosing `token`. This is how reasoning is switched off: the token that opens a
@@ -46,9 +53,10 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
-        match self.candidates(logits) {
+        match self.scratch.candidates(self.config, self.banned, logits) {
             Candidates::Greedy(token) => token,
-            Candidates::Weighted(candidates) => self.draw(&candidates, None),
+            Candidates::Dense(weights) => draw(&mut self.rng, in_order(weights)),
+            Candidates::Weighted(candidates) => draw(&mut self.rng, candidates.iter().copied()),
         }
     }
 
@@ -57,44 +65,56 @@ impl Sampler {
     /// the proposal is kept with the probability sampling would have given it, and otherwise the replacement
     /// is drawn from the remaining tokens.
     pub fn verify(&mut self, logits: &[f32], proposed: u32) -> Verdict {
-        match self.candidates(logits) {
+        match self.scratch.candidates(self.config, self.banned, logits) {
             Candidates::Greedy(token) if token == proposed => Verdict::Accepted,
             Candidates::Greedy(token) => Verdict::Replaced(token),
+            Candidates::Dense(weights) => {
+                let weight = weights.get(proposed as usize).copied().unwrap_or(0.0);
+                verify_weight(&mut self.rng, in_order(weights), proposed, weight)
+            }
             Candidates::Weighted(candidates) => {
-                let total: f64 = candidates.iter().map(|(_, weight)| weight).sum();
                 let weight = candidates.iter().find(|(token, _)| *token == proposed).map_or(0.0, |(_, w)| *w);
-                // With the proposal as the only candidate there is nothing to replace it with.
-                if self.rng.random::<f64>() * total < weight || candidates.len() == 1 && weight > 0.0 {
-                    Verdict::Accepted
-                } else {
-                    Verdict::Replaced(self.draw(&candidates, Some(proposed)))
-                }
+                verify_weight(&mut self.rng, candidates.iter().copied(), proposed, weight)
             }
         }
     }
+}
 
-    /// Draws from weighted candidates, optionally leaving one token out.
-    fn draw(&mut self, candidates: &[(u32, f64)], except: Option<u32>) -> u32 {
-        let allowed = |token: u32| Some(token) != except;
-        let total: f64 = candidates.iter().filter(|(token, _)| allowed(*token)).map(|(_, weight)| weight).sum();
-        let mut remaining = self.rng.random::<f64>() * total;
-        let mut last = None;
-        for &(token, weight) in candidates.iter().filter(|(token, _)| allowed(*token)) {
-            remaining -= weight;
-            if remaining < 0.0 {
-                return token;
-            }
-            last = Some(token);
-        }
-        // Only reachable through rounding at the very end of the range.
-        last.expect("at least one candidate")
+fn in_order(weights: &[f64]) -> impl ExactSizeIterator<Item = (u32, f64)> + Clone {
+    weights.iter().enumerate().map(|(id, &w)| (id as u32, w))
+}
+
+fn verify_weight(rng: &mut StdRng, candidates: impl ExactSizeIterator<Item = (u32, f64)> + Clone, proposed: u32, weight: f64) -> Verdict {
+    let total: f64 = candidates.clone().map(|(_, w)| w).sum();
+    if rng.random::<f64>() * total < weight || candidates.len() == 1 && weight > 0.0 {
+        Verdict::Accepted
+    } else {
+        // Sum the remaining candidates in their original order, so seeded replacements stay reproducible.
+        Verdict::Replaced(draw(rng, candidates.filter(|&(id, _)| id != proposed)))
     }
+}
 
+fn draw(rng: &mut StdRng, candidates: impl Iterator<Item = (u32, f64)> + Clone) -> u32 {
+    let total: f64 = candidates.clone().map(|(_, weight)| weight).sum();
+    let mut remaining = rng.random::<f64>() * total;
+    let mut last = None;
+    for (token, weight) in candidates {
+        remaining -= weight;
+        if remaining < 0.0 {
+            return token;
+        }
+        last = Some(token);
+    }
+    // Only reachable through rounding at the very end of the range.
+    last.expect("at least one candidate")
+}
+
+impl Scratch {
     /// The tokens sampling can choose from, with unnormalised probabilities, after temperature, top-k and top-p.
-    fn candidates(&self, logits: &[f32]) -> Candidates {
-        let SamplerConfig { temperature, top_k, top_p } = self.config;
+    fn candidates(&mut self, config: SamplerConfig, banned: Option<u32>, logits: &[f32]) -> Candidates<'_> {
+        let SamplerConfig { temperature, top_k, top_p } = config;
         let without_banned;
-        let logits = match self.banned.filter(|&token| (token as usize) < logits.len()) {
+        let logits = match banned.filter(|&token| (token as usize) < logits.len()) {
             Some(token) => {
                 without_banned = { let mut copy = logits.to_vec(); copy[token as usize] = f32::NEG_INFINITY; copy };
                 &without_banned[..]
@@ -106,6 +126,15 @@ impl Sampler {
             return Candidates::Greedy((0..logits.len() as u32).min_by(descending).expect("logits are not empty"));
         }
 
+        let dense = top_k == 0 || top_k >= logits.len();
+        if dense {
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            self.weights.clear();
+            self.weights.extend(logits.iter().map(|&logit| (((logit - max) / temperature) as f64).exp()));
+            if top_p >= 1.0 {
+                return Candidates::Dense(&self.weights);
+            }
+        }
         let mut candidates: Vec<u32> = (0..logits.len() as u32).collect();
         if top_k > 0 && top_k < candidates.len() {
             candidates.select_nth_unstable_by(top_k - 1, descending);
@@ -113,11 +142,15 @@ impl Sampler {
         }
 
         // Softmax over the candidates, in f64 so the tail of a 200k-token vocabulary does not round away.
-        let max = candidates.iter().map(|&id| logits[id as usize]).fold(f32::NEG_INFINITY, f32::max);
-        let weight = |id: u32| (((logits[id as usize] - max) / temperature) as f64).exp();
+        let max = if dense { 0.0 } else { candidates.iter().map(|&id| logits[id as usize]).fold(f32::NEG_INFINITY, f32::max) };
+        let weight = |id: u32| if dense {
+            self.weights[id as usize]
+        } else {
+            (((logits[id as usize] - max) / temperature) as f64).exp()
+        };
 
         if top_p < 1.0 {
-            let total: f64 = candidates.iter().map(|&id| weight(id)).sum();
+            let total: f64 = if dense { self.weights.iter().sum() } else { candidates.iter().map(|&id| weight(id)).sum() };
             // Sort only as much of the head as the nucleus needs, doubling until it is covered.
             let target = top_p.max(0.0) as f64 * total;
             let mut sorted = 0;
@@ -141,9 +174,10 @@ impl Sampler {
     }
 }
 
-enum Candidates {
+enum Candidates<'a> {
     /// Sampling is deterministic: always this token.
     Greedy(u32),
+    Dense(&'a [f64]),
     Weighted(Vec<(u32, f64)>),
 }
 
