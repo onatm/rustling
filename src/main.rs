@@ -488,6 +488,10 @@ fn generate(model_dir: &std::path::Path, text: &str, run: &RunArgs, top: bool, t
         if redone > 0 {
             eprintln!("{redone} experts were recomputed on the CPU after the GPU returned NaN");
         }
+        let redone = rustling::model::GPU_ATTENTION_REDONE.load(std::sync::atomic::Ordering::Relaxed);
+        if redone > 0 {
+            eprintln!("{redone} stretches of attention were recomputed on the CPU after the GPU returned NaN");
+        }
     }
 
     let started = Instant::now();

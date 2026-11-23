@@ -16,7 +16,7 @@ use crate::accel;
 use crate::checkpoint::{Checkpoint, ExpertMatrix, Experts};
 use crate::config::{Config, TextConfig};
 #[cfg(target_os = "macos")]
-use crate::gpu::{DenseJob, ExpertJob, Gpu, Stack};
+use crate::gpu::{AttendHead, AttendShape, DenseJob, ExpertJob, Gpu, Stack, WholeExperts};
 use crate::timing::{self, Stage, time};
 use crate::trace;
 use crate::quant::{
@@ -50,9 +50,21 @@ const GPU_FAST_EXPERT_SHARE: f32 = 0.75;
 /// How many experts' GPU results had to be recomputed on the CPU, for the timing report.
 pub static GPU_EXPERTS_REDONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many stretches of attention had to be recomputed on the CPU, for the timing report.
+pub static GPU_ATTENTION_REDONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Prompt tokens per pass on the fast path. Unpacking the weights for the GPU costs the same however many tokens
-/// follow, so long passes pay off: a 2,400-token prompt took 29 s in passes of 512 and 23 s in passes of 2,048.
-const FAST_PROMPT_CHUNK: usize = 2048;
+/// follow, so long passes pay off: a 2,400-token prompt took 29 s in passes of 512 and 23 s in passes of 2,048,
+/// and a 15,000-token one 211 s in passes of 2,048 and 175 s in passes of 4,096. Longer made no difference.
+const FAST_PROMPT_CHUNK: usize = 4096;
+
+/// The most tokens of a sliding layer whose fast attention is computed together.
+#[cfg(target_os = "macos")]
+const FAST_LOCAL_STRETCH: usize = 1024;
+
+/// A stretch of fast attention goes to the GPU when its rows times its keys come to at least this.
+#[cfg(target_os = "macos")]
+const GPU_ATTENTION_MIN_WEIGHTS: usize = 1 << 20;
 
 /// Prompt tokens per pass otherwise: enough to share each read of the weights, with memory still bounded.
 const PROMPT_CHUNK: usize = 512;
@@ -804,7 +816,7 @@ impl<'a> Model<'a> {
             let input = |i: usize| {
                 let read = &reads[if layer.local { 0 } else { i }];
                 let mut x = match gates {
-                    Some((controllers, messages)) => controllers[i].merge(read, &messages[i], h, eps, bf16),
+                    Some((controllers, messages)) => controllers[i].merge(self.gpu.as_ref(), read, &messages[i], h, eps, bf16),
                     None => read.clone(),
                 };
                 let norm = &layer.input_norms[if layer.local { 0 } else { i }];
@@ -850,7 +862,7 @@ impl<'a> Model<'a> {
         let x = time(Stage::Inputs, || {
             let mut x = attn_res(&layer.mlp_query, &block_refs, &residual, h).remove(0);
             if let Some((controllers, messages)) = gates {
-                x = controllers[3].merge(&x, &messages[3], h, eps, bf16);
+                x = controllers[3].merge(self.gpu.as_ref(), &x, &messages[3], h, eps, bf16);
             }
             x.chunks_exact_mut(h).for_each(|x| rms_norm(x, Some(&layer.mlp_norm), eps));
             round_all(bf16, &mut x);
@@ -1110,6 +1122,9 @@ impl<'a> Model<'a> {
             // A stretch of tokens at a time, as many as keep the weights within bounds.
             let longest = position + tokens - window_start(position);
             let stretch = (FAST_ATTENTION_WEIGHTS / (group * longest)).clamp(1, tokens);
+            // A sliding layer's rows see only a window's worth of the keys their stretch covers, and the rest of
+            // each product is wasted, so its stretches are kept short.
+            let stretch = if layer.local { stretch.min(FAST_LOCAL_STRETCH) } else { stretch };
             for i0 in (0..tokens).step_by(stretch) {
                 let count = stretch.min(tokens - i0);
                 // Every key any of these tokens can see; a row uses its own part of them.
@@ -1154,11 +1169,67 @@ impl<'a> Model<'a> {
                     accel::multiply(mine, context, false, 1.0, &mut attended);
                     attended
                 };
-                // A few tokens make products too small for the routine to spread over the cores itself, so the
-                // key heads go a core each; a long batch fills the cores from inside one product.
-                let attended: Vec<Vec<f32>> = match count < FAST_MIN_TOKENS {
-                    true => (0..kv_heads).into_par_iter().map(attend).collect(),
-                    false => (0..kv_heads).map(attend).collect(),
+                // A long stretch goes to the GPU whole: the same products and softmax, an order of magnitude
+                // faster once every row meets thousands of keys. Anything it gets wrong, the CPU redoes.
+                let on_gpu = || -> Option<Vec<Vec<f32>>> {
+                    let gpu = self.gpu.as_ref().filter(|_| rows * keys >= GPU_ATTENTION_MIN_WEIGHTS)?;
+                    let from = (lowest - cached_from) * dim;
+                    // Each key head's rows: for every token, the query heads that share it.
+                    let gathered: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = (0..kv_heads)
+                        .into_par_iter()
+                        .map(|kv| {
+                            let (mut queries, mut rels, mut row_sinks) = (Vec::new(), Vec::new(), Vec::new());
+                            for i in i0..i0 + count {
+                                queries.extend_from_slice(&q[i * q_dim + kv * group * dim..][..group * dim]);
+                                rels.extend_from_slice(&rel[(i * heads + kv * group) * d_rel..][..group * d_rel]);
+                                row_sinks.extend_from_slice(&sinks[i * heads + kv * group..][..group]);
+                            }
+                            (queries, rels, row_sinks)
+                        })
+                        .collect();
+                    let jobs: Vec<AttendHead> = gathered
+                        .iter()
+                        .enumerate()
+                        .map(|(kv, (queries, rels, row_sinks))| AttendHead {
+                            queries,
+                            keys: &k[kv][from..],
+                            values: &v[kv][from..],
+                            rel: rels,
+                            sinks: row_sinks,
+                        })
+                        .collect();
+                    let shape = AttendShape {
+                        rows,
+                        keys,
+                        dim,
+                        d_rel,
+                        extent,
+                        profiles: &layer.rel_proj,
+                        share: group,
+                        first: position + i0,
+                        lowest,
+                        local: layer.local,
+                        window: cfg.sliding_window_size,
+                        scaling,
+                    };
+                    match gpu.attend_fast(&jobs, &shape) {
+                        Ok(outputs) if outputs.par_iter().all(|head| head.iter().all(|value| value.is_finite())) => Some(outputs),
+                        Ok(_) => {
+                            GPU_ATTENTION_REDONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            None
+                        }
+                        Err(error) => {
+                            gpu_failed(&error);
+                            None
+                        }
+                    }
+                };
+                // On the CPU, a few tokens make products too small for the routine to spread over the cores
+                // itself, so the key heads go a core each; a long batch fills the cores from inside one product.
+                let attended: Vec<Vec<f32>> = match on_gpu() {
+                    Some(attended) => attended,
+                    None if count < FAST_MIN_TOKENS => (0..kv_heads).into_par_iter().map(attend).collect(),
+                    None => (0..kv_heads).map(attend).collect(),
                 };
                 for (kv, attended) in attended.iter().enumerate() {
                     for (row, attended) in attended.chunks_exact(dim).enumerate() {
@@ -1208,6 +1279,8 @@ impl<'a> Model<'a> {
 
         // tokens_of[expert] lists the (token, weight) pairs routed to it.
         let mut tokens_of: Vec<Vec<(usize, f32)>> = vec![Vec::new(); cfg.n_routed_experts];
+        // The same in token order: each token's experts and their weights.
+        let mut routes: Vec<(u32, f32)> = Vec::with_capacity(x.len() / h * top_k);
         let scores = layer.router.apply(x);
         if layer.traced {
             trace::record("router_logits", &scores);
@@ -1220,7 +1293,14 @@ impl<'a> Model<'a> {
             let total: f32 = chosen.iter().map(|&e| scores[e]).sum::<f32>() + 1e-20;
             for &e in chosen {
                 tokens_of[e].push((t, scores[e] / total * cfg.route_scale));
+                routes.push((e as u32, scores[e] / total * cfg.route_scale));
             }
+        }
+
+        // A long batch from a GGUF file on the fast path: the whole step on the GPU.
+        #[cfg(target_os = "macos")]
+        if let Some(out) = self.experts_on_gpu(layer, x, &routes) {
+            return out;
         }
 
         let contributions = match self.activations {
@@ -1234,6 +1314,42 @@ impl<'a> Model<'a> {
         }
         round_all(self.bf16(), &mut out);
         out
+    }
+
+    /// The experts of a long batch entirely on the GPU, when the model is set up for it; nothing otherwise, or
+    /// when the GPU fails or returns values that are not finite, and the caller takes the usual route.
+    #[cfg(target_os = "macos")]
+    fn experts_on_gpu(&self, layer: &Layer, x: &Seq, routes: &[(u32, f32)]) -> Option<Seq> {
+        let cfg = &self.cfg;
+        let experts = &layer.experts;
+        let gpu = self.gpu.as_ref().filter(|gpu| gpu.fast() && x.len() / cfg.hidden_size >= FAST_MIN_TOKENS)?;
+        let (gate_up, down) = (experts.gate_up.ggml()?, experts.down.ggml()?);
+        if experts.interleaved || float_reference() {
+            return None;
+        }
+        let job = WholeExperts {
+            gate_up: (experts.gate_up.raw_parts().0, gate_up),
+            down: (experts.down.raw_parts().0, down),
+            experts: cfg.n_routed_experts,
+            hidden: cfg.hidden_size,
+            units: cfg.intermediate_size,
+            chosen: cfg.num_experts_per_tok,
+            x,
+            routes,
+            gate_cap: cfg.mlp_gate_softcap,
+            up_cap: cfg.mlp_up_softcap,
+        };
+        match gpu.experts_whole(&job) {
+            Ok(out) if out.par_iter().all(|value| value.is_finite()) => Some(out),
+            Ok(_) => {
+                GPU_EXPERTS_REDONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+            Err(error) => {
+                gpu_failed(&error);
+                None
+            }
+        }
     }
 
     /// Expert outputs with f32 activations, as transformers computes them. Returns `(token, output)` pairs,
@@ -1839,7 +1955,42 @@ impl KvConv<'_> {
 
 impl Controller<'_> {
     /// `(1 - forget) * hidden + gain * message`, with both gates read from the normed pair through a low rank.
-    fn merge(&self, hidden: &Seq, message: &Seq, h: usize, eps: f32, bf16: bool) -> Seq {
+    fn merge(&self, gpu: Option<&Gpu>, hidden: &Seq, message: &Seq, h: usize, eps: f32, bf16: bool) -> Seq {
+        // A long batch on the fast path: the three products on the GPU, which is several times quicker at them
+        // than every core together.
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = gpu.filter(|gpu| gpu.fast() && hidden.len() / h >= FAST_MIN_TOKENS && !bf16)
+            && [&self.down, &self.forget, &self.gain].iter().all(|matrix| matrix.format == Format::F32)
+        {
+            let mut pairs = vec![0.0f32; 2 * hidden.len()];
+            pairs.par_chunks_exact_mut(2 * h).zip(hidden.par_chunks_exact(h)).zip(message.par_chunks_exact(h)).for_each(
+                |((pair, hidden), message)| {
+                    let (a, b) = pair.split_at_mut(h);
+                    a.copy_from_slice(hidden);
+                    b.copy_from_slice(message);
+                    rms_norm(a, None, eps);
+                    rms_norm(b, None, eps);
+                },
+            );
+            match gpu.gates_fast(&pairs, &self.down.bytes, &self.forget.bytes, &self.gain.bytes, (self.down.rows, h)) {
+                Ok((mut forget, mut gain)) => {
+                    let mut merged = vec![0.0f32; hidden.len()];
+                    (merged.par_chunks_mut(h), forget.par_chunks_mut(h), gain.par_chunks_mut(h), hidden.par_chunks(h), message.par_chunks(h))
+                        .into_par_iter()
+                        .for_each(|(merged, forget, gain, hidden, message)| {
+                            accel::tanh_in_place(forget);
+                            accel::tanh_in_place(gain);
+                            for i in 0..h {
+                                merged[i] = (1.0 - forget[i]) * hidden[i] + gain[i] * message[i];
+                            }
+                        });
+                    return merged;
+                }
+                Err(error) => gpu_failed(&error),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = gpu;
         let merged = per_token(hidden.len() / h, |t| {
             let (hidden, message) = (&hidden[t * h..][..h], &message[t * h..][..h]);
             let mut pair = [hidden, message].concat();

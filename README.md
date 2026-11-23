@@ -16,7 +16,7 @@ It reads the published checkpoint directly, in its native NVFP4 and MXFP8 precis
 | NEON kernels that multiply straight from NVFP4, MXFP8 and bfloat16 weights (`src/quant.rs`) | done |
 | Batched prompt processing: tokens share each pass over the weights, with results independent of batching | done; about 30 tokens/s for a 561-token prompt |
 | Metal backend for large batches, bit-identical to the CPU (`src/gpu.rs`, `src/shaders.metal`) | done and the default; a 2,114-token prompt in 56 s against 80 s on the CPU |
-| Fast path for prompts of 256 tokens or more, not bit-identical: tuned matrix products on the GPU and for attention | done, opt-in with `--backend metal-fast`; a 2,413-token prompt in 35 s against 85 s on the CPU, and in 24 s against 50 s for a Q4_K_M conversion |
+| Fast path for prompts of 256 tokens or more, not bit-identical: tuned matrix products on the GPU and for attention | done, opt-in with `--backend metal-fast`; a 2,413-token prompt in 35 s against 85 s on the CPU (measured before the changes below), and for a Q4_K_M conversion a 2,424-token prompt in 21 s and a 15,194-token one in 118 s |
 | Sampler: temperature, top-k, top-p, seed (`src/sampler.rs`) | done |
 | Multi-turn chat that reuses the conversation's state, with a stop on repeating output (`src/session.rs`) | done |
 | OpenAI-compatible HTTP server: chat completions, streaming, tool calls (`src/server.rs`) | done |
@@ -52,7 +52,7 @@ cargo run --release -- generate "Hello" --backend cpu   # default is auto: Metal
 | `--backend` | Long prompts (256+ tokens) | Results |
 |---|---|---|
 | `auto` (default), `metal` | GPU kernels that repeat the CPU's arithmetic step for step | identical to the CPU's |
-| `metal-fast` | weights widened to float on the GPU, then Apple's tuned matrix product; attention by the same kind of product on the CPU | differ from the CPU's in the last bits |
+| `metal-fast` | weights widened to float on the GPU, then Apple's tuned matrix product; attention by the same kind of product, on the GPU for long stretches | differ from the CPU's in the last bits |
 | `cpu` | NEON kernels | the reference |
 
 Shorter batches and token-by-token generation use the exact kernels on every backend.
@@ -97,9 +97,21 @@ rustling --model ~/models/Inkling-2-Mini-Q4_K_M.gguf serve
 - **Accuracy**: a conversion is a lossy copy. On a passage of prose, Q4_K_M and the checkpoint agreed on the most
   likely next token at 80% of positions (`tests/gguf.rs`); the 8-bit rounding did not change that figure.
 - **Long prompts**: `--backend metal-fast` works with GGUF files too. The GPU unpacks the blocks to float for the
-  attention projections and for the experts with the most tokens, while the CPU does the remaining experts in
-  integers. Its inputs are not rounded to 8 bits, so it differs from the CPU a little more than in the last
-  bits; on a prose test the two predicted the same token at 23 of 25 positions.
+  attention projections and the experts. Its inputs are not rounded to 8 bits, so it differs from the CPU a
+  little more than in the last bits; on a prose test the two predicted the same token at 23 of 25 positions.
+  On an M1 Max a 15,194-token prompt takes 118 s (129 tokens/s), where it took 211 s before the following:
+  - A layer's experts are one submission: the tokens' inputs laid out under their experts, the first product,
+    the activation, the second product and each token's weighted sum, with nothing coming back to the CPU in
+    between. Carrying about 1.5 GB a visit to and from the GPU was more than half the experts' time.
+  - Attention over a long stretch runs on the GPU: the scores and the value sums as matrix products, and a kernel
+    between them for the distance bias, the window and the softmax. In the full-attention layers every token
+    meets the whole prompt, which the CPU's cores took 74 s over and this takes 24 s.
+  - The products of the message merges run there too.
+  - Passes are 4,096 tokens: unpacking a layer's expert weights, about 4 GB of floats, costs the same however
+    many tokens follow.
+  - Every expert product has the same shape, 256 rows, padded with zeros. Apple's matrix product returns NaN
+    for half the outputs of products of some sizes, repeatably, and at this one it has not; the results are
+    still checked and redone on the CPU if need be.
 - **Not available with GGUF**: the exact Metal backend (`auto` and `cpu` are the same thing), and `--activations`
   (the experts are no longer in the formats the model's activations were trained against).
 

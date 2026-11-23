@@ -25,6 +25,13 @@ use crate::quant::{E4M3, Nvfp4Activation};
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
+/// The most bytes of unpacked expert weights kept in one buffer.
+const WIDENED_BYTES: usize = 1 << 30;
+
+/// The most input vectors given to one expert product on the fast path. With runs of 512 a few products of a
+/// 3,774-token prompt still came back with NaN; with 256 none did.
+const EXPERT_RUN: usize = 256;
+
 /// Apple silicon pages; `newBufferWithBytesNoCopy` needs whole pages.
 const PAGE: usize = 16384;
 
@@ -38,6 +45,12 @@ pub struct Gpu {
     widen_mxfp8: Pipeline,
     /// Unpacking kernels for a GGUF file's block formats: Q4_K, Q5_0, Q6_K, Q8_0.
     widen_ggml: [Pipeline; 4],
+    /// Turns a long batch's attention scores into weights.
+    prompt_weights: Pipeline,
+    /// The steps between a long batch's two expert products: gather, activation, weighted sum.
+    expert_steps: [Pipeline; 3],
+    /// Held while a message merge's gates use their scratch buffers.
+    gates: Mutex<()>,
     e4m3: Buffer,
     /// Working buffers of the fast path, reused from call to call and grown as needed; `(bytes, buffer)` by slot.
     scratch: Mutex<Vec<Option<(usize, Buffer)>>>,
@@ -53,6 +66,57 @@ pub struct Gpu {
 // Command buffers and encoders are not, and never leave the function that creates them.
 unsafe impl Send for Gpu {}
 unsafe impl Sync for Gpu {}
+
+/// A GGUF layer's experts applied to a long batch, for [`Gpu::experts_whole`].
+pub struct WholeExperts<'a> {
+    /// The stored bytes and block format of the two stacks: `experts` matrices of `2 * units x hidden`, with
+    /// each expert's gate rows before its up rows, and of `hidden x units`.
+    pub gate_up: (&'a [u8], Format),
+    pub down: (&'a [u8], Format),
+    pub experts: usize,
+    pub hidden: usize,
+    pub units: usize,
+    /// Experts to a token.
+    pub chosen: usize,
+    /// `tokens x hidden`: the tokens' inputs.
+    pub x: &'a [f32],
+    /// `chosen` per token: the expert and the weight of its output.
+    pub routes: &'a [(u32, f32)],
+    pub gate_cap: f32,
+    pub up_cap: f32,
+}
+
+/// One key head's part of an attention job: its query heads' rows, and the keys and values they attend over.
+pub struct AttendHead<'a> {
+    /// `rows x dim`: for each token, the query heads that share this key head.
+    pub queries: &'a [f32],
+    /// At least `keys x dim` each, oldest first.
+    pub keys: &'a [f32],
+    pub values: &'a [f32],
+    /// `rows x d_rel`: each row's relative state.
+    pub rel: &'a [f32],
+    /// One sink per row.
+    pub sinks: &'a [f32],
+}
+
+/// What the heads of an attention job share.
+pub struct AttendShape<'a> {
+    pub rows: usize,
+    pub keys: usize,
+    pub dim: usize,
+    pub d_rel: usize,
+    pub extent: usize,
+    /// `d_rel x extent`: the bias each relative dimension gives at each distance.
+    pub profiles: &'a [f32],
+    /// Rows to a token.
+    pub share: usize,
+    /// The position of the first row's token, and of the first key.
+    pub first: usize,
+    pub lowest: usize,
+    pub local: bool,
+    pub window: usize,
+    pub scaling: f32,
+}
 
 /// One dense product: `rows x cols` weights, bfloat16 or in a GGUF block format, applied to each `cols`-wide
 /// vector in `xs`. Only the fast path takes block formats.
@@ -135,6 +199,19 @@ impl Gpu {
                 .map_err(|e| anyhow!("building kernel {name}: {}", e.localizedDescription()))
         };
         let widen_ggml = [pipeline("widen_q4k")?, pipeline("widen_q5_0")?, pipeline("widen_q6k")?, pipeline("widen_q8_0")?];
+        let source = NSString::from_str(include_str!("attend.metal"));
+        let library = device
+            .newLibraryWithSource_options_error(&source, Some(&options))
+            .map_err(|e| anyhow!("compiling the attention shaders: {}", e.localizedDescription()))?;
+        let pipeline = |name: &str| -> Result<Pipeline> {
+            let function =
+                library.newFunctionWithName(&NSString::from_str(name)).with_context(|| format!("no kernel {name}"))?;
+            device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|e| anyhow!("building kernel {name}: {}", e.localizedDescription()))
+        };
+        let prompt_weights = pipeline("prompt_weights")?;
+        let expert_steps = [pipeline("gather_rows")?, pipeline("expert_activation")?, pipeline("combine_routes")?];
 
         let mut gpu = Self {
             e4m3: copied(&device, &E4M3[..])?,
@@ -146,6 +223,9 @@ impl Gpu {
             widen_nvfp4,
             widen_mxfp8,
             widen_ggml,
+            prompt_weights,
+            expert_steps,
+            gates: Mutex::new(()),
             scratch: Mutex::new(Vec::new()),
             fast,
             mapped: Vec::new(),
@@ -321,7 +401,7 @@ impl Gpu {
                 let first = copied(&self.device, &[0u32])?;
                 let params = [job.rows as u32, job.cols as u32, 1];
                 let buffers = [(&weights, offset), (&first, 0), (&widened, 0)];
-                self.encode(&commands, self.widen_ggml(job.format)?, &buffers, &params, (job.cols / 32, job.rows))?;
+                self.encode(&commands, self.widen_ggml(job.format)?, &buffers, &params, (job.cols.div_ceil(256), job.rows))?;
             }
             let x = copied(&self.device, job.xs)?;
             let out = self.scratch(2 * index + 1, vectors * job.rows * 4)?;
@@ -393,64 +473,80 @@ impl Gpu {
         }
         order.sort_by_key(|&e| std::cmp::Reverse(vectors[e].len()));
 
-        // One product per expert, as (position, matrices, vectors each).
-        let groups: Vec<(usize, usize, usize)> =
-            order.iter().enumerate().map(|(position, &expert)| (position, 1, vectors[expert].len())).collect();
+        // Products as (position in `order`, first vector, vectors): an expert's vectors in runs of at most
+        // `run`, since Apple's product has returned NaN for runs of around nine hundred.
+        let run = EXPERT_RUN;
+        let groups: Vec<(usize, usize, usize)> = order
+            .iter()
+            .enumerate()
+            .flat_map(|(position, &expert)| {
+                let all = vectors[expert].len();
+                (0..all).step_by(run).map(move |start| (position, start, run.min(all - start)))
+            })
+            .collect();
 
         let (values_buffer, values_offset) = self.weights(values)?;
         ensure!(values_offset % 4 == 0 || matches!(stack, Stack::Ggml(_)), "expert weights are not word-aligned");
         // Slots after the dense ones.
-        let padded: usize = groups.iter().map(|&(_, count, most)| count * most).sum();
-        let widened = self.scratch(16 + slot, order.len() * rows * cols * 4)?;
+        // Every product takes a full run, the last of an expert padded with zero vectors: one shape for all.
+        let padded = groups.len() * run;
+        // The unpacked weights go in several buffers of at most a gigabyte: Apple's product returns NaN for
+        // matrices that start more than two gigabytes into a buffer.
+        let per_part = (WIDENED_BYTES / (rows * cols * 4)).max(1);
+        let widened: Vec<Buffer> = order
+            .chunks(per_part)
+            .enumerate()
+            .map(|(part, experts)| self.scratch(40 + 16 * slot + part, experts.len() * rows * cols * 4))
+            .collect::<Result<_>>()?;
+        ensure!(widened.len() <= 16, "too many experts for the scratch buffers");
         let x = self.scratch(18 + slot, padded * cols * 4)?;
         let out = self.scratch(20 + slot, padded * rows * 4)?;
 
-        // Inputs group by group, expert by expert, zero where an expert has fewer than its group's most.
+        // Inputs product by product.
         // SAFETY: the buffer is shared-mode, at least `padded * cols` floats long, and nothing else uses it until
         // the command buffer below is committed.
         let inputs = unsafe { std::slice::from_raw_parts_mut(x.contents().as_ptr() as *mut f32, padded * cols) };
         let mut rest = inputs;
-        for &(first, count, most) in &groups {
-            for &expert in &order[first..first + count] {
-                let (mine, after) = rest.split_at_mut(most * cols);
-                for (slot, vector) in mine.chunks_exact_mut(cols).zip(vectors[expert].iter().map(Some).chain(std::iter::repeat(None))) {
-                    match vector {
-                        Some(vector) => slot.copy_from_slice(vector),
-                        None => slot.fill(0.0),
-                    }
-                }
-                rest = after;
+        for &(position, start, count) in &groups {
+            let (mine, after) = rest.split_at_mut(run * cols);
+            let (real, padding) = mine.split_at_mut(count * cols);
+            for (slot, vector) in real.chunks_exact_mut(cols).zip(&vectors[order[position]][start..start + count]) {
+                slot.copy_from_slice(vector);
             }
+            padding.fill(0.0);
+            rest = after;
         }
 
         let commands = self.queue.commandBuffer().context("creating a command buffer")?;
         let order_buffer = copied(&self.device, &order.iter().map(|&e| e as u32).collect::<Vec<u32>>())?;
-        let params = [rows as u32, cols as u32, order.len() as u32];
-        let grid = (cols / block, order.len() * rows);
-        if matches!(stack, Stack::Ggml(_)) {
-            let buffers = [(&values_buffer, values_offset), (&order_buffer, 0), (&widened, 0)];
-            self.encode(&commands, widen, &buffers, &params, grid)?;
-        } else {
-            let (scales_buffer, scales_offset) = self.weights(scales)?;
-            let buffers = [
-                (&values_buffer, values_offset),
-                (&scales_buffer, scales_offset),
-                (&self.e4m3, 0),
-                (&order_buffer, 0),
-                (&widened, 0),
-            ];
-            self.encode(&commands, widen, &buffers, &params, grid)?;
+        let scales_buffer = match stack {
+            Stack::Ggml(_) => None,
+            _ => Some(self.weights(scales)?),
+        };
+        for (part, (experts, widened)) in order.chunks(per_part).zip(&widened).enumerate() {
+            let params = [rows as u32, cols as u32, experts.len() as u32];
+            let chosen = (&order_buffer, part * per_part * 4);
+            match &scales_buffer {
+                // The GGUF kernels take 256 values to a thread.
+                None => {
+                    let buffers = [(&values_buffer, values_offset), chosen, (widened, 0)];
+                    self.encode(&commands, widen, &buffers, &params, (cols.div_ceil(256), experts.len() * rows))?;
+                }
+                Some((scales_buffer, scales_offset)) => {
+                    let buffers =
+                        [(&values_buffer, values_offset), (scales_buffer, *scales_offset), (&self.e4m3, 0), chosen, (widened, 0)];
+                    self.encode(&commands, widen, &buffers, &params, (cols / block, experts.len() * rows))?;
+                }
+            }
         }
-        let mut offset = 0;
-        for &(first, count, most) in &groups {
+        for (index, &(position, ..)) in groups.iter().enumerate() {
             self.multiply(
                 &commands,
-                (&x, offset * cols * 4, most, cols),
-                (&widened, first * rows * cols * 4, rows, cols),
-                (&out, offset * rows * 4),
-                count,
+                (&x, index * run * cols * 4, run, cols),
+                (&widened[position / per_part], (position % per_part) * rows * cols * 4, rows, cols),
+                (&out, index * run * rows * 4),
+                1,
             );
-            offset += count * most;
         }
         commands.commit();
         commands.waitUntilCompleted();
@@ -458,14 +554,233 @@ impl Gpu {
 
         // SAFETY: as for `inputs`; the command buffer that wrote it has completed.
         let results = unsafe { std::slice::from_raw_parts(out.contents().as_ptr() as *const f32, padded * rows) };
-        let mut offset = 0;
-        for &(first, count, most) in &groups {
-            for &expert in &order[first..first + count] {
-                outputs[expert] = results[offset * rows..][..vectors[expert].len() * rows].to_vec();
-                offset += most;
-            }
+        // Each expert's runs are next to each other, in order.
+        for (index, &(position, _, count)) in groups.iter().enumerate() {
+            outputs[order[position]].extend_from_slice(&results[index * run * rows..][..count * rows]);
         }
         Ok(outputs)
+    }
+
+    /// The gates of a message merge for a long batch: `forget = F (D pair)` and `gain = G (D pair)` for every
+    /// token's `pair`, where the three matrices are plain floats of `rank x width`, `hidden x rank` and
+    /// `hidden x rank`. Returns the two, `tokens x hidden` each, before their `tanh`.
+    pub fn gates_fast(&self, pairs: &[f32], down: &[u8], forget: &[u8], gain: &[u8], (rank, hidden): (usize, usize)) -> Result<(Vec<f32>, Vec<f32>)> {
+        let width = down.len() / 4 / rank;
+        let tokens = pairs.len() / width;
+        ensure!(
+            down.len() == rank * width * 4 && forget.len() == hidden * rank * 4 && gain.len() == forget.len() && pairs.len() == tokens * width,
+            "bad gate job"
+        );
+        // Merges run side by side on the CPU; here they share scratch buffers and take turns.
+        let _turn = self.gates.lock().expect("gate lock");
+        let buffer = |slot: usize, floats: usize| self.scratch(96 + slot, floats * 4);
+        let (x, low) = (buffer(0, tokens * width)?, buffer(1, tokens * rank)?);
+        let (forgets, gains) = (buffer(2, tokens * hidden)?, buffer(3, tokens * hidden)?);
+        // SAFETY: the buffer is shared-mode, at least `pairs.len()` floats long, and nothing else uses it until
+        // the submission below completes.
+        unsafe { std::ptr::copy_nonoverlapping(pairs.as_ptr(), x.contents().as_ptr() as *mut f32, pairs.len()) };
+        let ((down, down_at), (forget, forget_at), (gain, gain_at)) = (self.weights(down)?, self.weights(forget)?, self.weights(gain)?);
+        let commands = self.queue.commandBuffer().context("creating a command buffer")?;
+        self.multiply(&commands, (&x, 0, tokens, width), (&down, down_at, rank, width), (&low, 0), 1);
+        self.multiply(&commands, (&low, 0, tokens, rank), (&forget, forget_at, hidden, rank), (&forgets, 0), 1);
+        self.multiply(&commands, (&low, 0, tokens, rank), (&gain, gain_at, hidden, rank), (&gains, 0), 1);
+        commands.commit();
+        commands.waitUntilCompleted();
+        finish(&commands)?;
+        Ok((read(&forgets, tokens * hidden), read(&gains, tokens * hidden)))
+    }
+
+    /// A GGUF layer's experts for a long batch, start to finish in one submission: each token's input laid out
+    /// under the experts it is routed to, the first product, the activation, the second product, and each
+    /// token's weighted sum. Returns `tokens x hidden` outputs.
+    ///
+    /// Nothing comes back to the CPU in between, which is most of what the two products cost when run apart.
+    /// Every product takes exactly [`EXPERT_RUN`] rows, padded with zeros: Apple's routine has returned NaN
+    /// for half the outputs of products of some other sizes, and none of this one. The result should still be
+    /// checked.
+    pub fn experts_whole(&self, job: &WholeExperts) -> Result<Vec<f32>> {
+        let &WholeExperts { experts, hidden, units, chosen, .. } = job;
+        let tokens = job.x.len() / hidden;
+        ensure!(job.x.len() == tokens * hidden && job.routes.len() == tokens * chosen, "bad expert job");
+        ensure!(hidden % 256 == 0 || hidden % 32 == 0, "bad expert width");
+        let run = EXPERT_RUN;
+
+        // Rows: for each expert in use, its tokens in runs of `run`, the last padded.
+        let mut tokens_of: Vec<Vec<(u32, u32)>> = vec![Vec::new(); experts];
+        for (at, &(expert, _)) in job.routes.iter().enumerate() {
+            tokens_of[expert as usize].push(((at / chosen) as u32, at as u32));
+        }
+        let order: Vec<u32> = (0..experts as u32).filter(|&e| !tokens_of[e as usize].is_empty()).collect();
+        // Products as (position in `order`, first row).
+        let mut products: Vec<(usize, usize)> = Vec::new();
+        let mut token_of: Vec<u32> = Vec::new();
+        let mut row_of = vec![0u32; tokens * chosen];
+        for (position, &expert) in order.iter().enumerate() {
+            for piece in tokens_of[expert as usize].chunks(run) {
+                products.push((position, token_of.len()));
+                for &(token, route) in piece {
+                    row_of[route as usize] = token_of.len() as u32;
+                    token_of.push(token);
+                }
+                token_of.resize(token_of.len().next_multiple_of(run), u32::MAX);
+            }
+        }
+        let rows = token_of.len();
+        let weights: Vec<f32> = job.routes.iter().map(|&(_, weight)| weight).collect();
+
+        let buffer = |slot: usize, bytes: usize| self.scratch(80 + slot, bytes);
+        let (x, token_buffer, laid) = (buffer(0, tokens * hidden * 4)?, buffer(1, rows * 4)?, buffer(2, rows * hidden * 4)?);
+        // The first product's results, and later the second's, which are the same size.
+        let wide = buffer(3, rows * 2 * units.max(hidden / 2) * 4)?;
+        let (active, row_buffer, weight_buffer) = (buffer(4, rows * units * 4)?, buffer(5, tokens * chosen * 4)?, buffer(6, tokens * chosen * 4)?);
+        let out = buffer(7, tokens * hidden * 4)?;
+        // SAFETY: each buffer is shared-mode and at least as long as what is written, and nothing else uses the
+        // scratch slots until the submission below completes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(job.x.as_ptr(), x.contents().as_ptr() as *mut f32, job.x.len());
+            std::ptr::copy_nonoverlapping(token_of.as_ptr(), token_buffer.contents().as_ptr() as *mut u32, rows);
+            std::ptr::copy_nonoverlapping(row_of.as_ptr(), row_buffer.contents().as_ptr() as *mut u32, row_of.len());
+            std::ptr::copy_nonoverlapping(weights.as_ptr(), weight_buffer.contents().as_ptr() as *mut f32, weights.len());
+        }
+        let order_buffer = copied(&self.device, &order)?;
+
+        let commands = self.queue.commandBuffer().context("creating a command buffer")?;
+        let step = |pipeline: &Pipeline, buffers: &[(&Buffer, usize)], params: &[u32], grid: (usize, usize)| -> Result<()> {
+            let encoder = commands.computeCommandEncoder().context("creating a compute encoder")?;
+            encoder.setComputePipelineState(pipeline);
+            // SAFETY: the buffers are held until the submission completes; Metal copies the parameters now.
+            unsafe {
+                for (index, (buffer, offset)) in buffers.iter().enumerate() {
+                    encoder.setBuffer_offset_atIndex(Some(buffer), *offset, index);
+                }
+                let pointer = NonNull::new(params.as_ptr() as *mut c_void).expect("parameters");
+                encoder.setBytes_length_atIndex(pointer, size_of_val(params), buffers.len());
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize { width: grid.0, height: grid.1, depth: 1 },
+                MTLSize { width: 32, height: 1, depth: 1 },
+            );
+            encoder.endEncoding();
+            Ok(())
+        };
+        // One matrix stack's part: its chosen experts unpacked, then a product per run of rows.
+        let stack = |values: &[u8], format: Format, (out_rows, cols): (usize, usize), from: &Buffer, to: &Buffer, slot: usize| -> Result<()> {
+            let row_bytes = format.row_bytes(cols).context("rows do not make whole blocks")?;
+            ensure!(values.len() == experts * out_rows * row_bytes, "bad expert stack");
+            let (values_buffer, values_offset) = self.weights(values)?;
+            let per_part = (WIDENED_BYTES / (out_rows * cols * 4)).max(1);
+            let widened: Vec<Buffer> = order
+                .chunks(per_part)
+                .enumerate()
+                .map(|(part, experts)| self.scratch(40 + 16 * slot + part, experts.len() * out_rows * cols * 4))
+                .collect::<Result<_>>()?;
+            ensure!(widened.len() <= 16, "too many experts for the scratch buffers");
+            for (part, (experts, widened)) in order.chunks(per_part).zip(&widened).enumerate() {
+                let params = [out_rows as u32, cols as u32, experts.len() as u32];
+                let buffers = [(&values_buffer, values_offset), (&order_buffer, part * per_part * 4), (widened, 0)];
+                self.encode(&commands, self.widen_ggml(format)?, &buffers, &params, (cols.div_ceil(256), experts.len() * out_rows))?;
+            }
+            for &(position, first) in &products {
+                self.multiply(
+                    &commands,
+                    (from, first * cols * 4, run, cols),
+                    (&widened[position / per_part], (position % per_part) * out_rows * cols * 4, out_rows, cols),
+                    (to, first * out_rows * 4),
+                    1,
+                );
+            }
+            Ok(())
+        };
+
+        step(&self.expert_steps[0], &[(&x, 0), (&token_buffer, 0), (&laid, 0)], &[hidden as u32], (hidden / 4, rows))?;
+        stack(job.gate_up.0, job.gate_up.1, (2 * units, hidden), &laid, &wide, 0)?;
+        let params = [units as u32, job.gate_cap.to_bits(), job.up_cap.to_bits(), 0];
+        step(&self.expert_steps[1], &[(&wide, 0), (&active, 0)], &params, (units, rows))?;
+        stack(job.down.0, job.down.1, (hidden, units), &active, &wide, 1)?;
+        let buffers = [(&wide, 0), (&row_buffer, 0), (&weight_buffer, 0), (&out, 0)];
+        step(&self.expert_steps[2], &buffers, &[hidden as u32, chosen as u32], (hidden / 4, tokens))?;
+        commands.commit();
+        commands.waitUntilCompleted();
+        finish(&commands)?;
+        Ok(read(&out, tokens * hidden))
+    }
+
+    /// Attention for a stretch of a long batch, a key head at a time in one submission: scores as a product of
+    /// the head's queries and keys, weights by a softmax over each row's window with its distance bias and sink,
+    /// and outputs as a product of the weights and values. Returns each head's `rows x dim` outputs, before the
+    /// output gate.
+    ///
+    /// As with [`Gpu::experts_fast`], the results must be checked for values that are not finite.
+    pub fn attend_fast(&self, heads: &[AttendHead], shape: &AttendShape) -> Result<Vec<Vec<f32>>> {
+        let &AttendShape { rows, keys, dim, d_rel, extent, .. } = shape;
+        ensure!(shape.profiles.len() == d_rel * extent, "bad distance profiles");
+        for head in heads {
+            ensure!(
+                head.queries.len() == rows * dim
+                    && head.keys.len() >= keys * dim
+                    && head.values.len() >= keys * dim
+                    && head.rel.len() == rows * d_rel
+                    && head.sinks.len() == rows,
+                "bad attention job"
+            );
+        }
+        let count = heads.len();
+        let buffer = |slot: usize, floats: usize| self.scratch(24 + slot, floats * 4);
+        let (queries, tables, values) = (buffer(0, count * rows * dim)?, buffer(1, count * keys * dim)?, buffer(2, count * keys * dim)?);
+        let (rel, sinks, profiles) = (buffer(3, count * rows * d_rel)?, buffer(4, count * rows)?, buffer(5, d_rel * extent)?);
+        let (bias, scores, out) = (buffer(6, rows * extent)?, buffer(7, rows * keys)?, buffer(8, count * rows * dim)?);
+        // SAFETY: each buffer is shared-mode and at least as long as what is written, and nothing else uses the
+        // scratch slots until the submission below completes.
+        let fill = |buffer: &Buffer, at: usize, data: &[f32]| unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), (buffer.contents().as_ptr() as *mut f32).add(at), data.len());
+        };
+        fill(&profiles, 0, shape.profiles);
+        for (h, head) in heads.iter().enumerate() {
+            fill(&queries, h * rows * dim, head.queries);
+            fill(&tables, h * keys * dim, &head.keys[..keys * dim]);
+            fill(&values, h * keys * dim, &head.values[..keys * dim]);
+            fill(&rel, h * rows * d_rel, head.rel);
+            fill(&sinks, h * rows, head.sinks);
+        }
+
+        let commands = self.queue.commandBuffer().context("creating a command buffer")?;
+        let width = (keys / 256).clamp(1, 16);
+        let params = [
+            keys as u32,
+            shape.share as u32,
+            shape.first as u32,
+            shape.lowest as u32,
+            u32::from(shape.local),
+            shape.window as u32,
+            extent as u32,
+            width as u32,
+        ];
+        for h in 0..count {
+            self.product(&commands, (&rel, h * rows * d_rel * 4, rows, d_rel), (&profiles, 0, d_rel, extent), (&bias, 0), 1, false, 1.0);
+            let (mine, table) = ((&queries, h * rows * dim * 4, rows, dim), (&tables, h * keys * dim * 4, keys, dim));
+            self.product(&commands, mine, table, (&scores, 0), 1, true, shape.scaling as f64);
+            let encoder = commands.computeCommandEncoder().context("creating a compute encoder")?;
+            encoder.setComputePipelineState(&self.prompt_weights);
+            // SAFETY: the buffers are held until the submission completes, and the offsets are within them.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&scores), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&bias), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&sinks), h * rows * 4, 2);
+                encoder.setBytes_length_atIndex(NonNull::from(&params).cast::<c_void>(), size_of_val(&params), 3);
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: rows, height: 1, depth: 1 },
+                MTLSize { width: 32 * width, height: 1, depth: 1 },
+            );
+            encoder.endEncoding();
+            let table = (&values, h * keys * dim * 4, keys, dim);
+            self.product(&commands, (&scores, 0, rows, keys), table, (&out, h * rows * dim * 4), 1, false, 1.0);
+        }
+        commands.commit();
+        commands.waitUntilCompleted();
+        finish(&commands)?;
+        let results = read(&out, count * rows * dim);
+        Ok(results.chunks_exact(rows * dim).map(<[f32]>::to_vec).collect())
     }
 
     /// Encodes `out = left . right^T` for `count` matrices laid end to end in each buffer, as float.
@@ -479,9 +794,27 @@ impl Gpu {
         out: (&Buffer, usize),
         count: usize,
     ) {
+        self.product(commands, left, right, out, count, true, 1.0);
+    }
+
+    /// Encodes `out = scale * left . right` (or `left . right^T` with `transposed`) for `count` matrices laid
+    /// end to end in each buffer, as float. Each operand is `(buffer, byte offset, rows, cols)` per matrix.
+    #[allow(clippy::too_many_arguments)]
+    fn product(
+        &self,
+        commands: &ProtocolObject<dyn MTLCommandBuffer>,
+        left: (&Buffer, usize, usize, usize),
+        right: (&Buffer, usize, usize, usize),
+        out: (&Buffer, usize),
+        count: usize,
+        transposed: bool,
+        scale: f64,
+    ) {
         use objc2::AnyThread;
         use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication};
-        let ((left, left_offset, vectors, cols), (right, right_offset, rows, _)) = (left, right);
+        let ((left, left_offset, vectors, cols), (right, right_offset, right_rows, right_cols)) = (left, right);
+        // How many columns the result has.
+        let rows = if transposed { right_rows } else { right_cols };
         // SAFETY: the callers size each buffer for `count` matrices of the stated shape past its offset, and hold
         // the buffers until the command buffer completes.
         unsafe {
@@ -492,13 +825,13 @@ impl Gpu {
                 MPSMatrix::initWithBuffer_offset_descriptor(MPSMatrix::alloc(), buffer, offset, &descriptor)
             };
             let kernel = MPSMatrixMultiplication::initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta(
-                MPSMatrixMultiplication::alloc(), &self.device, false, true, vectors, rows, cols, 1.0, 0.0,
+                MPSMatrixMultiplication::alloc(), &self.device, false, transposed, vectors, rows, cols, scale, 0.0,
             );
             kernel.setBatchSize(count);
             kernel.encodeToCommandBuffer_leftMatrix_rightMatrix_resultMatrix(
                 commands,
                 &matrix(left, left_offset, vectors, cols),
-                &matrix(right, right_offset, rows, cols),
+                &matrix(right, right_offset, right_rows, right_cols),
                 &matrix(out.0, out.1, vectors, rows),
             );
         }
@@ -817,6 +1150,54 @@ mod tests {
         }
     }
 
+    /// What the pieces of a long prompt's chunk cost on the fast path, one layer visit's worth:
+    /// `cargo test --release --lib gpu::tests::prompt_parts -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn prompt_parts() {
+        use crate::checkpoint::{Checkpoint, resolve_model};
+        use std::time::Instant;
+        let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
+        let weights = Checkpoint::open(&path).unwrap();
+        let gpu = Gpu::new(&weights.maps(), true).unwrap();
+        let tokens: usize = std::env::var("TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
+        let best = |work: &dyn Fn()| (0..3).map(|_| { let t = Instant::now(); work(); t.elapsed().as_secs_f64() }).fold(f64::MAX, f64::min);
+
+        let xs = floats(tokens * 3072, 7);
+        let mut dense_products = 0usize;
+        let mut jobs = Vec::new();
+        for (name, rows, cols) in [
+            ("attn.wq_du.weight", 3072, 2304),
+            ("attn.wk_dv.weight", 1024, 2304),
+            ("attn.wv_dv.weight", 1024, 2304),
+            ("attn.wr_du.weight", 384, 2304),
+            ("attn.gate_attn.weight", 3072, 2304),
+            ("attn.wo_ud.weight", 2304, 3072),
+        ] {
+            let (format, _, bytes) = weights.rows(&format!("model.llm.layers.3.{name}")).unwrap();
+            jobs.push(DenseJob { format, weights: bytes, rows, cols, xs: &xs[..tokens * cols] });
+            dense_products += rows * cols * tokens;
+        }
+        let seconds = best(&|| drop(gpu.dense_fast(&jobs).unwrap()));
+        eprintln!("projections, {tokens} tokens: {:.0} ms, {:.0} G products/s", seconds * 1e3, dense_products as f64 / seconds / 1e9);
+
+        // Every expert with the same share of the tokens' eight choices.
+        let experts = weights.experts(3).unwrap();
+        let each = tokens * 8 / 128;
+        for (label, matrix, slot) in [("gate_up", &experts.gate_up, 0), ("down", &experts.down, 1)] {
+            let inputs = floats(each * matrix.cols, 9);
+            let vectors: Vec<Vec<&[f32]>> = (0..128).map(|_| inputs.chunks_exact(matrix.cols).collect()).collect();
+            let stack = Stack::Ggml(matrix.ggml().unwrap());
+            let shape = (128, matrix.rows, matrix.cols);
+            let seconds = best(&|| drop(gpu.experts_fast(matrix.raw_parts(), shape, stack, &vectors, slot).unwrap()));
+            let products = 128 * each * matrix.rows * matrix.cols;
+            eprintln!("{label}, {each} tokens to each of 128 experts: {:.0} ms, {:.0} G products/s", seconds * 1e3, products as f64 / seconds / 1e9);
+            let none: Vec<Vec<&[f32]>> = (0..128).map(|_| inputs.chunks_exact(matrix.cols).take(1).collect()).collect();
+            let seconds = best(&|| drop(gpu.experts_fast(matrix.raw_parts(), shape, stack, &none, slot).unwrap()));
+            eprintln!("  of which unpacking the weights (one token each): {:.0} ms", seconds * 1e3);
+        }
+    }
+
     /// Kernel throughput at prompt-like sizes: `cargo test --release --lib gpu::tests::bench -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -939,6 +1320,129 @@ mod tests {
             let exact = crate::quant::dot_f32_row(&decoded, x);
             let magnitude: f32 = decoded.iter().zip(x).map(|(w, x)| (w * x).abs()).sum();
             assert!((fast - exact).abs() <= 1e-5 * magnitude, "{format:?} {what}, row {r}: {fast} against {exact}");
+        }
+    }
+
+    #[test]
+    fn the_fast_attention_matches_plain_sums() {
+        let gpu = Gpu::new(&[], true).unwrap();
+        // Five tokens at positions 40..45, three query heads to a key head, two key heads.
+        let (count, share, dim, d_rel, extent, window) = (5usize, 3usize, 16usize, 4usize, 12usize, 9usize);
+        let (rows, first) = (count * share, 40usize);
+        let profiles = floats(d_rel * extent, 1);
+        for local in [false, true] {
+            // The table starts at the oldest key the first token sees.
+            let lowest = if local { first + 1 - window } else { 0 };
+            let keys = first + count - lowest;
+            let data: Vec<_> = (0..2u64)
+                .map(|h| (floats(rows * dim, 10 + h), floats(keys * dim, 20 + h), floats(keys * dim, 30 + h), floats(rows * d_rel, 40 + h), floats(rows, 50 + h)))
+                .collect();
+            let heads: Vec<AttendHead> = data
+                .iter()
+                .map(|(queries, keys, values, rel, sinks)| AttendHead { queries, keys, values, rel, sinks })
+                .collect();
+            let shape = AttendShape { rows, keys, dim, d_rel, extent, profiles: &profiles, share, first, lowest, local, window, scaling: 0.25 };
+            let out = gpu.attend_fast(&heads, &shape).unwrap();
+            for (h, (queries, table, values, rel, sinks)) in data.iter().enumerate() {
+                for row in 0..rows {
+                    let t = first + row / share;
+                    let from = if local { t + 1 - window } else { 0 };
+                    let query = &queries[row * dim..][..dim];
+                    let scores: Vec<f32> = (from..=t)
+                        .map(|s| {
+                            let key = &table[(s - lowest) * dim..][..dim];
+                            let bias: f32 = match t - s < extent {
+                                true => (0..d_rel).map(|r| rel[row * d_rel + r] * profiles[r * extent + (t - s)]).sum(),
+                                false => 0.0,
+                            };
+                            query.iter().zip(key).map(|(q, k)| q * k).sum::<f32>() * 0.25 + bias
+                        })
+                        .collect();
+                    let highest = scores.iter().copied().fold(sinks[row], f32::max);
+                    let total: f32 = scores.iter().map(|s| (s - highest).exp()).sum::<f32>() + (sinks[row] - highest).exp();
+                    for c in 0..dim {
+                        let expected: f32 = (from..=t)
+                            .zip(&scores)
+                            .map(|(s, score)| (score - highest).exp() / total * values[(s - lowest) * dim + c])
+                            .sum();
+                        let got = out[h][row * dim + c];
+                        assert!((got - expected).abs() < 1e-4, "local {local}, head {h}, row {row}, {c}: {got} against {expected}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_whole_expert_step_matches_plain_sums() {
+        use crate::ggml::encode_q8_0;
+        let gpu = Gpu::new(&[], true).unwrap();
+        let (experts, hidden, units, chosen, tokens) = (5usize, 64usize, 32usize, 2usize, 300usize);
+        let decoded = |rows: usize, cols: usize, seed: u64| -> (Vec<u8>, Vec<f32>) {
+            let bytes: Vec<u8> = floats(rows * cols, seed).chunks_exact(cols).flat_map(encode_q8_0).collect();
+            let mut values = vec![0.0f32; rows * cols];
+            for (row, values) in bytes.chunks_exact(cols / 32 * 34).zip(values.chunks_exact_mut(cols)) {
+                Format::Q8_0.decode_row(row, values);
+            }
+            (bytes, values)
+        };
+        let (gate_up, gate_up_values) = decoded(experts * 2 * units, hidden, 1);
+        let (down, down_values) = decoded(experts * hidden, units, 2);
+        let x = floats(tokens * hidden, 3);
+        // Most tokens to one expert, so that it takes more than one run of rows, and one expert unused.
+        let routes: Vec<(u32, f32)> = (0..tokens).flat_map(|t| [(0u32, 0.75f32), (1 + (t % 3) as u32, 0.25 + t as f32 / 1000.0)]).collect();
+        let job = WholeExperts {
+            gate_up: (&gate_up, Format::Q8_0),
+            down: (&down, Format::Q8_0),
+            experts,
+            hidden,
+            units,
+            chosen,
+            x: &x,
+            routes: &routes,
+            gate_cap: 4.0,
+            up_cap: 25.0,
+        };
+        let out = gpu.experts_whole(&job).unwrap();
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f32>();
+        for t in [0, 1, 255, 256, 257, tokens - 1] {
+            let input = &x[t * hidden..][..hidden];
+            let mut expected = vec![0.0f32; hidden];
+            for &(expert, weight) in &routes[t * chosen..][..chosen] {
+                let rows = &gate_up_values[expert as usize * 2 * units * hidden..][..2 * units * hidden];
+                let active: Vec<f32> = (0..units)
+                    .map(|u| {
+                        let (gate, up) = (dot(&rows[u * hidden..][..hidden], input), dot(&rows[(units + u) * hidden..][..hidden], input));
+                        (gate / 4.0).tanh() * 4.0 / (1.0 + (-gate).exp()) * (up / 25.0).tanh() * 25.0
+                    })
+                    .collect();
+                let rows = &down_values[expert as usize * hidden * units..][..hidden * units];
+                for (c, expected) in expected.iter_mut().enumerate() {
+                    *expected += weight * dot(&rows[c * units..][..units], &active);
+                }
+            }
+            for (c, expected) in expected.iter().enumerate() {
+                let got = out[t * hidden + c];
+                assert!((got - expected).abs() < 1e-3 * (1.0 + expected.abs()), "token {t}, {c}: {got} against {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_fast_gates_match_plain_sums() {
+        let gpu = Gpu::new(&[], true).unwrap();
+        let (tokens, width, rank, hidden) = (7usize, 48usize, 6usize, 20usize);
+        let (pairs, down, forget, gain) = (floats(tokens * width, 1), floats(rank * width, 2), floats(hidden * rank, 3), floats(hidden * rank, 4));
+        let raw = |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let (forgets, gains) = gpu.gates_fast(&pairs, &raw(&down), &raw(&forget), &raw(&gain), (rank, hidden)).unwrap();
+        for t in 0..tokens {
+            let low: Vec<f32> = (0..rank).map(|r| (0..width).map(|c| down[r * width + c] * pairs[t * width + c]).sum()).collect();
+            for i in 0..hidden {
+                let expected: f32 = (0..rank).map(|r| forget[i * rank + r] * low[r]).sum();
+                assert!((forgets[t * hidden + i] - expected).abs() < 1e-4, "forget, token {t}, {i}");
+                let expected: f32 = (0..rank).map(|r| gain[i * rank + r] * low[r]).sum();
+                assert!((gains[t * hidden + i] - expected).abs() < 1e-4, "gain, token {t}, {i}");
+            }
         }
     }
 
