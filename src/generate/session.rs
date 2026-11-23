@@ -254,7 +254,7 @@ impl<'m, 'a> Session<'m, 'a> {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             tokens: self.context.clone(),
-            state: self.state.clone(),
+            state: self.model.trimmed(&self.state),
             last: self.last.clone(),
             draft: self.draft.as_ref().map(|(_, state)| state.clone()),
         }
@@ -265,6 +265,7 @@ impl<'m, 'a> Session<'m, 'a> {
         let draft = self.draft.as_mut().map(|(draft, state)| std::mem::replace(state, draft.new_state()));
         self.ahead = None;
         self.mark = None;
+        self.model.trim(&mut self.state);
         Snapshot {
             tokens: std::mem::take(&mut self.context),
             state: std::mem::replace(&mut self.state, self.model.new_state()),

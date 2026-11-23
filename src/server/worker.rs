@@ -3,6 +3,11 @@
 use super::*;
 
 /// Loads the model, reports readiness, then serves jobs one at a time until every sender is gone.
+/// How long the model must be idle before the prompt cache is brought up to date on disk.
+const IDLE_BEFORE_SAVING: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long before the conversation in the session is kept as a snapshot and saved with the rest.
+const IDLE_BEFORE_KEEPING: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::Receiver<Job>, ready: std_mpsc::Sender<Result<()>>) {
     let loaded = (|| -> Result<_> {
         let config = Config::load(model_dir)?;
@@ -72,7 +77,7 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
         config.text_config.visits().len(),
         options.model.activations,
         // The fast path's states differ from the exact ones, so the two must not share snapshots.
-        if options.model.backend == Backend::MetalFast { "fast" } else { "exact" },
+        if model.on_fast_path() { "fast" } else { "exact" },
         draft.is_some(),
     );
     let mut cache = match &options.cache_dir {
@@ -91,9 +96,35 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
 
     let mut memory = Memory::default();
     let mut calls = 0usize;
-    for (number, job) in queue.into_iter().enumerate() {
+    let mut number = 0;
+    // When the session's conversation last changed, while it has not been kept as a snapshot.
+    let mut live_since: Option<std::time::Instant> = None;
+    loop {
+        // Between requests, what the cache has gained goes to disk: only the new snapshots are written, and a
+        // server that is killed loses nothing but the conversation it was in.
+        let job = match queue.recv_timeout(IDLE_BEFORE_SAVING) {
+            Ok(job) => job,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                // The conversation in the session is only a snapshot once something displaces it. Left alone
+                // for a while, it is kept as one, so that it too outlives the server; not sooner, because that
+                // writes its whole state, a gigabyte for a long one, and an agent's turns come seconds apart.
+                if live_since.is_some_and(|since| since.elapsed() >= IDLE_BEFORE_KEEPING) && options.cache_dir.is_some() {
+                    cache.keep(&session);
+                    live_since = None;
+                }
+                if let Some(dir) = options.cache_dir.as_ref().filter(|_| cache.unsaved()) {
+                    match cache.save(dir, &fingerprint) {
+                        Ok(written) => tracing::debug!("saved {written} processed prompts to {}", dir.display()),
+                        Err(error) => tracing::warn!("could not save the prompt cache: {error:#}"),
+                    }
+                }
+                continue;
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        WAITING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let events = job.events.clone();
-        let number = number + 1;
+        number += 1;
         let handled =
             handle(number, &job, &options, &config, &prompter, &mut session, &mut cache, &mut memory, &mut calls);
         if let Err(failure) = handled {
@@ -101,6 +132,7 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
             // The receiver may already be gone, when the failure is the client hanging up.
             let _ = events.blocking_send(Event::Failed { status: failure.status, message: failure.message });
         }
+        live_since = Some(std::time::Instant::now());
     }
 
     // Shutting down: the conversation in the session is worth keeping too.
@@ -108,7 +140,7 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
         cache.keep(&session);
         let (count, bytes) = (cache.len(), cache.bytes());
         match cache.save(dir, &fingerprint) {
-            Ok(()) => tracing::info!("saved {count} processed prompts ({:.1} GiB) to {}", bytes as f64 / GIB, dir.display()),
+            Ok(_) => tracing::info!("{count} processed prompts ({:.1} GiB) kept in {}", bytes as f64 / GIB, dir.display()),
             Err(error) => tracing::warn!("could not save the prompt cache: {error:#}"),
         }
     }
@@ -279,8 +311,9 @@ pub(crate) fn handle(
             reported = std::time::Instant::now();
             tracing::debug!("[{number}] prompt: {processed} of {} tokens after {:.0}s", ids.len(), started.elapsed().as_secs_f32());
         }
-        // A client that has gone away is not worth finishing the prompt for; what was processed stays.
-        !job.events.is_closed()
+        // A client that has gone away has often only run out of patience, and will ask again: its prompt is
+        // finished for it, unless another request is waiting for the model. What was processed stays either way.
+        !job.events.is_closed() || WAITING.load(std::sync::atomic::Ordering::Relaxed) == 0
     };
     let cached_tokens = cache.prepare_watched(session, &ids, header, &mut watch).map_err(|error| {
         match job.events.is_closed() {

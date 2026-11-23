@@ -37,13 +37,16 @@ fn worth(boundary: usize, have: usize) -> bool {
     boundary >= have + MIN_GAIN_TOKENS.max(boundary / 16)
 }
 
-const FILE_NAME: &str = "prompt-cache.bin";
+/// What a saved snapshot's file name ends in.
+const EXTENSION: &str = "prompt";
 
 pub struct PromptCache {
     entries: Vec<Entry>,
     budget_bytes: usize,
     /// Counts uses, to order entries by recency.
     clock: u64,
+    /// The names of saved snapshots that have since been dropped, whose files the next save removes.
+    dropped: Vec<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,13 +56,25 @@ struct Entry {
     /// conversation replaces it.
     tip: bool,
     used: u64,
+    /// What its file is called, chosen at random so that servers sharing a directory do not collide.
+    name: u64,
+    /// Whether that file has been written.
+    #[serde(skip)]
+    saved: bool,
 }
 
-/// What is kept on disk: the snapshots, and what they were made with.
-#[derive(Serialize, Deserialize)]
+/// A snapshot's file: what it was made with, then the snapshot.
+#[derive(Deserialize)]
 struct Saved {
     fingerprint: String,
-    entries: Vec<Entry>,
+    entry: Entry,
+}
+
+/// [`Saved`] for writing, without taking the snapshot out of the cache.
+#[derive(Serialize)]
+struct Saving<'a> {
+    fingerprint: &'a str,
+    entry: &'a Entry,
 }
 
 /// Where to start processing a prompt from, and where to stop on the way to take snapshots.
@@ -132,7 +147,7 @@ impl PromptCache {
     /// A cache holding at most about `budget_bytes` of snapshots. With a budget of zero it keeps nothing and the
     /// session alone carries a conversation from one turn to the next.
     pub fn new(budget_bytes: usize) -> Self {
-        Self { entries: Vec::new(), budget_bytes, clock: 0 }
+        Self { entries: Vec::new(), budget_bytes, clock: 0, dropped: Vec::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -218,56 +233,94 @@ impl PromptCache {
         }
         if tip {
             // Earlier ends of the same conversation are prefixes of this one, and no longer needed.
-            self.entries.retain(|entry| !(entry.tip && snapshot.tokens().starts_with(entry.snapshot.tokens())));
+            let earlier = |entry: &Entry| entry.tip && snapshot.tokens().starts_with(entry.snapshot.tokens());
+            while let Some(index) = self.entries.iter().position(earlier) {
+                self.drop_entry(index);
+            }
         }
-        self.entries.push(Entry { snapshot, tip, used: self.clock });
+        self.entries.push(Entry { snapshot, tip, used: self.clock, name: rand::random(), saved: false });
         while self.bytes() > self.budget_bytes {
             let oldest = (0..self.entries.len()).min_by_key(|&i| self.entries[i].used).expect("over budget, so not empty");
-            self.entries.remove(oldest);
+            self.drop_entry(oldest);
         }
     }
 
-    /// Writes the cache to `dir`. `fingerprint` names what the snapshots were made with (model, pass count,
-    /// arithmetic); [`PromptCache::load`] only accepts a file with the same one.
-    pub fn save(self, dir: &Path, fingerprint: &str) -> Result<()> {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = dir.join(FILE_NAME);
-        // Written beside the real file and renamed, so an interrupted save cannot leave half a cache.
-        let partial = dir.join(format!("{FILE_NAME}.partial"));
-        let file = File::create(&partial).with_context(|| format!("creating {}", partial.display()))?;
-        let saved = Saved { fingerprint: fingerprint.to_owned(), entries: self.entries };
-        postcard::to_io(&saved, BufWriter::new(file)).with_context(|| format!("writing {}", partial.display()))?;
-        std::fs::rename(&partial, &path).with_context(|| format!("renaming to {}", path.display()))?;
-        Ok(())
+    fn drop_entry(&mut self, index: usize) {
+        let entry = self.entries.remove(index);
+        if entry.saved {
+            self.dropped.push(entry.name);
+        }
     }
 
-    /// Reads back a cache written by [`PromptCache::save`]. A missing file, or one made with something else, gives
-    /// an empty cache.
+    /// Whether [`PromptCache::save`] has anything to do.
+    pub fn unsaved(&self) -> bool {
+        !self.dropped.is_empty() || self.entries.iter().any(|entry| !entry.saved)
+    }
+
+    /// Brings `dir` up to date with the cache: a file for each snapshot not yet written, and none for those
+    /// dropped since. Snapshots already there are left alone, so this costs what has changed. `fingerprint` names
+    /// what the snapshots were made with (model, pass count, arithmetic); [`PromptCache::load`] only takes files
+    /// with the same one. Returns how many files were written.
+    pub fn save(&mut self, dir: &Path, fingerprint: &str) -> Result<usize> {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        for name in self.dropped.drain(..) {
+            let _ = std::fs::remove_file(file_of(dir, name));
+        }
+        let mut written = 0;
+        for entry in self.entries.iter_mut().filter(|entry| !entry.saved) {
+            let path = file_of(dir, entry.name);
+            // Written beside the real file and renamed, so an interrupted save cannot leave half a snapshot.
+            let partial = path.with_extension("partial");
+            let file = File::create(&partial).with_context(|| format!("creating {}", partial.display()))?;
+            postcard::to_io(&Saving { fingerprint, entry }, BufWriter::new(file))
+                .with_context(|| format!("writing {}", partial.display()))?;
+            std::fs::rename(&partial, &path).with_context(|| format!("renaming to {}", path.display()))?;
+            entry.saved = true;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Reads back what [`PromptCache::save`] wrote to `dir`: the snapshots made with the same `fingerprint`, most
+    /// recently used first, as far as the budget goes. Files made with something else are left where they are,
+    /// for the server that made them; a file that cannot be read is skipped.
     pub fn load(dir: &Path, fingerprint: &str, budget_bytes: usize) -> Result<Self> {
         let mut cache = Self::new(budget_bytes);
-        let path = dir.join(FILE_NAME);
-        let Ok(file) = File::open(&path) else { return Ok(cache) };
+        let files = std::fs::read_dir(dir).into_iter().flatten().filter_map(|entry| Some(entry.ok()?.path()));
+        let mut entries = Vec::new();
         let mut scratch = vec![0u8; 1 << 16];
-        // The fingerprint comes first in the file and is checked on its own: a file made with something else
-        // may not even have snapshots of the same layout.
-        let made_with: Result<(String, _), _> = postcard::from_io((BufReader::new(file), &mut scratch));
-        if !made_with.is_ok_and(|(made_with, _)| made_with == fingerprint) {
-            return Ok(cache);
+        for path in files.filter(|path| path.extension().is_some_and(|extension| extension == EXTENSION)) {
+            // The fingerprint comes first in the file and is checked on its own: a file made with something else
+            // may not even hold a snapshot of the same layout.
+            let Ok(file) = File::open(&path) else { continue };
+            let made_with: Result<(String, _), _> = postcard::from_io((BufReader::new(file), &mut scratch));
+            if !made_with.is_ok_and(|(made_with, _)| made_with == fingerprint) {
+                continue;
+            }
+            let Ok(file) = File::open(&path) else { continue };
+            let read: Result<(Saved, _), _> = postcard::from_io((BufReader::new(file), &mut scratch));
+            match read {
+                Ok((saved, _)) if saved.fingerprint == fingerprint => entries.push(Entry { saved: true, ..saved.entry }),
+                Ok(_) => {}
+                Err(error) => tracing::warn!("skipping {}, which could not be read: {error}", path.display()),
+            }
         }
-        let file = File::open(&path).with_context(|| format!("reopening {}", path.display()))?;
-        let (saved, _): (Saved, _) = postcard::from_io((BufReader::new(file), &mut scratch))
-            .with_context(|| format!("reading {}; delete it to start with an empty cache", path.display()))?;
-        if saved.fingerprint != fingerprint {
-            return Ok(cache);
-        }
-        // Oldest first, so the budget drops the right ones if it has shrunk.
-        let mut entries = saved.entries;
-        entries.sort_by_key(|entry| entry.used);
+        // Most recent first, so that it is the oldest the budget leaves out; those keep their files, which a
+        // later save removes if they are still unwanted.
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.used));
+        cache.clock = entries.first().map_or(0, |entry| entry.used);
         for entry in entries {
-            cache.insert(entry.snapshot, entry.tip);
+            match cache.bytes() + entry.snapshot.bytes() <= budget_bytes {
+                true => cache.entries.push(entry),
+                false => cache.dropped.push(entry.name),
+            }
         }
         Ok(cache)
     }
+}
+
+fn file_of(dir: &Path, name: u64) -> std::path::PathBuf {
+    dir.join(format!("{name:016x}.{EXTENSION}"))
 }
 
 #[cfg(test)]

@@ -142,9 +142,14 @@ impl VisitState {
     /// Drops the keys and values that have left a sliding layer's window, once a batch of them has: dropping
     /// from the front moves everything kept, megabytes per visit, so until then they sit unread at the front.
     pub(super) fn drop_stale(&mut self, cfg: &TextConfig, local: bool, position: usize) {
+        self.drop_stale_from(cfg, local, position, STALE_BATCH);
+    }
+
+    /// As [`VisitState::drop_stale`], for `batch` stale tokens or more.
+    pub(super) fn drop_stale_from(&mut self, cfg: &TextConfig, local: bool, position: usize, batch: usize) {
         let window_start = if local { (position + 1).saturating_sub(cfg.sliding_window_size) } else { 0 };
         let stale = window_start.saturating_sub(self.first).min(self.keys.rows());
-        if stale >= STALE_BATCH {
+        if stale >= batch {
             self.keys.drop_front(stale);
             self.values.drop_front(stale);
             self.first += stale;

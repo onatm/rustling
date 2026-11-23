@@ -128,13 +128,16 @@ enum Command {
         host: String,
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        /// Memory, in GiB, for keeping processed prompts so later requests that share them start from there.
-        /// 0 keeps only the latest conversation.
-        #[arg(long, default_value_t = 4.0)]
+        /// Memory, in GiB, for keeping processed prompts so later requests that share them start from there, and
+        /// as much again on disk. 0 keeps only the latest conversation.
+        #[arg(long, default_value_t = 8.0)]
         cache_gb: f64,
-        /// Keep the processed prompts in this directory between runs.
+        /// Where processed prompts are kept between runs. Defaults to `~/.cache/rustling`.
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+        /// Keep processed prompts in memory only, and forget them when the server stops.
+        #[arg(long, conflicts_with = "cache_dir")]
+        no_cache_dir: bool,
         #[command(flatten)]
         run: RunArgs,
     },
@@ -161,6 +164,14 @@ enum Command {
         #[arg(long, value_enum, default_value_t = ActivationsArg::Float)]
         activations: ActivationsArg,
     },
+}
+
+/// Where processed prompts are kept when no place is given: `rustling` under `$XDG_CACHE_HOME`, or under
+/// `~/.cache`.
+fn default_cache_dir() -> Option<PathBuf> {
+    let caches = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).filter(|path| path.is_absolute());
+    let caches = caches.or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache")))?;
+    Some(caches.join("rustling"))
 }
 
 fn main() -> Result<()> {
@@ -199,7 +210,11 @@ fn main() -> Result<()> {
         Command::Prompt { text, effort } => prompt(&model_dir, &text, effort.as_deref()),
         Command::Generate { text, run, top, timing } => generate(&model_dir, &text, &run, top, timing),
         Command::Chat { system, run } => chat(&model_dir, system.as_deref(), &run),
-        Command::Serve { host, port, cache_gb, cache_dir, run } => {
+        Command::Serve { host, port, cache_gb, cache_dir, no_cache_dir, run } => {
+            let cache_dir = match no_cache_dir {
+                true => None,
+                false => cache_dir.or_else(default_cache_dir),
+            };
             anyhow::ensure!(cache_gb >= 0.0, "--cache-gb must not be negative");
             run.sampler()?;
             anyhow::ensure!(run.effort.is_none(), "--effort does not apply to serve: requests set reasoning_effort");

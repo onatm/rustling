@@ -22,7 +22,7 @@ use rustling::generate::cache::PromptCache;
 use rustling::weights::checkpoint::Checkpoint;
 use rustling::config::Config;
 use rustling::generate::draft::Draft;
-use rustling::model::{Backend, Model, Options};
+use rustling::model::{Model, Options};
 use rustling::prompt::{Prompter, SegmentKind, parse_reply, reply_message};
 use rustling::generate::sampler::{Sampler, SamplerConfig};
 use rustling::generate::session::{Limits, Session, Stop};
@@ -122,6 +122,9 @@ enum StopSequences {
     Many(Vec<String>),
 }
 
+/// How many requests are queued for the model and not yet taken up.
+static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 struct Job {
     request: ChatRequest,
     events: mpsc::Sender<Event>,
@@ -210,6 +213,7 @@ async fn chat_completions(State(App { jobs, model }): State<App>, body: axum::bo
     };
     let (stream, include_usage) = (request.stream, request.stream_options.as_ref().is_some_and(|o| o.include_usage));
     let (events, mut received) = mpsc::channel(64);
+    WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if jobs.send(Job { request, events }).is_err() {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "the model thread has stopped");
     }

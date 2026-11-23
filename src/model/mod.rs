@@ -396,6 +396,14 @@ impl<'a> Model<'a> {
         PROMPT_CHUNK
     }
 
+    /// Whether long prompts take the fast path, whose states match the exact paths' only to rounding.
+    pub fn on_fast_path(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.gpu.as_ref().is_some_and(Gpu::fast);
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
     /// Whether large batches run on the GPU.
     pub fn uses_gpu(&self) -> bool {
         self.gpu.is_some()
@@ -430,6 +438,23 @@ impl<'a> Model<'a> {
             })
             .collect();
         Mark { position: state.position, visits }
+    }
+
+    /// A copy of `state` holding only what the tokens to come can read: the next pass would drop the rest
+    /// anyway. After a long prompt the sliding layers still hold the whole of its last chunk, four times their
+    /// window, which is most of what a copy would otherwise take.
+    pub fn trimmed(&self, state: &State) -> State {
+        let mut copy = state.clone();
+        self.trim(&mut copy);
+        copy
+    }
+
+    /// Drops from `state` what the tokens to come cannot read; see [`Model::trimmed`].
+    pub fn trim(&self, state: &mut State) {
+        let position = state.position;
+        for (visit, at) in state.visits.iter_mut().zip(self.cfg.visits()) {
+            visit.drop_stale_from(&self.cfg, self.cfg.is_local(at.layer), position, 1);
+        }
     }
 
     /// A fresh context with no tokens in it.

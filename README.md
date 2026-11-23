@@ -11,8 +11,9 @@ runs of tokens the reply repeats from the conversation.
 ## Requirements
 
 - An Apple silicon Mac. Nothing else is supported: the engine is built around Metal and tuned on these chips.
-- About 24 GB of free memory: 17.5 GB for the model and 1 to 5 GB for a conversation, depending on its length.
-  Measured on a 64 GB machine; 32 GB should do.
+- Memory: 17.5 GB for the model, 1 to 5 GB for a conversation depending on its length, and up to 15 GB more
+  while a long prompt is being processed. Measured on a 64 GB machine. 48 GB is comfortable; on 32 GB long
+  prompts will push the model's own pages out of memory and slow down.
 - A Rust toolchain to build it.
 
 ## Quick start
@@ -31,7 +32,7 @@ the file it leaves.
 To serve it to other programs:
 
 ```sh
-rustling serve --cache-dir ~/.cache/rustling
+rustling serve
 ```
 
 ```sh
@@ -82,7 +83,9 @@ rustling generate "Hello" --timing                       # where the time went
 rustling serve                                           # http://127.0.0.1:8080/v1
 rustling serve --port 9000 --host 0.0.0.0                # reachable from other machines
 rustling serve --context 32768 --max-tokens 8192         # a larger window and longer replies
-rustling serve --cache-dir ~/.cache/rustling --cache-gb 8 # keep processed prompts, up to 8 GiB of them
+rustling serve --cache-gb 16                             # keep up to 16 GiB of processed prompts
+rustling serve --cache-dir /Volumes/fast/rustling        # keep them somewhere else
+rustling serve --no-cache-dir                            # keep them in memory only
 rustling serve --temperature 0.2 --top-p 0.9             # sampling for requests that do not set their own
 rustling serve --log-level debug                         # also report progress through long prompts
 ```
@@ -90,7 +93,7 @@ rustling serve --log-level debug                         # also report progress 
 A typical setup for a coding agent:
 
 ```sh
-rustling serve --context 32768 --cache-dir ~/.cache/rustling
+rustling serve --context 32768
 ```
 
 The server's flags are defaults. A request sets its own `temperature`, `top_p`, `top_k`, `seed`, `max_tokens`
@@ -126,8 +129,9 @@ rustling pull --draft && rustling chat --backend cpu --draft   # the draft model
 ## Coding agents
 
 The server speaks `POST /v1/chat/completions` and `POST /v1/responses`, with streaming and tool calls. An agent's
-opening prompt is long (10,000 tokens and more) and takes a minute or two the first time; `--cache-dir` keeps it
-between runs, after which a new session starts in a few seconds.
+opening prompt is long (10,000 tokens and more) and takes a minute or two the first time. The server keeps what
+it has processed, in memory and under `~/.cache/rustling`, so after that a new session starts in a few seconds,
+also after a restart.
 
 Give the agent a long timeout: nothing is sent while a long prompt is being processed.
 
@@ -172,6 +176,8 @@ On an M1 Max with 64 GB, with the default model, against llama.cpp running the s
 | Processing a 2,400-token prompt | 21 s | 19 s |
 | Processing a 15,000-token prompt | 118 s | 182 s |
 
+On an M4 Max, generation in a short conversation runs at about 50 tokens/s.
+
 In an agent session, most turns add a few hundred tokens to a conversation the server already holds, and those
 take 3 to 10 seconds before the reply starts. Replies that repeat text from the conversation, as edits to a
 file do, go faster than the figures above.
@@ -208,7 +214,8 @@ Everything has a default; these are the ones worth knowing. `rustling <command> 
 | `--no-reasoning` | reasoning on | Never let the model reason before answering. `--effort none` only shortens it. |
 | `--draft` | off | Use the model's draft model to propose several tokens at a time. Only helps when generating on the CPU; with the GPU it is not used. |
 | `--no-copying` | copying on | Stop proposing tokens copied from the conversation. |
-| `--cache-gb`, `--cache-dir` | 4, none | How much memory processed prompts may take, and where to keep them between runs (`serve`). |
+| `--cache-gb` | 8 | How many GiB of processed prompts to keep, in memory and again on disk (`serve`). |
+| `--cache-dir`, `--no-cache-dir` | `~/.cache/rustling` | Where they are kept between runs, or not to keep them (`serve`). |
 | `--threads` | performance cores | Worker threads for the CPU's share of the work. |
 | `--log-level` | `info` | What is reported on stderr. Also `$RUSTLING_LOG`. |
 

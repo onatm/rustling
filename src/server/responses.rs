@@ -258,6 +258,7 @@ pub(crate) async fn responses(State(App { jobs, .. }): State<App>, body: axum::b
     };
     let stream = request.stream;
     let (events, mut received) = mpsc::channel(64);
+    WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if jobs.send(Job { request, events }).is_err() {
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "the model thread has stopped");
     }

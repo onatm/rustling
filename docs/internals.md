@@ -332,8 +332,8 @@ prompt tokens were reused. Three things are kept:
 These snapshots are large, roughly 0.4 MB per token up to 1,024 tokens and 64 KB per token beyond, so a
 12,000-token prompt takes over a gigabyte. A snapshot is only taken where it saves at least a sixteenth of its
 own length over the one before it, and of a header and a shared point close together only the shared point is
-kept. `--cache-gb` (default 4) bounds their total, dropping the least recently used first. `--cache-dir <dir>` saves them on
-shutdown and loads them at start; a cache made with a different model, pass count or arithmetic is ignored.
+kept. `--cache-gb` (default 8) bounds their total, dropping the least recently used first. A snapshot made with a
+different model, pass count or arithmetic is ignored.
 
 A coding agent's opening prompt is the case this is for. opencode sends about 12,000 tokens of instructions
 and tool declarations that end with the date and the working directory. The first session pays for all of it
@@ -348,6 +348,16 @@ before each reply and steps back to it; the mark takes about 340 MB however long
 
 Clients usually drop the assistant's reasoning when they send the history back. The server restores it for
 replies it generated, which is what lets the next turn match the conversation it kept.
+
+Snapshots are saved one to a file under `~/.cache/rustling` (`--cache-dir` names another place, `--no-cache-dir`
+none), and only what has changed is written: a new snapshot two seconds after the model falls idle, and the
+conversation in the session once it has been left alone for a minute. A server that is killed therefore loses
+at most the turns of the last minute, and the next one starts from the agent's header. A snapshot holds only
+what later tokens can read: straight after a long prompt the sliding layers still hold the whole of its last
+pass, and trimming that halves the snapshot (a 2,725-token header went from 1.09 GB to 0.54 GB).
+
+A client that gives up while its prompt is being processed has usually only run out of patience. The prompt is
+finished for it unless another request is waiting, so that asking again finds the work done.
 
 ## Testing against the reference
 

@@ -68,7 +68,13 @@ fn cached_prompts_give_the_same_state_as_fresh_ones() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("prompt-cache-test");
     let _ = std::fs::remove_dir_all(&dir);
     cache.keep(&session);
-    cache.save(&dir, "test model").unwrap();
+    assert!(cache.unsaved());
+    let written = cache.save(&dir, "test model").unwrap();
+    assert_eq!(written, cache.len(), "every snapshot is new to the directory");
+    // A second save finds nothing changed and writes nothing.
+    assert!(!cache.unsaved());
+    assert_eq!(cache.save(&dir, "test model").unwrap(), 0);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), cache.len(), "one file per snapshot");
     assert!(PromptCache::load(&dir, "another model", 4 * GIB).unwrap().is_empty());
     let mut cache = PromptCache::load(&dir, "test model", 4 * GIB).unwrap();
     assert!(!cache.is_empty());
