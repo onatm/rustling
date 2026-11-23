@@ -47,6 +47,7 @@ unsafe impl Send for Kernels {}
 unsafe impl Sync for Kernels {}
 
 /// One kernel of a program: which buffers it is given, at which byte offsets, its parameters and its grid.
+#[derive(Clone)]
 pub(crate) struct Step {
     pub kernel: usize,
     /// `(buffer, byte offset)` for each binding in order; the parameters take the next binding.
@@ -100,6 +101,11 @@ impl Gpu {
     /// keys a sliding layer and a full layer see at most, for the grids that depend on it. Returns the seconds
     /// the GPU spent.
     pub(crate) fn run(&self, kernels: &[&Kernels], steps: &[Step], buffers: &[Shared], keys: [usize; 2], tokens: usize) -> Result<f64> {
+        self.run_steps(kernels, steps.iter().map(|step| (step, tokens)), buffers, keys)
+    }
+
+    /// Like `run`, but each step can cover a different number of tokens in the same submission.
+    pub(crate) fn run_steps<'s>(&self, kernels: &[&Kernels], steps: impl Iterator<Item = (&'s Step, usize)>, buffers: &[Shared], keys: [usize; 2]) -> Result<f64> {
         // Metal hands back objects that are only let go when a pool drains, and the threads this runs on
         // have none of their own: without one here, every call would leave its command buffers behind.
         objc2::rc::autoreleasepool(|_| {
@@ -107,7 +113,7 @@ impl Gpu {
             let commands = self.queue.commandBuffer().context("creating a command buffer")?;
             let encoder = commands.computeCommandEncoder().context("creating a compute encoder")?;
             let wide = MTLSize { width: 32, height: 1, depth: 1 };
-            for step in steps {
+            for (step, tokens) in steps {
                 encoder.setComputePipelineState(pipelines[step.kernel]);
                 // SAFETY: the buffers outlive the submission, which is waited for below; the offsets were laid out
                 // within them by the program's builder; Metal copies the parameter bytes during the call.

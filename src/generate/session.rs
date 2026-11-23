@@ -329,8 +329,15 @@ impl<'m, 'a> Session<'m, 'a> {
         };
         // In chunks, which on the exact paths give the same states as one pass: memory stays bounded, and the
         // caller hears of progress and can give up.
-        for chunk in ids[reused..].chunks(self.model.prompt_chunk()) {
-            self.extend(chunk)?;
+        let piece = if self.draft.is_some() { self.model.prompt_chunk() } else { self.model.prompt_piece(reused, ids.len() - reused) };
+        for chunk in ids[reused..].chunks(piece) {
+            if self.draft.is_none() {
+                let final_piece = self.context.len() + chunk.len() == ids.len();
+                (self.last, self.ahead) = self.model.prompt_tail(chunk, &mut self.state, final_piece)?;
+                self.context.extend_from_slice(chunk);
+            } else {
+                self.extend(chunk)?;
+            }
             ensure!(progress(self.context.len()) || self.context.len() == ids.len(), "{ABANDONED}");
         }
         // What the prompt was processed in is not needed to generate from it.

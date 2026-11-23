@@ -25,6 +25,13 @@ const FIRST_CAPACITY: usize = 8192;
 /// The most tokens one submission takes: a token and as many proposals as can be taken back after it.
 pub(crate) const MAX_BATCH: usize = super::MAX_ROLLBACK + 1;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Projection {
+    All,
+    Last,
+    None,
+}
+
 // Buffers, by their place in the list.
 const SCRATCH: usize = 0;
 const CONSTANTS: usize = 1;
@@ -100,17 +107,19 @@ struct VisitSlots {
 
 /// What a batch of tokens left behind.
 pub(crate) struct Tokens {
-    /// The final normed state of each token, one after another.
+    /// The final normed states, or just the last one when processing a prompt.
     pub last: Vec<f32>,
     /// For each of the visits asked for, the hidden state entering it for each token.
     pub taps: Vec<Vec<f32>>,
-    /// Each token's soft-capped logits over the usable vocabulary.
+    /// The requested soft-capped logits over the usable vocabulary.
     pub logits: Vec<Vec<f32>>,
 }
 
 pub(crate) struct Decoder {
     kernels: [Kernels; 2],
     steps: Vec<Step>,
+    /// Index of the vocabulary projection. Prompt batches only need it for the final prompt token.
+    head_start: usize,
     buffers: Vec<Shared>,
     visits: Vec<VisitSlots>,
     embed: usize,
@@ -506,6 +515,7 @@ impl Decoder {
         let last = builder.norm(read, Some(&model.final_norm), h, 1, cfg.rms_norm_eps);
         let (unembed, vocab) = (&model.unembed, cfg.unpadded_vocab_size);
         let in_order = (CONSTANTS, builder.in_order * 4);
+        let head_start = builder.steps.len();
         let logits = builder.rows(unembed.format, &unembed.bytes, (vocab, h), 1, in_order, last, 0)?;
         let params = [Word::Count(vocab), Word::Real(cfg.final_logit_softcapping)];
         builder.step(SOFT_CAP, vec![(SCRATCH, logits * 4)], &params, Grid::Threads(vocab, 1));
@@ -532,6 +542,7 @@ impl Decoder {
                 gpu.kernels(include_str!("../gpu/shaders/decode.metal"), &STEP_KERNELS)?,
             ],
             steps,
+            head_start,
             buffers,
             visits: builder.visits,
             embed,
@@ -546,7 +557,7 @@ impl Decoder {
 
     /// Runs a batch of tokens, each seeing the ones before it, and adds them to `state`. `embedded` holds their
     /// embeddings one after another.
-    pub(crate) fn tokens(&mut self, model: &Model, gpu: &Gpu, state: &mut State, embedded: &[f32], taps: &[usize]) -> Result<Tokens> {
+    pub(super) fn tokens(&mut self, model: &Model, gpu: &Gpu, state: &mut State, embedded: &[f32], taps: &[usize], projection: Projection) -> Result<Tokens> {
         let cfg = &model.cfg;
         let (h, k, stride) = (cfg.hidden_size, cfg.sconv_kernel_size, self.token_stride);
         let count = embedded.len() / h;
@@ -580,7 +591,23 @@ impl Decoder {
 
         let end = position + count;
         let keys = [end.min(cfg.sliding_window_size), end];
-        let ran = gpu.run(&[&self.kernels[0], &self.kernels[1]], &self.steps, &self.buffers, keys, count);
+        let kernels = [&self.kernels[0], &self.kernels[1]];
+        let (body, head) = self.steps.split_at(self.head_start);
+        let ran = match projection {
+            Projection::None => gpu.run(&kernels, body, &self.buffers, keys, count),
+            Projection::Last if count > 1 => {
+                // Bind the head to the final token's scratch, then dispatch it only one token deep.
+                let mut last_head = head.to_vec();
+                for step in &mut last_head {
+                    for (buffer, offset) in &mut step.buffers {
+                        if *buffer == SCRATCH { *offset += (count - 1) * stride * 4; }
+                    }
+                }
+                let steps = body.iter().map(|step| (step, count)).chain(last_head.iter().map(|step| (step, 1)));
+                gpu.run_steps(&kernels, steps, &self.buffers, keys)
+            }
+            _ => gpu.run(&kernels, &self.steps, &self.buffers, keys, count),
+        };
         // The tables go back to the state whatever happened; only a run that worked adds to it.
         self.exchange_tables(state);
         self.gpu_seconds = ran?;
@@ -601,10 +628,15 @@ impl Decoder {
         state.position = end;
 
         let of_each = |at: usize, len: usize| -> Vec<&[f32]> { (0..count).map(|t| &floats[t * stride + at..][..len]).collect() };
+        let of_last = |at: usize, len: usize| floats[(count - 1) * stride + at..][..len].to_vec();
         Ok(Tokens {
-            last: of_each(self.last, h).concat(),
+            last: if projection == Projection::All { of_each(self.last, h).concat() } else { of_last(self.last, h) },
             taps: taps.iter().map(|&visit| of_each(self.visits[visit].input, h).concat()).collect(),
-            logits: of_each(self.logits, cfg.unpadded_vocab_size).into_iter().map(<[f32]>::to_vec).collect(),
+            logits: match projection {
+                Projection::All => of_each(self.logits, cfg.unpadded_vocab_size).into_iter().map(<[f32]>::to_vec).collect(),
+                Projection::Last => vec![of_last(self.logits, cfg.unpadded_vocab_size)],
+                Projection::None => Vec::new(),
+            },
         })
     }
 
@@ -817,6 +849,25 @@ mod tests {
                 eprintln!("a batch of {count} at {}: {:.1} ms, {:.1} ms a token", from - count, seconds * 1e3, seconds * 1e3 / count as f64);
             }
         }
+        // A prompt needs only its final logits. Skipping earlier projections must still leave
+        // exactly the same state for the next decoding step.
+        for size in [1, MAX_BATCH, 2 * MAX_BATCH + 1] {
+            let batch = ids(0, size as u32);
+            let (mut prompt, mut reference) = (model.new_state(), model.new_state());
+            let mut chunks = batch.chunks(MAX_BATCH).peekable();
+            let (last, logits) = loop {
+                let chunk = chunks.next().unwrap();
+                let final_piece = chunks.peek().is_none();
+                let result = model.prompt_tail(chunk, &mut prompt, final_piece).unwrap();
+                if final_piece { break result; }
+                assert!(result.1.is_none());
+            };
+            let expected = batch.chunks(MAX_BATCH).map(|chunk| model.forward(chunk, &mut reference, false).unwrap()).last().unwrap();
+            assert_eq!(last, expected.last[expected.last.len() - h..]);
+            assert!(logits.unwrap() == expected.logits.unwrap().pop().unwrap());
+            let next = |state: &mut State| model.forward(&[500], state, false).unwrap().logits;
+            assert!(next(&mut prompt) == next(&mut reference));
+        }
     }
 
     /// Where a token's time goes with a long conversation behind it.
@@ -880,7 +931,7 @@ mod tests {
         // One token through the model's own decoder, checked against a refill.
         let mut single = |state: &mut State, id: u32, what: &str| {
             let mut copy = state.clone();
-            let expected = refilled.tokens(&model, gpu, &mut copy, &model.embed(id).unwrap(), &[]).unwrap();
+            let expected = refilled.tokens(&model, gpu, &mut copy, &model.embed(id).unwrap(), &[], Projection::All).unwrap();
             let actual = model.forward(&[id], state, false).unwrap();
             assert!(actual.last == expected.last, "{what}: the token differs from one computed on refilled tables");
             assert!(actual.logits == Some(expected.logits), "{what}: logits differ");
@@ -948,7 +999,7 @@ mod tests {
         for (t, &id) in ids.iter().enumerate() {
             let expected = model.forward(&[id], &mut on_cpu, true).unwrap();
             let started = std::time::Instant::now();
-            let token = decoder.tokens(&model, gpu, &mut on_gpu, &model.embed(id).unwrap(), &[]).unwrap();
+            let token = decoder.tokens(&model, gpu, &mut on_gpu, &model.embed(id).unwrap(), &[], Projection::All).unwrap();
             let last = token.last;
             let logits_apart = apart(&token.logits[0], &model.logits(&expected.last).unwrap());
             let seconds = started.elapsed().as_secs_f64();

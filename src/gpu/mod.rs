@@ -283,6 +283,10 @@ impl Gpu {
         self.fast
     }
 
+    pub(crate) fn is_m4_max(&self) -> bool {
+        self.device.name().to_string() == "Apple M4 Max"
+    }
+
     /// A working buffer of at least `bytes`, kept under `slot` for reuse. Its contents are whatever the last use
     /// left there.
     /// Lets go of the working buffers of the long-batch paths, which are gigabytes after a long prompt. They are

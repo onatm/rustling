@@ -476,6 +476,33 @@ impl<'a> Model<'a> {
         self.run(ids, state, trace, &[])
     }
 
+    /// On M4 Max two decoder batches beat the hybrid path for a short fresh GGUF prompt.
+    /// Cached additions and larger batches did not consistently benefit.
+    pub(crate) fn prompt_piece(&self, reused: usize, remaining: usize) -> usize {
+        if reused == 0 && remaining <= 2 * decode::MAX_BATCH && self.decodes_on_gpu() && self.gpu.as_ref().is_some_and(Gpu::is_m4_max) {
+            decode::MAX_BATCH
+        } else {
+            self.prompt_chunk()
+        }
+    }
+
+    /// Extend a prompt and return its last state. Only the final piece needs vocabulary logits.
+    pub(crate) fn prompt_tail(&self, ids: &[u32], state: &mut State, final_piece: bool) -> Result<(Seq, Option<Vec<f32>>)> {
+        let short = if (1..=decode::MAX_BATCH).contains(&ids.len()) {
+            let projection = if final_piece { decode::Projection::Last } else { decode::Projection::None };
+            self.decode(ids, state, &[], projection)?
+        } else {
+            None
+        };
+        let mut forward = match short {
+            Some(decoded) => decoded,
+            None => in_pool(|| self.run_in_pool(ids, state, false, &[]))?,
+        };
+        let h = self.cfg.hidden_size;
+        let last = if forward.last.len() == h { forward.last } else { forward.last.split_off(forward.last.len() - h) };
+        Ok((last, forward.logits.and_then(|mut logits| logits.pop())))
+    }
+
     /// As [`Model::forward`], also keeping the hidden state that enters each of the visits in `taps`.
     pub fn forward_tapped(&self, ids: &[u32], state: &mut State, taps: &[usize]) -> Result<Forward> {
         self.run(ids, state, false, taps)
@@ -500,7 +527,7 @@ impl<'a> Model<'a> {
         #[cfg(target_os = "macos")]
         if !trace
             && (1..=decode::MAX_BATCH).contains(&ids.len())
-            && let Some(forward) = self.decode(ids, state, taps)?
+            && let Some(forward) = self.decode(ids, state, taps, decode::Projection::All)?
         {
             return Ok(forward);
         }
@@ -543,7 +570,7 @@ impl<'a> Model<'a> {
     /// A token or a short batch on the GPU, when the model is set up for it: a GGUF file on the fast backend.
     /// Nothing otherwise, or when the GPU fails, and the caller takes the CPU path with the state untouched.
     #[cfg(target_os = "macos")]
-    fn decode(&self, ids: &[u32], state: &mut State, taps: &[usize]) -> Result<Option<Forward>> {
+    fn decode(&self, ids: &[u32], state: &mut State, taps: &[usize], projection: decode::Projection) -> Result<Option<Forward>> {
         let Some(gpu) = self.gpu.as_ref().filter(|_| self.decodes_on_gpu() && !float_reference()) else { return Ok(None) };
         let Some(decoder) = self.decoder() else { return Ok(None) };
         let mut embedded = Vec::with_capacity(ids.len() * self.cfg.hidden_size);
@@ -551,7 +578,7 @@ impl<'a> Model<'a> {
             embedded.extend(self.embed(id)?);
         }
         let started = std::time::Instant::now();
-        let result = decoder.lock().expect("decoder lock").tokens(self, gpu, state, &embedded, taps);
+        let result = decoder.lock().expect("decoder lock").tokens(self, gpu, state, &embedded, taps, projection);
         timing::since(Stage::Token, started);
         match result {
             Ok(tokens) => Ok(Some(Forward { hidden: Vec::new(), last: tokens.last, taps: tokens.taps, logits: Some(tokens.logits) })),
