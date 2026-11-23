@@ -167,6 +167,13 @@ with the model name `inkling-2-mini`.
 
 ## Performance
 
+To try experimental split attention for long-context GGUF generation, build with
+`cargo build --release --features split-attention` and run `target/release/rustling` with a context
+window large enough for the prompt and reply (for example, `serve --context 65536`).
+It splits full attention across blocks of cached keys on the same GPU when generating one token
+with at least 32,768 visible keys. Prompt processing in large batches and speculative verification
+batches use the usual kernels. The different order of floating-point sums can change a reply.
+
 On an M1 Max with 64 GB, with the default model, against llama.cpp running the same file:
 
 | | rustling | llama.cpp |

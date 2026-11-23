@@ -16,6 +16,57 @@ fn floats(len: usize, seed: u64) -> Vec<f32> {
 }
 
 #[test]
+fn split_attention_matches_stable_softmax_with_sink_and_distance_bias() {
+    let gpu = Gpu::new(&[], true).unwrap();
+    let kernels = gpu.kernels(include_str!("shaders/decode.metal"), &["attention_blocks", "attention_reduce"]).unwrap();
+    let (dim, heads, extent) = (128usize, 6usize, 5usize);
+    for seen in [127usize, 128, 129, 8193] {
+        let blocks = seen.div_ceil(128);
+        let (kc, vc) = (seen + 6, seen + 11);
+        let (q, k, v) = (floats(heads * dim, 1), floats(2 * kc * dim, 2), floats(2 * vc * dim, 3));
+        let bias: Vec<_> = floats(heads * extent, 4).into_iter().map(|x| x * 6.).collect();
+        let sinks = [-10., 2., 12., 100., -2., 9.];
+        let gate = floats(heads * dim, 5);
+        let shared = |x: &[f32]| {
+            let mut buf = gpu.shared(x.len() * 4).unwrap();
+            buf.floats_mut()[..x.len()].copy_from_slice(x);
+            buf
+        };
+        let buffers = [
+            shared(&q), shared(&k), shared(&v), shared(&bias), shared(&[f32::from_bits((seen - 1) as u32)]),
+            shared(&[0., f32::from_bits(kc as u32), f32::from_bits(vc as u32)]), gpu.shared(blocks * heads * 132 * 4).unwrap(),
+            shared(&sinks), shared(&gate), gpu.shared(heads * dim * 4).unwrap(),
+        ];
+        let scale = (dim as f32).powf(-0.5);
+        let steps = [
+            Step { kernel: 0, buffers: (0..7).map(|i| (i, 0)).collect(),
+                params: [extent as u32, scale.to_bits()].into_iter().flat_map(u32::to_le_bytes).collect(),
+                grid: Grid::KeyBlocks { rows: 2, block: 128 } },
+            Step { kernel: 1, buffers: [6, 7, 8, 4, 9].map(|i| (i, 0)).to_vec(), params: vec![],
+                grid: Grid::Wide { groups: heads, threads: 256 } },
+        ];
+        gpu.run(&[&kernels], &steps, &buffers, [seen, seen], 1).unwrap();
+        for head in 0..heads {
+            let scores: Vec<_> = (0..seen).map(|j| {
+                let key = (head / 3 * kc + j) * dim;
+                let dot: f64 = (0..dim).map(|i| q[head * dim + i] as f64 * k[key + i] as f64).sum();
+                let back = seen - 1 - j;
+                dot * scale as f64 + if back < extent { bias[head * extent + back] as f64 } else { 0. }
+            }).collect();
+            let max = scores.iter().copied().fold(sinks[head] as f64, f64::max);
+            let w: Vec<_> = scores.iter().map(|s| (s - max).exp()).collect();
+            let mass = w.iter().sum::<f64>() + (sinks[head] as f64 - max).exp();
+            for i in 0..dim {
+                let at = head * dim + i;
+                let sum: f64 = w.iter().enumerate().map(|(j, w)| w * v[(head / 3 * vc + j) * dim + i] as f64).sum();
+                let want = sum / mass / (1. + (-gate[at] as f64).exp());
+                assert!((buffers[9].floats()[at] as f64 - want).abs() < 1e-5, "head {head}, component {i}, keys {seen}");
+            }
+        }
+    }
+}
+
+#[test]
 fn dense_matches_the_cpu_kernel_exactly() {
     let gpu = Gpu::new(&[], true).unwrap();
     // A small case, and the real width with a vector count that is not a multiple of the share.

@@ -66,6 +66,8 @@ pub(crate) enum Grid {
     Wide { groups: usize, threads: usize },
     /// A thread per visible key and row; how many keys are visible is known only when the program runs.
     Keys { local: bool, rows: usize },
+    /// One group per block of full-attention keys and KV head, for a single token.
+    KeyBlocks { rows: usize, block: usize },
 }
 
 impl Gpu {
@@ -135,6 +137,9 @@ impl Gpu {
                     Grid::Keys { local, rows } => {
                         encoder.dispatchThreads_threadsPerThreadgroup(size(keys[usize::from(!local)], rows), wide)
                     }
+                    Grid::KeyBlocks { rows, block } => encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                        size(keys[1].div_ceil(block), rows), MTLSize { width: block, height: 1, depth: 1 },
+                    ),
                 }
             }
             encoder.endEncoding();

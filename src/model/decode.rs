@@ -40,9 +40,9 @@ const TABLES: usize = 3;
 
 // Kernels, by their place in the two lists they are built from.
 const ROW_KERNELS: [&str; 5] = ["row_q4k", "row_q5_0", "row_q6k", "row_q8_0", "row_f32"];
-const STEP_KERNELS: [&str; 14] = [
+const STEP_KERNELS: [&str; 16] = [
     "rms_norm", "scale_clip", "residual_read", "merge", "conv", "distance_bias", "attention_scores",
-    "attention_weights", "attention_values", "store", "route", "activation", "combine", "soft_cap",
+    "attention_weights", "attention_values", "store", "route", "activation", "combine", "soft_cap", "attention_blocks", "attention_reduce",
 ];
 const RMS_NORM: usize = 5;
 const SCALE_CLIP: usize = 6;
@@ -58,6 +58,11 @@ const ROUTE: usize = 15;
 const ACTIVATION: usize = 16;
 const COMBINE: usize = 17;
 const SOFT_CAP: usize = 18;
+const ATTENTION_BLOCKS: usize = 19;
+const ATTENTION_REDUCE: usize = 20;
+const KEY_BLOCK: usize = 128;
+/// Shorter conversations don't reliably repay merging the block results.
+const SPLIT_MIN_KEYS: usize = 32768;
 
 fn row_kernel(format: Format) -> Result<usize> {
     Ok(match format {
@@ -118,6 +123,9 @@ pub(crate) struct Tokens {
 pub(crate) struct Decoder {
     kernels: [Kernels; 2],
     steps: Vec<Step>,
+    /// Alternate single-token program. Empty when split attention isn't built for this model.
+    single_long: Vec<Step>,
+    split_min_keys: usize,
     /// Index of the vocabulary projection. Prompt batches only need it for the final prompt token.
     head_start: usize,
     buffers: Vec<Shared>,
@@ -141,6 +149,7 @@ struct Builder<'m, 'a> {
     gpu: &'m Gpu,
     /// The kernels so far, their parameters still to be packed.
     steps: Vec<(usize, Vec<(usize, usize)>, Vec<Word>, Grid)>,
+    attention_replacements: Vec<(usize, [Step; 2])>,
     constants: Vec<f32>,
     weights: Vec<Shared>,
     first_weight: usize,
@@ -407,6 +416,21 @@ impl<'m, 'a> Builder<'m, 'a> {
         let buffers = vec![(SCORES, 0), (tables[1], 0), (SCRATCH, gate * 4), (SCRATCH, attended * 4), (SCRATCH, 0), (SCRATCH, info * 4)];
         ensure!(heads / kv_heads <= 4, "the attention kernels hold four query heads to a key head");
         self.step(ATTENTION_VALUES, buffers, &attention, Grid::Wide { groups: heads * dim / 16, threads: 32 * value_width });
+        if cfg!(any(test, feature = "split-attention")) && !local && dim == 128 && heads == 3 * kv_heads {
+            let part = Step {
+                kernel: ATTENTION_BLOCKS,
+                buffers: vec![(SCRATCH, q * 4), (tables[0], 0), (tables[1], 0), (SCRATCH, bias * 4), (SCRATCH, 0), (SCRATCH, info * 4), (SCORES, 0)],
+                params: words(&[Word::Count(extent), Word::Real((dim as f32).powf(-0.5))], 0),
+                grid: Grid::KeyBlocks { rows: kv_heads, block: KEY_BLOCK },
+            };
+            let reduce = Step {
+                kernel: ATTENTION_REDUCE,
+                buffers: vec![(SCORES, 0), (SCRATCH, sinks * 4), (SCRATCH, gate * 4), (SCRATCH, 0), (SCRATCH, attended * 4)],
+                params: vec![],
+                grid: Grid::Wide { groups: heads, threads: 256 },
+            };
+            self.attention_replacements.push((self.steps.len() - 3, [part, reduce]));
+        }
         let attn = self.product(&layer.wo, attended)?;
 
         // The first layer of a block starts a fresh residual; the block's input becomes a source instead.
@@ -472,6 +496,7 @@ impl Decoder {
             model,
             gpu,
             steps: Vec::new(),
+            attention_replacements: Vec::new(),
             constants: Vec::new(),
             weights: Vec::new(),
             first_weight: TABLES + 2 * visit_count,
@@ -521,10 +546,14 @@ impl Decoder {
         builder.step(SOFT_CAP, vec![(SCRATCH, logits * 4)], &params, Grid::Threads(vocab, 1));
 
         let token_stride = builder.used;
-        let steps = std::mem::take(&mut builder.steps)
+        let steps: Vec<_> = std::mem::take(&mut builder.steps)
             .into_iter()
             .map(|(kernel, buffers, params, grid)| Step { kernel, buffers, params: words(&params, token_stride), grid })
             .collect();
+        let mut single_long = if builder.attention_replacements.is_empty() { Vec::new() } else { steps.clone() };
+        for (at, pair) in builder.attention_replacements.drain(..).rev() {
+            single_long.splice(at..at + 3, pair);
+        }
         let mut buffers = vec![
             gpu.shared(MAX_BATCH * token_stride * 4)?,
             gpu.shared(builder.constants.len() * 4)?,
@@ -539,9 +568,11 @@ impl Decoder {
         Ok(Self {
             kernels: [
                 gpu.kernels(include_str!("../gpu/shaders/gguf.metal"), &ROW_KERNELS)?,
-                gpu.kernels(include_str!("../gpu/shaders/decode.metal"), &STEP_KERNELS)?,
+                gpu.kernels(include_str!("../gpu/shaders/decode.metal"), if single_long.is_empty() { &STEP_KERNELS[..14] } else { &STEP_KERNELS })?,
             ],
             steps,
+            single_long,
+            split_min_keys: if cfg!(feature = "split-attention") { SPLIT_MIN_KEYS } else { usize::MAX },
             head_start,
             buffers,
             visits: builder.visits,
@@ -594,6 +625,9 @@ impl Decoder {
         let kernels = [&self.kernels[0], &self.kernels[1]];
         let (body, head) = self.steps.split_at(self.head_start);
         let ran = match projection {
+            Projection::All | Projection::Last if count == 1 && end >= self.split_min_keys && !self.single_long.is_empty() => {
+                gpu.run(&kernels, &self.single_long, &self.buffers, keys, count)
+            }
             Projection::None => gpu.run(&kernels, body, &self.buffers, keys, count),
             Projection::Last if count > 1 => {
                 // Bind the head to the final token's scratch, then dispatch it only one token deep.
@@ -899,6 +933,52 @@ mod tests {
             eprintln!("  {name}: {count} dispatches, {ms:.2} ms");
         }
         eprintln!("  in all {total:.1} ms");
+    }
+
+    /// A/B long-context decode on identical cached source-code prompts.
+    #[test]
+    #[ignore]
+    fn compare_split_decode() {
+        use crate::generate::{sampler::{Sampler, SamplerConfig}, session::{Limits, Session}};
+        use crate::prompt::Prompter;
+        let _turn = my_turn();
+        let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
+        let weights = Checkpoint::open(&path).unwrap();
+        let config = Config::load(&path).unwrap();
+        let model = Model::load(&config, &weights, Options { activations: Activations::Float, backend: Backend::MetalFast }).unwrap();
+        let text = [include_str!("experts.rs"), include_str!("attention.rs"), include_str!("mat.rs")].concat().repeat(3);
+        let ids = Prompter::load(&path).unwrap().encode(&text).unwrap();
+        let decoder = model.decoder().unwrap();
+        let mut prefix = Session::new(&model);
+        for n in [8192, 16384, 32768] {
+            prefix.set_context(&ids[..n]).unwrap();
+            let snapshot = prefix.snapshot();
+            let mut reference = None;
+            for split in [false, true, true, false] {
+                let mut s = Session::new(&model).with_copying(false);
+                s.restore(snapshot.clone()).unwrap();
+                // Grow tables and the decoder program outside the timed section.
+                decoder.lock().unwrap().split_min_keys = usize::MAX;
+                s.set_context(&ids[..n + 1]).unwrap();
+                let mut d = decoder.lock().unwrap();
+                assert!(!d.single_long.is_empty());
+                d.split_min_keys = if split { 1 } else { usize::MAX };
+                drop(d);
+                s.set_context(&ids[..n + 2]).unwrap();
+                let logits = s.logits().unwrap();
+                let reference = reference.get_or_insert_with(|| logits.clone());
+                let err = logits.iter().zip(reference.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>();
+                let norm = reference.iter().map(|x| x * x).sum::<f32>();
+                let relative = (err / norm).sqrt();
+                let mut sampler = Sampler::new(SamplerConfig { temperature: 0., ..Default::default() }, Some(0));
+                let t = std::time::Instant::now();
+                let limits = Limits { max_tokens: 96, stop_on_loop: false };
+                let (reply, _) = s.generate(&mut sampler, limits, u32::MAX, |_, _| Ok(true)).unwrap();
+                let speed = reply.len() as f64 / t.elapsed().as_secs_f64();
+                eprintln!("{n} split={split}: {speed:.2} tok/s, next-token logit relative L2 {relative:.2e}");
+                assert!(relative < 0.02);
+            }
+        }
     }
 
     /// Tokens from the GPU mixed with everything else that changes a state: prompts and batches on the CPU,

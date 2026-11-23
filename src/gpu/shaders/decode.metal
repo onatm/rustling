@@ -422,6 +422,113 @@ kernel void attention_values(const device float* weights [[buffer(0)]],
     }
 }
 
+// Single-token full attention, 3 query heads per KV head and 128 dimensions. Each
+// group reads 128 keys and values once for all three heads. Store the maximum, sum
+// of exponentials, and unnormalised weighted values for a stable merge across blocks.
+struct SplitParams { uint extent; float scaling; };
+kernel void attention_blocks(const device float4* query [[buffer(0)]],
+                             const device float4* keys [[buffer(1)]],
+                             const device float4* values [[buffer(2)]],
+                             const device float* bias [[buffer(3)]],
+                             const device Token* token [[buffer(4)]],
+                             const device Visit* visit [[buffer(5)]],
+                             device float* partial [[buffer(6)]],
+                             constant SplitParams& p [[buffer(7)]],
+                             uint2 group [[threadgroup_position_in_grid]],
+                             ushort lane [[thread_index_in_simdgroup]],
+                             ushort sg [[simdgroup_index_in_threadgroup]],
+                             ushort tid [[thread_index_in_threadgroup]]) {
+    uint seen = token->position + 1, blocks = (seen + 127) / 128;
+    uint start = group.x * 128, head = group.y * 3;
+    threadgroup float scores[3][128];
+    threadgroup float stats[3][4];
+    threadgroup float4 sums[3][4][32];
+    float4 q[3];
+    for (uint h = 0; h < 3; h++) q[h] = query[(head+h)*32+lane];
+    for (uint i = sg; i < 128; i += 4) {
+        uint j = start + i;
+        if (j >= seen) break;
+        float4 k = keys[(group.y*visit->key_capacity+j-visit->first)*32+lane];
+        uint back = seen-1-j;
+        for (uint h = 0; h < 3; h++) {
+            float s = simd_sum(dot(q[h],k))*p.scaling;
+            if (!lane) scores[h][i] = s + (back < p.extent ? bias[(head+h)*p.extent+back] : 0.f);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float hi[3], w[3];
+    for (uint h = 0; h < 3; h++) {
+        float s = start+tid < seen ? scores[h][tid] : -INFINITY;
+        float m = simd_max(s);
+        if (!lane) stats[h][sg] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint h = 0; h < 3; h++) {
+        hi[h] = max(max(stats[h][0],stats[h][1]),max(stats[h][2],stats[h][3]));
+        w[h] = start+tid < seen ? exp(scores[h][tid]-hi[h]) : 0.f;
+        scores[h][tid] = w[h];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 accum[3] = {};
+    for (uint i = sg; i < 128 && start+i < seen; i += 4) {
+        float4 v = values[(group.y*visit->value_capacity+start+i-visit->first)*32+lane];
+        for (uint h = 0; h < 3; h++) accum[h] += scores[h][i]*v;
+    }
+    for (uint h = 0; h < 3; h++) {
+        float mass = simd_sum(w[h]);
+        if (!lane) stats[h][sg] = mass;
+        sums[h][sg][lane] = accum[h];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg < 3) {
+        device float* out = partial + ((head+sg)*blocks+group.x)*132;
+        ((device float4*)out)[lane] = sums[sg][0][lane]+sums[sg][1][lane]+sums[sg][2][lane]+sums[sg][3][lane];
+        if (!lane) {
+            out[128] = hi[sg];
+            out[129] = stats[sg][0]+stats[sg][1]+stats[sg][2]+stats[sg][3];
+        }
+    }
+}
+
+kernel void attention_reduce(const device float* partial [[buffer(0)]],
+                             const device float* sinks [[buffer(1)]],
+                             const device float4* gates [[buffer(2)]],
+                             const device Token* token [[buffer(3)]],
+                             device float4* out [[buffer(4)]],
+                             uint head [[threadgroup_position_in_grid]],
+                             ushort sg [[simdgroup_index_in_threadgroup]],
+                             ushort lane [[thread_index_in_simdgroup]]) {
+    uint blocks = (token->position+128)/128;
+    partial += head*blocks*132;
+    // Each SIMD group combines an eighth of the blocks. Include the zero-valued
+    // sink exactly once in the final denominator.
+    float hi = sinks[head];
+    for (uint i = sg*32+lane; i < blocks; i += 256) hi = max(hi,partial[i*132+128]);
+    threadgroup float maxima[8], masses[8];
+    threadgroup float4 sums[8][32];
+    hi = simd_max(hi);
+    if (!lane) maxima[sg] = hi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint g = 0; g < 8; g++) hi = max(hi,maxima[g]);
+    float mass = 0;
+    float4 sum = 0;
+    for (uint i = sg; i < blocks; i += 8) {
+        const device float* block = partial+i*132;
+        float scale = exp(block[128]-hi);
+        mass += block[129]*scale;
+        sum += ((const device float4*)block)[lane]*scale;
+    }
+    if (!lane) masses[sg] = mass;
+    sums[sg][lane] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!sg) {
+        mass = exp(sinks[head]-hi);
+        sum = 0;
+        for (uint g = 0; g < 8; g++) { mass += masses[g]; sum += sums[g][lane]; }
+        out[head*32+lane] = sum/mass/(1.f+exp(-gates[head*32+lane]));
+    }
+}
+
 struct StoreParams {
     uint heads;
     uint dim;

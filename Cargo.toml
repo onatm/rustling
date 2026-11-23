@@ -6,6 +6,9 @@ description = "A fast local inference engine for Inkling 2 Mini on Apple silicon
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
+[features]
+split-attention = []
+
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"

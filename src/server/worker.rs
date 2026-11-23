@@ -77,7 +77,8 @@ pub(crate) fn worker(model_dir: &Path, options: ServerOptions, queue: std_mpsc::
         config.text_config.visits().len(),
         options.model.activations,
         // The fast path's states differ from the exact ones, so the two must not share snapshots.
-        if model.on_fast_path() { "fast" } else { "exact" },
+        if cfg!(feature = "split-attention") && model.decodes_on_gpu() { "fast-split" }
+        else if model.on_fast_path() { "fast" } else { "exact" },
         draft.is_some(),
     );
     let mut cache = match &options.cache_dir {
