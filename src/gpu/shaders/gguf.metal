@@ -240,6 +240,36 @@ static inline float unit_q8_0(const device uchar* row, const device float* x, ui
     return read_half(block) * (acc.x + acc.y + acc.z + acc.w);
 }
 
+struct ProjectionParams {
+    uint cols, end_q, end_k, end_v, end_rel, token_stride;
+};
+
+// One output range per matrix. All groups use the same two-row Q8_0 reduction,
+// even when K and V have different normalized inputs from Q.
+kernel void q8_attention_projections(const device uchar* wq [[buffer(0)]], const device uchar* wk [[buffer(1)]],
+                                     const device uchar* wv [[buffer(2)]], const device uchar* wr [[buffer(3)]],
+                                     const device uchar* wg [[buffer(4)]], const device float* q [[buffer(5)]],
+                                     const device float* k [[buffer(6)]], const device float* v [[buffer(7)]],
+                                     device float* out [[buffer(8)]], constant ProjectionParams& p [[buffer(9)]],
+                                     uint3 group [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_threadgroup]]) {
+    uint row = 2 * group.x + lane / 16;
+    const device uchar* weights = wq;
+    const device float* input = q;
+    if (row >= p.end_rel) { weights = wg; row -= p.end_rel; }
+    else if (row >= p.end_v) { weights = wr; row -= p.end_v; }
+    else if (row >= p.end_k) { weights = wv; input = v; row -= p.end_k; }
+    else if (row >= p.end_q) { weights = wk; input = k; row -= p.end_q; }
+    uint shift = group.z * p.token_stride;
+    weights += ulong(row) * (p.cols / 32) * 34;
+    input += shift;
+    float sum = 0.f;
+    for (uint unit = lane % 16; unit < p.cols / 32; unit += 16) sum += unit_q8_0(weights, input, unit);
+    for (uint which = 0; which < 2; which++) {
+        float total = simd_sum(lane / 16 == which ? sum : 0.f);
+        if (lane == 0) out[shift + 2 * group.x + which] = total;
+    }
+}
+
 static inline float unit_q5_0(const device uchar* row, const device float* x, uint unit) {
     const device uchar* block = row + unit * 22;
     uint high = uint(block[2]) | (uint(block[3]) << 8) | (uint(block[4]) << 16) | (uint(block[5]) << 24);

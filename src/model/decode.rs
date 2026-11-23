@@ -39,8 +39,9 @@ const SCORES: usize = 2;
 const TABLES: usize = 3;
 
 // Kernels, by their place in the two lists they are built from.
-const ROW_KERNELS: [&str; 9] = ["row_q4k", "row_q5_0", "row_q6k", "row_q8_0", "row_f32", "row_bf16", "row_nvfp4", "row_q5k", "expert_scale"];
+const ROW_KERNELS: [&str; 10] = ["row_q4k", "row_q5_0", "row_q6k", "row_q8_0", "row_f32", "row_bf16", "row_nvfp4", "row_q5k", "expert_scale", "q8_attention_projections"];
 const EXPERT_SCALE: usize = 8;
+const Q8_ATTENTION_PROJECTIONS: usize = 9;
 const STEP_KERNELS: [&str; 16] = [
     "rms_norm", "scale_clip", "residual_read", "merge", "conv", "distance_bias", "attention_scores",
     "attention_weights", "attention_values", "store", "route", "activation", "combine", "soft_cap", "attention_blocks", "attention_reduce",
@@ -236,6 +237,28 @@ impl<'m, 'a> Builder<'m, 'a> {
         self.rows(matrix.format, &matrix.bytes, (matrix.rows, matrix.cols), 1, (CONSTANTS, self.in_order * 4), x, 0)
     }
 
+    /// Independent Q/K/V, relative-position, and gate products can share one grid.
+    fn attention_projections(&mut self, matrices: [&Mat; 5], [q, k, v]: [usize; 3]) -> Result<[usize; 5]> {
+        let cols = matrices[0].cols;
+        let mut outputs = [0; 5];
+        if matrices.iter().all(|m| m.format == Format::Q8_0 && m.cols == cols && m.rows % 4 == 0) {
+            let mut buffers = Vec::with_capacity(9);
+            for m in matrices { buffers.push(self.weight(&m.bytes)?); }
+            // Each matrix ends on a four-float boundary; alloc leaves no gaps.
+            outputs = matrices.map(|m| self.alloc(m.rows));
+            buffers.extend([q, k, v, outputs[0]].map(|at| (SCRATCH, at * 4)));
+            let heights = matrices.map(|m| m.rows);
+            let [a, b, c, d, _] = heights;
+            let params = [cols, a, a + b, a + b + c, a + b + c + d].map(Word::Count);
+            self.step(Q8_ATTENTION_PROJECTIONS, buffers, &params, Grid::Groups(heights.iter().sum::<usize>() / 2, 1));
+        } else {
+            for ((out, m), input) in outputs.iter_mut().zip(matrices).zip([q, k, v, q, q]) {
+                *out = self.product(m, input)?;
+            }
+        }
+        Ok(outputs)
+    }
+
     /// `count` vectors of `n`, each normed, into `out`.
     fn norm_into(&mut self, x: usize, out: usize, weight: Option<&[f32]>, n: usize, count: usize, eps: f32) {
         let weights = weight.map_or((CONSTANTS, 0), |weight| self.constant(weight));
@@ -362,12 +385,8 @@ impl<'m, 'a> Builder<'m, 'a> {
         }
         let [q_in, k_in, v_in] = inputs;
 
-        let q = self.product(&layer.wq, q_in)?;
-        let k_raw = self.product(&layer.wk, k_in)?;
-        let v_raw = self.product(&layer.wv, v_in)?;
-        let rel = self.product(&layer.wr, q_in)?;
+        let [q, k_raw, v_raw, rel, gate] = self.attention_projections([&layer.wq, &layer.wk, &layer.wv, &layer.wr, &layer.gate], inputs)?;
         let sinks = self.product(&layer.sink, q_in)?;
-        let gate = self.product(&layer.gate, q_in)?;
         let q = self.scale_clip(q, Some(&layer.q_scale), dim, heads, cfg.qk_l2_clip_threshold, !local);
 
         let kv_conv = |builder: &mut Self, conv: &KvConv, raw: usize, dynamic_input: usize| -> Result<(usize, usize)> {
