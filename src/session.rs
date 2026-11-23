@@ -332,6 +332,8 @@ impl<'m, 'a> Session<'m, 'a> {
             self.extend(chunk)?;
             ensure!(progress(self.context.len()) || self.context.len() == ids.len(), "{ABANDONED}");
         }
+        // What the prompt was processed in is not needed to generate from it.
+        self.model.release_scratch();
         Ok(reused)
     }
 

@@ -6,21 +6,20 @@
 //! convolution, attention and expert of all the layer visits, laid out once as a fixed list of kernels over one
 //! scratch buffer and run again for each token with only the token's position changed.
 //!
-//! The model's state stays what it is everywhere else, the [`State`] on the CPU. The GPU keeps a copy of the
-//! keys and values to attend over, brought up to date from the state before a token and matched by what the
-//! token adds to both, so prompts, batches and rollbacks on the CPU paths mix freely with tokens from here.
+//! The model's state stays what it is everywhere else, the [`State`]. Its tables of keys and values are moved
+//! into buffers the GPU shares the first time a token runs here; from then on the kernels read and add to the
+//! same rows the CPU paths do, so prompts, batches and rollbacks there mix freely with tokens from here and
+//! nothing is kept twice.
 //!
 //! The arithmetic is float throughout, where the CPU rounds the inputs of a quantised matrix to bytes, so the
 //! two agree only approximately. This is how llama.cpp computes on a GPU too.
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Controller, KvConv, Mat, Model, RESIDUAL_NORM_EPS, State, next_version};
+use super::{Controller, KvConv, Mat, Model, RESIDUAL_NORM_EPS, State};
 use crate::ggml::Format;
 use crate::gpu::{Gpu, Grid, Kernels, Shared, Step};
 
-/// Tokens a sliding layer's ring holds beyond its window, so that a few can be taken back without refilling it.
-const SLACK: usize = 64;
 /// Tokens the full layers' tables hold at first; they double when a conversation outgrows them.
 const FIRST_CAPACITY: usize = 8192;
 /// The most tokens one submission takes: a token and as many proposals as can be taken back after it.
@@ -94,9 +93,8 @@ struct VisitSlots {
     conv_inputs: [usize; 4],
     /// Where the `kernel - 1` inputs before them are expected.
     histories: [usize; 4],
-    /// The token's finished keys and values.
-    keys: usize,
-    values: usize,
+    /// Where the kernels expect the visit's first position and its tables' capacities.
+    info: usize,
     local: bool,
 }
 
@@ -120,13 +118,12 @@ pub(crate) struct Decoder {
     logits: usize,
     /// Tokens the full layers' tables hold.
     capacity: usize,
-    ring: usize,
     /// Floats from one token's copy of the scratch layout to the next.
     token_stride: usize,
-    /// The state version the tables match, and how many tokens they hold of it.
-    mirrored: Option<(u64, usize)>,
     /// Seconds the GPU spent on the last token.
     pub(crate) gpu_seconds: f64,
+    /// The scratch buffer of [`Decoder::experts`], and how many tokens it holds.
+    short: Option<(usize, Shared)>,
 }
 
 /// Lays out the program: every helper appends kernels and returns where in the scratch buffer its result is.
@@ -142,7 +139,6 @@ struct Builder<'m, 'a> {
     used: usize,
     visits: Vec<VisitSlots>,
     capacity: usize,
-    ring: usize,
     /// Eight zero-based indices, for products whose matrices are not chosen by a kernel.
     in_order: usize,
 }
@@ -364,11 +360,14 @@ impl<'m, 'a> Builder<'m, 'a> {
         let (v, v_history) = kv_conv(self, &layer.v_conv, v_raw, v_in)?;
         let values = self.norm(v, None, dim, kv_heads, eps);
 
-        // The token's keys and values join the layer's tables before it attends, as it sees itself.
+        // The token's keys and values join the layer's tables before it attends, as it sees itself. The tables
+        // are the state's own, bound when the program runs.
         let tables = [TABLES + 2 * visit, TABLES + 2 * visit + 1];
-        for (from, table) in [keys, values].into_iter().zip(tables) {
-            let params = [kv_dim, usize::from(local), self.ring].map(Word::Count);
-            self.step(STORE, vec![(SCRATCH, from * 4), (table, 0), (SCRATCH, 0)], &params, Grid::Threads(kv_dim, 1));
+        let info = self.alloc(4);
+        for (which, (from, table)) in [keys, values].into_iter().zip(tables).enumerate() {
+            let params = [kv_heads, dim, which].map(Word::Count);
+            let buffers = vec![(SCRATCH, from * 4), (table, 0), (SCRATCH, 0), (SCRATCH, info * 4)];
+            self.step(STORE, buffers, &params, Grid::Threads(kv_dim, 1));
         }
 
         let rel = self.scale_clip(rel, Some(&layer.rel_scale), d_rel, heads, cfg.rel_l2_clip_threshold, !local);
@@ -384,7 +383,6 @@ impl<'m, 'a> Builder<'m, 'a> {
             Word::Count(dim),
             Word::Count(usize::from(local)),
             Word::Count(cfg.sliding_window_size),
-            Word::Count(self.ring),
             Word::Count(extent),
             Word::Real((dim as f32).powf(-0.5)),
             Word::Count(self.capacity),
@@ -393,11 +391,11 @@ impl<'m, 'a> Builder<'m, 'a> {
             Word::Count(value_width),
         ];
         let weights_grid = Grid::Wide { groups: heads, threads: 32 * if local { 8 } else { 32 } };
-        let buffers = vec![(SCRATCH, q * 4), (tables[0], 0), (SCRATCH, bias * 4), (SCORES, 0), (SCRATCH, 0)];
+        let buffers = vec![(SCRATCH, q * 4), (tables[0], 0), (SCRATCH, bias * 4), (SCORES, 0), (SCRATCH, 0), (SCRATCH, info * 4)];
         self.step(ATTENTION_SCORES, buffers, &attention, Grid::Keys { local, rows: kv_heads });
         self.step(ATTENTION_WEIGHTS, vec![(SCORES, 0), (SCRATCH, sinks * 4), (SCRATCH, 0)], &attention, weights_grid);
         let attended = self.alloc(heads * dim);
-        let buffers = vec![(SCORES, 0), (tables[1], 0), (SCRATCH, gate * 4), (SCRATCH, attended * 4), (SCRATCH, 0)];
+        let buffers = vec![(SCORES, 0), (tables[1], 0), (SCRATCH, gate * 4), (SCRATCH, attended * 4), (SCRATCH, 0), (SCRATCH, info * 4)];
         ensure!(heads / kv_heads <= 4, "the attention kernels hold four query heads to a key head");
         self.step(ATTENTION_VALUES, buffers, &attention, Grid::Wide { groups: heads * dim / 16, threads: 32 * value_width });
         let attn = self.product(&layer.wo, attended)?;
@@ -444,8 +442,7 @@ impl<'m, 'a> Builder<'m, 'a> {
             output,
             conv_inputs: [k_raw, v_raw, attn, mlp],
             histories: [k_history, v_history, attn_history, mlp_history],
-            keys,
-            values,
+            info,
             local,
         });
         Ok(output)
@@ -462,7 +459,6 @@ impl Decoder {
         let h = cfg.hidden_size;
         let (start, end) = (cfg.loop_config.core_start, cfg.loop_config.core_end);
         let visit_count = cfg.visits().len();
-        let ring = cfg.sliding_window_size + SLACK;
         let mut builder = Builder {
             model,
             gpu,
@@ -474,7 +470,6 @@ impl Decoder {
             used: 4,
             visits: Vec::new(),
             capacity,
-            ring,
             in_order: 0,
         };
         let in_order: Vec<f32> = (0..8u32).map(f32::from_bits).collect();
@@ -515,7 +510,6 @@ impl Decoder {
         let params = [Word::Count(vocab), Word::Real(cfg.final_logit_softcapping)];
         builder.step(SOFT_CAP, vec![(SCRATCH, logits * 4)], &params, Grid::Threads(vocab, 1));
 
-        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
         let token_stride = builder.used;
         let steps = std::mem::take(&mut builder.steps)
             .into_iter()
@@ -527,10 +521,9 @@ impl Decoder {
             gpu.shared(MAX_BATCH * cfg.num_attention_heads * capacity * 4)?,
         ];
         buffers[CONSTANTS].floats_mut()[..builder.constants.len()].copy_from_slice(&builder.constants);
-        for visit in &builder.visits {
-            let tokens = if visit.local { ring } else { capacity };
-            buffers.push(gpu.shared(tokens * kv_dim * 4)?);
-            buffers.push(gpu.shared(tokens * kv_dim * 4)?);
+        // Places for the state's tables, which are swapped in for the length of a run.
+        for _ in 0..2 * builder.visits.len() {
+            buffers.push(gpu.shared(16)?);
         }
         buffers.append(&mut builder.weights);
         Ok(Self {
@@ -545,43 +538,10 @@ impl Decoder {
             last,
             logits,
             capacity,
-            ring,
             token_stride,
-            mirrored: None,
             gpu_seconds: 0.0,
+            short: None,
         })
-    }
-
-    /// Brings the tables up to date with `state`: only the tokens added since they last matched, when that is
-    /// known, and everything otherwise.
-    fn mirror(&mut self, model: &Model, state: &State) {
-        let cfg = &model.cfg;
-        let (kv_heads, dim, window) = (cfg.num_key_value_heads, cfg.head_dim, cfg.sliding_window_size);
-        let position = state.position;
-        let (valid, held) = match self.mirrored {
-            Some((version, held)) if version == state.track.anchor => (state.track.kept.min(held), held),
-            _ => (0, 0),
-        };
-        if valid == position && held == position {
-            return;
-        }
-        for (v, (slots, visit)) in self.visits.iter().zip(&state.visits).enumerate() {
-            // A ring that ran more than its slack past this position has overwritten tokens the window needs.
-            let from = match slots.local {
-                true if held > position + SLACK => position.saturating_sub(window),
-                true => valid.max(position.saturating_sub(window)),
-                false => valid,
-            };
-            for (table, source) in [(TABLES + 2 * v, &visit.keys), (TABLES + 2 * v + 1, &visit.values)] {
-                let table = self.buffers[table].floats_mut();
-                for t in from.max(visit.first)..position {
-                    let slot = if slots.local { t % self.ring } else { t };
-                    for (kv, head) in source.iter().enumerate() {
-                        table[(slot * kv_heads + kv) * dim..][..dim].copy_from_slice(&head[(t - visit.first) * dim..][..dim]);
-                    }
-                }
-            }
-        }
     }
 
     /// Runs a batch of tokens, each seeing the ones before it, and adds them to `state`. `embedded` holds their
@@ -595,7 +555,10 @@ impl Decoder {
         if position + count > self.capacity {
             *self = Self::with_capacity(model, gpu, (position + count).next_power_of_two().max(2 * self.capacity))?;
         }
-        self.mirror(model, state);
+        // The state's tables: old rows dropped as at the start of any pass, room made for the batch's rows, and
+        // the buffers themselves put where the kernels are bound to them.
+        self.prepare_tables(model, gpu, state, count)?;
+        self.exchange_tables(state);
 
         let scratch = &mut self.buffers[SCRATCH];
         for t in 0..count {
@@ -617,23 +580,25 @@ impl Decoder {
 
         let end = position + count;
         let keys = [end.min(cfg.sliding_window_size), end];
-        self.gpu_seconds = gpu.run(&[&self.kernels[0], &self.kernels[1]], &self.steps, &self.buffers, keys, count)?;
+        let ran = gpu.run(&[&self.kernels[0], &self.kernels[1]], &self.steps, &self.buffers, keys, count);
+        // The tables go back to the state whatever happened; only a run that worked adds to it.
+        self.exchange_tables(state);
+        self.gpu_seconds = ran?;
 
         let floats = self.buffers[SCRATCH].floats();
-        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        for visit in &mut state.visits {
+            // The kernels wrote the batch's keys and values into the tables.
+            visit.keys.added(count);
+            visit.values.added(count);
+        }
         for t in 0..count {
             let mine = &floats[t * stride..][..stride];
             for (slots, visit) in self.visits.iter().zip(&mut state.visits) {
                 let conv_inputs: [&[f32]; 4] = std::array::from_fn(|c| &mine[slots.conv_inputs[c]..][..visit.conv_channels[c]]);
-                let (keys, values) = (&mine[slots.keys..][..kv_dim], &mine[slots.values..][..kv_dim]);
-                visit.push(cfg, slots.local, position + t, keys, values, conv_inputs);
+                visit.push_conv_inputs(cfg, conv_inputs);
             }
         }
         state.position = end;
-        // The tables hold these tokens already, so they match the state as it now is.
-        let version = next_version();
-        state.track = super::Track { version, anchor: version, kept: end };
-        self.mirrored = Some((version, end));
 
         let of_each = |at: usize, len: usize| -> Vec<&[f32]> { (0..count).map(|t| &floats[t * stride + at..][..len]).collect() };
         Ok(Tokens {
@@ -643,15 +608,108 @@ impl Decoder {
         })
     }
 
-    /// Makes the next token refill the tables from the state it is given.
-    #[cfg(test)]
-    pub(crate) fn forget(&mut self) {
-        self.mirrored = None;
+    /// A layer's experts for some tokens of a batch, the row kernels multiplying straight from the stored
+    /// blocks, each token's experts at a time. `routes` holds each token's experts and their weights. Returns
+    /// `tokens x hidden` outputs.
+    pub(crate) fn experts(&mut self, model: &Model, gpu: &Gpu, layer: &super::Layer, x: &[f32], routes: &[(u32, f32)]) -> Result<Vec<f32>> {
+        let cfg = &model.cfg;
+        let (h, inter, top) = (cfg.hidden_size, cfg.intermediate_size, cfg.num_experts_per_tok);
+        let tokens = x.len() / h;
+        let experts = &layer.experts;
+        let (gate_up_format, down_format) =
+            (experts.gate_up.ggml().context("experts in a GGUF format")?, experts.down.ggml().context("experts in a GGUF format")?);
+        ensure!(!experts.interleaved && routes.len() == tokens * top && top % 4 == 0, "bad expert batch");
+        // A token's block of the scratch buffer: its input, its experts and their weights, the first products,
+        // the activations, the second products and its output.
+        let (order, weight, first) = (h, h + top, h + 2 * top);
+        let active = first + top * 2 * inter;
+        let second = active + top * inter;
+        let out = second + top * h;
+        let stride = out + h;
+        if self.short.as_ref().is_none_or(|(held, _)| *held < tokens) {
+            self.short = Some((tokens, gpu.shared(tokens * stride * 4)?));
+        }
+        let (held, mut scratch) = self.short.take().expect("just made");
+        for (t, (x, routes)) in x.chunks_exact(h).zip(routes.chunks_exact(top)).enumerate() {
+            for (k, &(expert, _)) in routes.iter().enumerate() {
+                scratch.words_mut()[t * stride + order + k] = expert;
+            }
+            let block = &mut scratch.floats_mut()[t * stride..][..stride];
+            block[..h].copy_from_slice(x);
+            for (k, &(_, weight_of)) in routes.iter().enumerate() {
+                block[weight + k] = weight_of;
+            }
+        }
+
+        let (gate_up, gate_up_at) = gpu.wrap(experts.gate_up.raw_parts().0)?;
+        let (down, down_at) = gpu.wrap(experts.down.raw_parts().0)?;
+        let buffers = [scratch, gate_up, down];
+        let rows = |format: Format, buffer: (usize, usize), (rows, cols): (usize, usize), x: usize, x_stride: usize, to: usize| -> Result<Step> {
+            let row_bytes = format.row_bytes(cols).context("rows of whole blocks")?;
+            let params = [rows, cols, rows * row_bytes, 8, x_stride, stride, 1].map(Word::Count);
+            Ok(Step {
+                kernel: row_kernel(format)?,
+                buffers: vec![buffer, (0, x * 4), (0, to * 4), (0, order * 4)],
+                params: words(&params, stride),
+                grid: Grid::Groups(rows.div_ceil(8), top),
+            })
+        };
+        let activation = [Word::Count(inter), Word::Real(cfg.mlp_gate_softcap), Word::Real(cfg.mlp_up_softcap), Word::TokenStride];
+        let steps = [
+            rows(gate_up_format, (1, gate_up_at), (2 * inter, h), 0, 0, first)?,
+            Step { kernel: ACTIVATION, buffers: vec![(0, first * 4), (0, active * 4)], params: words(&activation, stride), grid: Grid::Threads(inter, top) },
+            rows(down_format, (2, down_at), (h, inter), active, inter, second)?,
+            Step {
+                kernel: COMBINE,
+                buffers: vec![(0, second * 4), (0, weight * 4), (0, out * 4)],
+                params: words(&[Word::Count(h), Word::Count(top), Word::TokenStride], stride),
+                grid: Grid::Threads(h, 1),
+            },
+        ];
+        let ran = gpu.run(&[&self.kernels[0], &self.kernels[1]], &steps, &buffers, [0, 0], tokens);
+        let [scratch, ..] = buffers;
+        let outputs = (0..tokens).flat_map(|t| scratch.floats()[t * stride + out..][..h].iter().copied()).collect();
+        self.short = Some((held, scratch));
+        ran?;
+        Ok(outputs)
+    }
+
+    /// Gets the state's tables ready for `count` more tokens: rows that have left a sliding layer's window
+    /// dropped, as at the start of any pass; the tables in shared buffers with room for the new rows; and where
+    /// they start and how much they hold written where the kernels look.
+    fn prepare_tables(&mut self, model: &Model, gpu: &Gpu, state: &mut State, count: usize) -> Result<()> {
+        let words = self.buffers[SCRATCH].words_mut();
+        for (slots, visit) in self.visits.iter().zip(&mut state.visits) {
+            visit.drop_stale(&model.cfg, slots.local, state.position);
+            for table in [&mut visit.keys, &mut visit.values] {
+                table.share(gpu)?;
+                table.reserve(count);
+            }
+            words[slots.info] = visit.first as u32;
+            words[slots.info + 1] = visit.keys.capacity() as u32;
+            words[slots.info + 2] = visit.values.capacity() as u32;
+        }
+        Ok(())
+    }
+
+    /// Swaps the state's tables with the buffers in the places the kernels are bound to: in before a run, and
+    /// back out after it.
+    fn exchange_tables(&mut self, state: &mut State) {
+        for (v, visit) in state.visits.iter_mut().enumerate() {
+            for (which, table) in [&mut visit.keys, &mut visit.values].into_iter().enumerate() {
+                let shared = table.shared_mut().expect("shared before the first exchange");
+                std::mem::swap(shared, &mut self.buffers[TABLES + 2 * v + which]);
+            }
+        }
     }
 
     /// GPU milliseconds per kernel for a token at the tables' present state, and how often each runs.
     #[cfg(test)]
-    pub(crate) fn profile(&self, gpu: &Gpu, keys: [usize; 2]) -> Vec<(&'static str, usize, f64)> {
+    pub(crate) fn profile(&mut self, model: &Model, gpu: &Gpu, state: &mut State) -> Vec<(&'static str, usize, f64)> {
+        self.prepare_tables(model, gpu, state, 1).unwrap();
+        self.exchange_tables(state);
+        self.buffers[SCRATCH].words_mut()[0] = state.position as u32;
+        let keys = [(state.position + 1).min(model.cfg.sliding_window_size), state.position + 1];
         let names: Vec<&'static str> = ROW_KERNELS.iter().chain(&STEP_KERNELS).copied().collect();
         let mut profile = Vec::new();
         for (kernel, name) in names.iter().enumerate() {
@@ -668,6 +726,7 @@ impl Decoder {
             let best = (0..3).map(|_| run()).fold(f64::MAX, f64::min);
             profile.push((*name, steps.len(), best * 1e3));
         }
+        self.exchange_tables(state);
         profile
     }
 
@@ -692,6 +751,34 @@ mod tests {
 
     fn my_turn() -> std::sync::MutexGuard<'static, ()> {
         TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The experts as the decoder's kernels do them for part of a short batch, against the CPU in floats.
+    #[test]
+    #[ignore]
+    fn the_experts_of_a_short_batch_match_the_cpu_in_floats() {
+        let _turn = my_turn();
+        let path = resolve_model(Some(std::path::Path::new("lmstudio-community/Inkling-2-Mini-GGUF:Q4_K_M"))).unwrap();
+        let weights = Checkpoint::open(&path).unwrap();
+        let config = Config::load(&path).unwrap();
+        let options = Options { activations: Activations::Float, backend: Backend::MetalFast };
+        let model = Model::load(&config, &weights, options).unwrap();
+        let gpu = model.gpu.as_ref().unwrap();
+        let h = model.cfg.hidden_size;
+        // Inputs of about the size the experts see: normed states.
+        let x: Vec<f32> = (0..40 * h).map(|i| (((i * 2_654_435_761) >> 9) % 2001) as f32 / 1000.0 - 1.0).collect();
+        let mut decoder = Decoder::new(&model, gpu).unwrap();
+        for l in [0, 7, 23] {
+            let layer = &model.layers[l];
+            FLOAT_REFERENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+            let expected = model.experts(layer, &x);
+            FLOAT_REFERENCE.store(false, std::sync::atomic::Ordering::Relaxed);
+            let actual = decoder.experts(&model, gpu, layer, &x, &model.routes(layer, &x)).unwrap();
+            let diff: f64 = actual.iter().zip(&expected).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+            let apart = (diff / expected.iter().map(|b| (*b as f64).powi(2)).sum::<f64>()).sqrt();
+            eprintln!("layer {l}: apart by {apart:.1e}");
+            assert!(apart < 1e-5, "layer {l}: the experts differ by {apart:.1e}");
+        }
     }
 
     /// A batch must give each of its tokens exactly what it gets alone after the ones before it: at the start
@@ -745,11 +832,18 @@ mod tests {
         let options = Options { activations: Activations::Float, backend: Backend::MetalFast };
         let model = Model::load(&config, &weights, options).unwrap();
         let gpu = model.gpu.as_ref().unwrap();
-        let mut decoder = Decoder::with_capacity(&model, gpu, context.next_power_of_two()).unwrap();
-        decoder.buffers[SCRATCH].words_mut()[0] = context as u32 - 1;
-        let keys = [context.min(model.cfg.sliding_window_size), context];
+        let mut decoder = Decoder::with_capacity(&model, gpu, (context + 1).next_power_of_two()).unwrap();
+        // A state of that length, its tables filled with made-up rows.
+        let cfg = &model.cfg;
+        let mut state = model.new_state();
+        state.position = context;
+        for (visit, held) in cfg.visits().iter().zip(&mut state.visits) {
+            let rows = if cfg.is_local(visit.layer) { context.min(cfg.sliding_window_size - 1) } else { context };
+            let table = || super::super::Table::from_heads(vec![vec![0.25f32; rows * cfg.head_dim]; cfg.num_key_value_heads], cfg.head_dim);
+            (held.keys, held.values, held.first) = (table(), table(), context - rows);
+        }
         let mut total = 0.0;
-        for (name, count, ms) in decoder.profile(gpu, keys) {
+        for (name, count, ms) in decoder.profile(&model, gpu, &mut state) {
             total += ms;
             eprintln!("  {name}: {count} dispatches, {ms:.2} ms");
         }
@@ -758,8 +852,8 @@ mod tests {
 
     /// Tokens from the GPU mixed with everything else that changes a state: prompts and batches on the CPU,
     /// tokens taken back, a rewind to a mark, and a context long enough for the sliding layers' rings to wrap.
-    /// After each, the decoder that kept its tables up to date as it went must give exactly what one that
-    /// refills them from the state gives. `cargo test --release --lib decode::tests::keeps -- --ignored`.
+    /// After each, the token must be exactly what another decoder computes from a copy of the state.
+    /// `cargo test --release --lib decode::tests::keeps -- --ignored`.
     #[test]
     #[ignore]
     fn keeps_its_tables_in_step_with_the_state() {
@@ -786,7 +880,6 @@ mod tests {
         // One token through the model's own decoder, checked against a refill.
         let mut single = |state: &mut State, id: u32, what: &str| {
             let mut copy = state.clone();
-            refilled.forget();
             let expected = refilled.tokens(&model, gpu, &mut copy, &model.embed(id).unwrap(), &[]).unwrap();
             let actual = model.forward(&[id], state, false).unwrap();
             assert!(actual.last == expected.last, "{what}: the token differs from one computed on refilled tables");
@@ -875,8 +968,7 @@ mod tests {
             }
         }
         FLOAT_REFERENCE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let keys = [ids.len(), ids.len()];
-        for (name, count, ms) in decoder.profile(gpu, keys) {
+        for (name, count, ms) in decoder.profile(&model, gpu, &mut on_gpu) {
             eprintln!("  {name}: {count} dispatches, {ms:.2} ms");
         }
     }

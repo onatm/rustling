@@ -138,10 +138,14 @@ slower than a CPU core, so nothing is left to one thread: a group of 32 threads 
 matrix, each taking every so-manyth block and the group adding up, and the norms, reads and softmaxes are split
 the same way. All of a token's matrix products then take 23 ms, where a thread to a row took 46.
 
-The state stays where the rest of the engine keeps it, on the CPU. The GPU holds a copy of the keys and values
-to attend over, brought up to date before a token with whatever changed since (a prompt, a batch, tokens taken
-back) and matched by what the token adds to both; that copy takes about as much memory again as the state
-itself. So long prompts, the prompt cache and stepping back all work as before.
+The state stays what it is for the rest of the engine. Its tables of keys and values move into buffers the GPU
+shares the first time a token is generated, and from then on the kernels and the CPU paths read and add to the
+same rows, so nothing is kept twice and long prompts, the prompt cache and stepping back all work as before.
+
+Memory is kept down in two more ways. The long-prompt paths work in several gigabytes of buffers, which are let
+go when the prompt is done; and every call into Metal runs inside an autorelease pool, without which the
+objects it hands back are never freed on a thread that has no pool of its own. After a 15,000-token prompt and
+its reply the server holds 5.1 GB beyond the model file, where it held 13 GB.
 
 The arithmetic is float throughout, where the CPU path rounds the inputs of a quantised matrix to bytes, so the
 two agree only approximately; llama.cpp computes the same way on a GPU. Against the CPU computing in floats,

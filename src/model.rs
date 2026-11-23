@@ -62,6 +62,12 @@ const FAST_PROMPT_CHUNK: usize = 4096;
 #[cfg(target_os = "macos")]
 const FAST_LOCAL_STRETCH: usize = 1024;
 
+/// The share of a short batch's tokens whose experts the GPU does with the decoder's kernels while the CPU does
+/// the others'. With 150 tokens at 10,000 tokens of context the experts took 7.4 ms a token at this share,
+/// 8.4 ms at 0.3, 8.9 ms at 0.6 and 10.8 ms on the CPU alone.
+#[cfg(target_os = "macos")]
+const GPU_ROW_EXPERT_SHARE: f32 = 0.45;
+
 /// From this many tokens a GGUF layer's experts run as one submission on the GPU, which unpacks every expert's
 /// weights: about 6 s a pass on an M1 Max however few tokens there are. A shorter batch does better with the GPU
 /// unpacking only the busiest experts and the CPU doing the rest: 282 tokens took 4.1 s that way against 6.1 s,
@@ -128,6 +134,9 @@ const DENSE_TILE: usize = 16;
 
 #[cfg(target_os = "macos")]
 mod decode;
+mod table;
+
+use table::Table;
 
 /// Makes the CPU multiply quantised matrices by float inputs, as the GPU decoder does, where it normally rounds
 /// the inputs to bytes first. Slow; for checking the decoder against.
@@ -218,24 +227,6 @@ pub struct State {
     /// Number of tokens already processed, which is the position of the next one.
     position: usize,
     visits: Vec<VisitState>,
-    /// What a copy of this state kept elsewhere can still rely on.
-    #[serde(skip)]
-    track: Track,
-}
-
-/// How a state relates to the copy of its keys and values that the GPU decoder keeps. Every change gives the
-/// state a new `version`. `anchor` is the version the copy last matched, and the first `kept` tokens have not
-/// changed since, so bringing the copy up to date takes only the tokens after them.
-#[derive(Clone, Copy, Default)]
-struct Track {
-    version: u64,
-    anchor: u64,
-    kept: usize,
-}
-
-fn next_version() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl State {
@@ -248,15 +239,9 @@ impl State {
         let floats: usize = self
             .visits
             .iter()
-            .map(|v| v.keys.iter().chain(&v.values).chain(&v.convs).map(Vec::len).sum::<usize>())
+            .map(|v| v.convs.iter().map(Vec::len).sum::<usize>())
             .sum();
-        floats * size_of::<f32>()
-    }
-
-    /// Records a change that left the first `kept` tokens as they were.
-    fn changed(&mut self, kept: usize) {
-        self.track.version = next_version();
-        self.track.kept = self.track.kept.min(kept);
+        floats * size_of::<f32>() + self.visits.iter().map(|v| v.keys.bytes() + v.values.bytes()).sum::<usize>()
     }
 
     /// Whether the state has the shape `model` expects, as a check on one read back from disk.
@@ -264,13 +249,11 @@ impl State {
         let fresh = model.new_state();
         self.visits.len() == fresh.visits.len()
             && self.visits.iter().zip(&fresh.visits).all(|(mine, theirs)| {
-                // Every key head holds the same tokens.
-                let held = (self.position.saturating_sub(mine.first)) * theirs.conv_channels[0] / theirs.keys.len();
+                // Both tables hold the tokens from `first` on.
+                let held = self.position.saturating_sub(mine.first);
                 mine.conv_channels == theirs.conv_channels
                     && mine.first <= self.position
-                    && mine.keys.len() == theirs.keys.len()
-                    && mine.values.len() == theirs.values.len()
-                    && mine.keys.iter().chain(&mine.values).all(|head| head.len() == held)
+                    && [&mine.keys, &mine.values].iter().all(|table| table.heads() == theirs.keys.heads() && table.rows() == held)
             })
     }
 
@@ -279,11 +262,9 @@ impl State {
     pub fn truncate(&mut self, tokens: usize) {
         assert!(tokens <= MAX_ROLLBACK && tokens <= self.position, "cannot take back {tokens} tokens");
         self.position -= tokens;
-        self.changed(self.position);
         for visit in &mut self.visits {
-            for head in visit.keys.iter_mut().chain(&mut visit.values) {
-                let dim = head.len() / (self.position + tokens - visit.first);
-                head.truncate(head.len() - tokens * dim);
+            for table in [&mut visit.keys, &mut visit.values] {
+                table.truncate(table.rows() - tokens);
             }
             for (history, channels) in visit.convs.iter_mut().zip(visit.conv_channels) {
                 history.truncate(history.len() - tokens * channels);
@@ -307,7 +288,7 @@ struct VisitMark {
     first: usize,
     convs: [Vec<f32>; 4],
     /// The keys and values, for a visit that drops old ones.
-    window: Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)>,
+    window: Option<(Table, Table)>,
 }
 
 impl State {
@@ -323,14 +304,13 @@ impl State {
                 }
                 None => {
                     assert_eq!(visit.first, marked.first, "a visit that keeps everything dropped something");
-                    let dim = visit.conv_channels[0] / visit.keys.len();
-                    let held = (mark.position - visit.first) * dim;
-                    visit.keys.iter_mut().chain(&mut visit.values).for_each(|head| head.truncate(held));
+                    let held = mark.position - visit.first;
+                    visit.keys.truncate(held);
+                    visit.values.truncate(held);
                 }
             }
         }
         self.position = mark.position;
-        self.changed(self.position);
     }
 }
 
@@ -343,8 +323,8 @@ struct VisitState {
     /// Keys and values of earlier tokens, starting at position `first`: one table per key head, `head_dim` per
     /// token, so that attention reads each head's as one run of memory. Sliding-window visits drop what has
     /// left the window.
-    keys: Vec<Vec<f32>>,
-    values: Vec<Vec<f32>>,
+    keys: Table,
+    values: Table,
     first: usize,
     /// The recent inputs of the key, value, post-attention and post-MLP convolutions: the `kernel - 1` they
     /// need, and up to [`MAX_ROLLBACK`] more so recent tokens can be taken back.
@@ -354,16 +334,9 @@ struct VisitState {
 }
 
 impl VisitState {
-    /// Adds one token computed elsewhere: its keys and values, and the inputs its convolutions took.
+    /// Records the inputs the convolutions took for one token computed elsewhere.
     #[cfg(target_os = "macos")]
-    fn push(&mut self, cfg: &TextConfig, local: bool, position: usize, keys: &[f32], values: &[f32], conv_inputs: [&[f32]; 4]) {
-        let dim = cfg.head_dim;
-        self.drop_stale(cfg, local, position);
-        for (table, new) in [(&mut self.keys, keys), (&mut self.values, values)] {
-            for (head, new) in table.iter_mut().zip(new.chunks_exact(dim)) {
-                head.extend_from_slice(new);
-            }
-        }
+    fn push_conv_inputs(&mut self, cfg: &TextConfig, conv_inputs: [&[f32]; 4]) {
         for ((history, input), channels) in self.convs.iter_mut().zip(conv_inputs).zip(self.conv_channels) {
             history.extend_from_slice(input);
             let keep = (cfg.sconv_kernel_size - 1 + MAX_ROLLBACK) * channels;
@@ -374,11 +347,11 @@ impl VisitState {
     /// Drops the keys and values that have left a sliding layer's window, once a batch of them has: dropping
     /// from the front moves everything kept, megabytes per visit, so until then they sit unread at the front.
     fn drop_stale(&mut self, cfg: &TextConfig, local: bool, position: usize) {
-        let dim = cfg.head_dim;
         let window_start = if local { (position + 1).saturating_sub(cfg.sliding_window_size) } else { 0 };
-        let stale = window_start.saturating_sub(self.first).min(self.keys[0].len() / dim);
+        let stale = window_start.saturating_sub(self.first).min(self.keys.rows());
         if stale >= STALE_BATCH {
-            self.keys.iter_mut().chain(&mut self.values).for_each(|head| drop(head.drain(..stale * dim)));
+            self.keys.drop_front(stale);
+            self.values.drop_front(stale);
             self.first += stale;
         }
     }
@@ -573,10 +546,10 @@ impl<'a> Model<'a> {
         let cfg = &self.cfg;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
         let conv_channels = [kv_dim, kv_dim, cfg.hidden_size, cfg.hidden_size];
-        let heads = vec![Vec::new(); cfg.num_key_value_heads];
-        let fresh = VisitState { keys: heads.clone(), values: heads, conv_channels, ..Default::default() };
+        let table = Table::new(cfg.num_key_value_heads, cfg.head_dim);
+        let fresh = VisitState { keys: table.clone(), values: table, conv_channels, ..Default::default() };
         let visits = cfg.visits().iter().map(|_| fresh.clone()).collect();
-        State { position: 0, visits, track: Track::default() }
+        State { position: 0, visits }
     }
 
     /// Runs the decoder over `ids`, which continue the context in `state`. With `trace`, keeps the output of
@@ -614,6 +587,15 @@ impl<'a> Model<'a> {
             return Ok(forward);
         }
         in_pool(|| self.run_in_pool(ids, state, trace, taps))
+    }
+
+    /// Frees the memory the GPU paths for long batches work in, several gigabytes after a long prompt. Worth
+    /// doing when a prompt is done: generating does not use it.
+    pub fn release_scratch(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = &self.gpu {
+            gpu.release_scratch();
+        }
     }
 
     /// Whether tokens are generated on the GPU, singly and in the short batches that check proposed tokens. A
@@ -722,7 +704,6 @@ impl<'a> Model<'a> {
         }
         run(end..cfg.num_hidden_layers, 0, &mut hidden, &mut blocks, None);
         drop(run);
-        state.changed(state.position);
         state.position += ids.len();
 
         let block_refs: Vec<&Seq> = blocks.iter().collect();
@@ -967,12 +948,12 @@ impl<'a> Model<'a> {
         // Sliding layers see the last `sliding_window_size` tokens; full layers see everything.
         let window_start = |t: usize| if layer.local { (t + 1).saturating_sub(cfg.sliding_window_size) } else { 0 };
         state.drop_stale(cfg, layer.local, position);
-        for (table, new) in [(&mut state.keys, &k), (&mut state.values, &v)] {
-            for (kv, head) in table.iter_mut().enumerate() {
-                new.chunks_exact(kv_dim).for_each(|token| head.extend_from_slice(&token[kv * dim..][..dim]));
-            }
-        }
-        let (k, v, cached_from) = (&state.keys, &state.values, state.first);
+        state.keys.push(&k);
+        state.values.push(&v);
+        // Each key head's rows, oldest first.
+        let k: Vec<&[f32]> = (0..kv_heads).map(|kv| state.keys.head(kv)).collect();
+        let v: Vec<&[f32]> = (0..kv_heads).map(|kv| state.values.head(kv)).collect();
+        let (k, v, cached_from) = (&k, &v, state.first);
 
         rel.chunks_exact_mut(heads * d_rel).enumerate().for_each(|(i, rel)| {
             for (head, scale) in rel.chunks_exact_mut(d_rel).zip(layer.rel_scale.chunks_exact(d_rel)) {
@@ -1286,34 +1267,85 @@ impl<'a> Model<'a> {
         })
     }
 
-    /// Routes each token to its top experts and sums their weighted outputs.
-    fn experts(&self, layer: &Layer, x: &Seq) -> Seq {
+    /// Each token's experts and the weights of their outputs, the highest-ranked first: `num_experts_per_tok`
+    /// entries per token.
+    fn routes(&self, layer: &Layer, x: &Seq) -> Vec<(u32, f32)> {
         let cfg = &self.cfg;
-        let (h, top_k) = (cfg.hidden_size, cfg.num_experts_per_tok);
-
-        // tokens_of[expert] lists the (token, weight) pairs routed to it.
-        let mut tokens_of: Vec<Vec<(usize, f32)>> = vec![Vec::new(); cfg.n_routed_experts];
-        // The same in token order: each token's experts and their weights.
-        let mut routes: Vec<(u32, f32)> = Vec::with_capacity(x.len() / h * top_k);
+        let top_k = cfg.num_experts_per_tok;
+        let mut routes = Vec::with_capacity(x.len() / cfg.hidden_size * top_k);
         let scores = layer.router.apply(x);
         if layer.traced {
             trace::record("router_logits", &scores);
         }
-        for (t, scores) in scores.chunks_exact(cfg.n_routed_experts).enumerate() {
+        for scores in scores.chunks_exact(cfg.n_routed_experts) {
             let scores: Vec<f32> = scores.iter().map(|s| sigmoid(*s)).collect();
             let mut order: Vec<usize> = (0..scores.len()).collect();
             order.sort_by(|&a, &b| (scores[b] + layer.router_bias[b]).total_cmp(&(scores[a] + layer.router_bias[a])));
             let chosen = &order[..top_k];
             let total: f32 = chosen.iter().map(|&e| scores[e]).sum::<f32>() + 1e-20;
-            for &e in chosen {
-                tokens_of[e].push((t, scores[e] / total * cfg.route_scale));
-                routes.push((e as u32, scores[e] / total * cfg.route_scale));
-            }
+            routes.extend(chosen.iter().map(|&e| (e as u32, scores[e] / total * cfg.route_scale)));
+        }
+        routes
+    }
+
+    /// Routes each token to its top experts and sums their weighted outputs.
+    fn experts(&self, layer: &Layer, x: &Seq) -> Seq {
+        let cfg = &self.cfg;
+        let (h, top_k) = (cfg.hidden_size, cfg.num_experts_per_tok);
+
+        let routes = self.routes(layer, x);
+        // tokens_of[expert] lists the (token, weight) pairs routed to it.
+        let mut tokens_of: Vec<Vec<(usize, f32)>> = vec![Vec::new(); cfg.n_routed_experts];
+        for (at, &(expert, weight)) in routes.iter().enumerate() {
+            tokens_of[expert as usize].push((at / top_k, weight));
         }
 
         // A long batch from a GGUF file on the fast path: the whole step on the GPU.
         #[cfg(target_os = "macos")]
         if let Some(out) = self.experts_on_gpu(layer, x, &routes) {
+            return out;
+        }
+        // A batch too short for that, but more than the decoder takes whole: the GPU does the experts of the
+        // first tokens with the decoder's kernels while the CPU does the rest's, each at about its own pace.
+        #[cfg(target_os = "macos")]
+        let shared = {
+            let tokens = x.len() / h;
+            let count = (tokens as f32 * GPU_ROW_EXPERT_SHARE) as usize;
+            (tokens < FAST_MIN_TOKENS && count > 0 && !float_reference()).then_some(count).and_then(|count| {
+                let gpu = self.gpu.as_ref()?;
+                let decoder = self.decoder()?;
+                // The CPU keeps only the later tokens.
+                for tokens in &mut tokens_of {
+                    tokens.retain(|&(t, _)| t >= count);
+                }
+                Some((gpu, decoder, count))
+            })
+        };
+        #[cfg(target_os = "macos")]
+        if let Some((gpu, decoder, count)) = shared {
+            let (first, cpu) = std::thread::scope(|scope| {
+                let on_gpu = scope.spawn(|| decoder.lock().expect("decoder lock").experts(self, gpu, layer, &x[..count * h], &routes[..count * top_k]));
+                let cpu = self.expert_outputs_ggml(layer, x, &tokens_of);
+                (on_gpu.join().expect("GPU thread panicked"), cpu)
+            });
+            let mut out = vec![0.0f32; x.len()];
+            match first {
+                Ok(first) => out[..count * h].copy_from_slice(&first),
+                Err(error) => {
+                    // The CPU does them after all.
+                    gpu_failed(&error);
+                    let mut theirs: Vec<Vec<(usize, f32)>> = vec![Vec::new(); cfg.n_routed_experts];
+                    for (at, &(expert, weight)) in routes[..count * top_k].iter().enumerate() {
+                        theirs[expert as usize].push((at / top_k, weight));
+                    }
+                    for (t, contribution) in self.expert_outputs_ggml(layer, x, &theirs) {
+                        out[t * h..][..h].iter_mut().zip(contribution).for_each(|(o, c)| *o += c);
+                    }
+                }
+            }
+            for (t, contribution) in cpu {
+                out[t * h..][..h].iter_mut().zip(contribution).for_each(|(o, c)| *o += c);
+            }
             return out;
         }
 
@@ -2375,14 +2407,15 @@ mod tests {
                         .collect();
                     (0..cfg.num_key_value_heads).map(head).collect()
                 };
-                (held.keys, held.values, held.first) = (values(visit.index), values(visit.index + 99), context - kept);
+                let table = |seed: usize| Table::from_heads(values(seed), cfg.head_dim);
+                (held.keys, held.values, held.first) = (table(visit.index), table(visit.index + 99), context - kept);
             }
             model.forward(&[17], &mut state, false).unwrap();
             crate::timing::take();
             let started = std::time::Instant::now();
             // `BATCH` tokens per pass, as when a draft's proposals are checked.
             let batch: u32 = std::env::var("BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-            let tokens = 24;
+            let tokens = 24.max(batch);
             for pass in 0..tokens / batch {
                 let ids: Vec<u32> = (0..batch).map(|i| 100 + pass * batch + i).collect();
                 model.forward(&ids, &mut state, false).unwrap();

@@ -25,6 +25,14 @@ static inline const device Token* token_at(const device Token* first, uint which
     return (const device Token*)((const device float*)first + which * token_stride);
 }
 
+// Where a layer visit's keys and values are: tables of a row per token for each key head, the heads one after
+// another with room for `capacity` rows each, the first row holding the token at position `first`.
+struct Visit {
+    uint first;
+    uint key_capacity;
+    uint value_capacity;
+};
+
 struct NormParams {
     uint n;
     uint weighted;
@@ -271,10 +279,9 @@ struct AttentionParams {
     // Query heads to a key head.
     uint share;
     uint dim;
-    // A sliding layer keeps its keys and values in a ring of `ring` tokens and sees the last `window`.
+    // A sliding layer sees the last `window` tokens.
     uint local;
     uint window;
-    uint ring;
     uint extent;
     float scaling;
     // Floats from one head's scores to the next.
@@ -290,17 +297,12 @@ static inline uint keys_seen(const device Token* token, constant AttentionParams
     return p.local != 0 ? min(token->position + 1, p.window) : token->position + 1;
 }
 
-// Which row of the table holds the oldest visible token.
-static inline uint oldest_row(uint seen, const device Token* token, constant AttentionParams& p) {
-    uint at = token->position + 1 - seen;
-    return p.local != 0 ? at % p.ring : at;
-}
-
-// Where the `j`th visible token's keys and values start, oldest first.
-static inline uint slot_of(uint j, uint oldest, constant AttentionParams& p) {
-    uint row = oldest + j;
-    if (p.local != 0 && row >= p.ring) row -= p.ring;
-    return row * (p.heads / p.share) * p.dim;
+// Where the `j`th visible token's row for key head `head` starts, oldest first, in a table with room for
+// `capacity` rows a head.
+static inline uint row_of(uint j, uint seen, uint head, uint capacity, const device Token* token,
+                          const device Visit* visit, constant AttentionParams& p) {
+    uint row = token->position + 1 - seen + j - visit->first;
+    return (head * capacity + row) * p.dim;
 }
 
 // The score of every visible key for every head. The grid is keys x key heads: a thread reads one key and
@@ -310,7 +312,8 @@ kernel void attention_scores(const device float* queries [[buffer(0)]],
                              const device float* bias [[buffer(2)]],
                              device float* scores [[buffer(3)]],
                              const device Token* token [[buffer(4)]],
-                             constant AttentionParams& p [[buffer(5)]],
+                             const device Visit* visit [[buffer(5)]],
+                             constant AttentionParams& p [[buffer(6)]],
                              uint3 id [[thread_position_in_grid]]) {
     token = token_at(token, id.z, p.token_stride);
     uint shift = id.z * p.token_stride;
@@ -320,7 +323,7 @@ kernel void attention_scores(const device float* queries [[buffer(0)]],
     uint seen = keys_seen(token, p);
     if (id.x >= seen) return;
     const device packed_float4* key =
-        (const device packed_float4*)(keys + slot_of(id.x, oldest_row(seen, token, p), p) + id.y * p.dim);
+        (const device packed_float4*)(keys + row_of(id.x, seen, id.y, visit->key_capacity, token, visit, p));
     const device packed_float4* query = (const device packed_float4*)(queries + id.y * p.share * p.dim);
     uint quarter = p.dim / 4;
     float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
@@ -381,7 +384,8 @@ kernel void attention_values(const device float* weights [[buffer(0)]],
                              const device float* gate [[buffer(2)]],
                              device float* out [[buffer(3)]],
                              const device Token* token [[buffer(4)]],
-                             constant AttentionParams& p [[buffer(5)]],
+                             const device Visit* visit [[buffer(5)]],
+                             constant AttentionParams& p [[buffer(6)]],
                              uint3 group [[threadgroup_position_in_grid]],
                              uint lane [[thread_index_in_threadgroup]],
                              ushort simd_lane [[thread_index_in_simdgroup]],
@@ -392,15 +396,14 @@ kernel void attention_values(const device float* weights [[buffer(0)]],
     gate += group.z * p.token_stride;
     out += group.z * p.token_stride;
     uint seen = keys_seen(token, p);
-    uint oldest = oldest_row(seen, token, p);
     uint sixteenths = p.dim / 16;
     uint head = group.x / sixteenths, part = group.x % sixteenths;
     uint threads = 32 * p.value_width;
     const device float* mine = weights + head * p.stride;
-    uint at = (head / p.share) * p.dim + part * 16;
     float4 acc[4] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
     for (uint j = lane; j < seen; j += threads) {
-        const device packed_float4* value = (const device packed_float4*)(values + slot_of(j, oldest, p) + at);
+        const device packed_float4* value = (const device packed_float4*)(
+            values + row_of(j, seen, head / p.share, visit->value_capacity, token, visit, p) + part * 16);
         float w = mine[j];
         for (uint i = 0; i < 4; i++) acc[i] += w * float4(value[i]);
     }
@@ -420,23 +423,25 @@ kernel void attention_values(const device float* weights [[buffer(0)]],
 }
 
 struct StoreParams {
-    uint n;
-    uint local;
-    uint ring;
+    uint heads;
+    uint dim;
+    // Whether the table is the visit's values, as opposed to its keys.
+    uint values;
     uint token_stride;
 };
 
-// Files this token's keys or values in the layer's table.
+// Files this token's keys or values, its heads one after another, in the layer's table.
 kernel void store(const device float* from [[buffer(0)]],
                   device float* table [[buffer(1)]],
                   const device Token* token [[buffer(2)]],
-                  constant StoreParams& p [[buffer(3)]],
+                  const device Visit* visit [[buffer(3)]],
+                  constant StoreParams& p [[buffer(4)]],
                   uint3 id [[thread_position_in_grid]]) {
     uint i = id.x;
-    if (i >= p.n) return;
-    uint position = token_at(token, id.z, p.token_stride)->position;
-    uint slot = p.local != 0 ? position % p.ring : position;
-    table[slot * p.n + i] = from[id.z * p.token_stride + i];
+    if (i >= p.heads * p.dim) return;
+    uint row = token_at(token, id.z, p.token_stride)->position - visit->first;
+    uint capacity = p.values != 0 ? visit->value_capacity : visit->key_capacity;
+    table[((i / p.dim) * capacity + row) * p.dim + i % p.dim] = from[id.z * p.token_stride + i];
 }
 
 struct RouteParams {
