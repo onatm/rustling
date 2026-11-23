@@ -115,6 +115,39 @@ fn nvfp4_row_kernel_matches_decoded_weights_for_every_scale() {
     }
 }
 
+#[test]
+fn q5k_expert_tail_matches_cpu_weights_at_each_column() {
+    let gpu = Gpu::new(&[], true).unwrap();
+    let kernels = gpu.kernels(include_str!("shaders/gguf.metal"), &["tail_q5k"]).unwrap();
+    let (rows, cols) = (4, 512);
+    let weights: Vec<u8> = (0..rows).flat_map(|r| crate::weights::ggml::random_row(Format::Q5K, cols, r as u32)).collect();
+    let (w, offset) = gpu.wrap(&weights).unwrap();
+    // Each short batch selects 32 successive columns with one-hot inputs, exercising
+    // the fifth bit for every sub-block as well as the stride between blocks.
+    let mut buffers = [w, gpu.shared(32 * cols * 4).unwrap(), gpu.shared(32 * rows * 4).unwrap()];
+    let step = Step {
+        kernel: 0, buffers: vec![(0, offset), (1, 0), (2, 0)],
+        params: [rows as u32, cols as u32].into_iter().flat_map(u32::to_le_bytes).collect(),
+        grid: Grid::Groups(rows / 4, 32),
+    };
+    let mut decoded = vec![0.; rows * cols];
+    for (block, out) in weights.chunks_exact(weights.len() / rows).zip(decoded.chunks_exact_mut(cols)) {
+        Format::Q5K.decode_row(block, out);
+    }
+    for first in (0..cols).step_by(32) {
+        let x = buffers[1].floats_mut();
+        x.fill(0.);
+        for t in 0..32 { x[t * cols + first + t] = 1.; }
+        gpu.run(&[&kernels], std::slice::from_ref(&step), &buffers, [0, 0], 1).unwrap();
+        for t in 0..32 {
+            for r in 0..rows {
+                let want = decoded[r * cols + first + t];
+                assert!((buffers[2].floats()[t * rows + r] - want).abs() < 1e-5, "row {r}, column {}", first + t);
+            }
+        }
+    }
+}
+
 /// What a token's matrix products cost with a group of 32 threads sharing 1, 2, 4 or 8 rows, and what a
 /// dispatch costs by itself: `cargo test --release --lib gpu::tests::row_kernels -- --ignored --nocapture`.
 #[test]

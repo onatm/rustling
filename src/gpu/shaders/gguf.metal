@@ -112,26 +112,40 @@ static inline float nv_value(const device uchar* b, uint i) {
     uint q = b[4 + 8*s + i%8];
     return scale * e2m1_values[(q >> (4*((i/8)%2))) & 15];
 }
-static inline float q5k_value(const device uchar* b, uint i) {
-    uint s = i/32, j = i%32;
-    const device uchar* p = b+4;
-    uint sc = s < 4 ? p[s]&63 : (p[s+4]&15) | ((p[s-4]>>6)<<4);
-    uint m = s < 4 ? p[s+4]&63 : (p[s+4]>>4) | ((p[s]>>6)<<4);
-    uint q = ((b[48+32*(s/2)+j] >> (4*(s%2))) & 15) | (((b[16+j]>>s)&1)<<4);
-    return read_half(b)*float(sc)*float(q) - read_half(b+2)*float(m);
+// One affine scale and minimum cover 32 weights. The eight sub-blocks use
+// successive bits of the same 32 high-bit bytes, and pairs share low-nibble bytes.
+static inline float2 q5k_scale_min(const device uchar* block, uint s) {
+    const device uchar* p = block + 4;
+    uint scale = s < 4 ? p[s] & 63 : (p[s + 4] & 15) | ((p[s - 4] >> 6) << 4);
+    uint minimum = s < 4 ? p[s + 4] & 63 : (p[s + 4] >> 4) | ((p[s] >> 6) << 4);
+    return float2(read_half(block) * scale, read_half(block + 2) * minimum);
 }
-#define EXTRA_BLOCK(name, width, bytes, value)                                                 \
-    static inline void widen_##name##_part(const device uchar* b, uint part, device float* o) { \
-        for (uint i=0; i<32; i++) o[i] = value(b, part*32+i);                                  \
-    }                                                                                          \
-    WIDEN_KERNEL(widen_##name, width, bytes)                                                    \
-    static inline float unit_##name(const device uchar* row, const device float* x, uint u) {  \
-        const device uchar* b = row + (u/(width/32))*bytes;                                     \
-        float sum = 0;                                                                         \
-        for (uint i=0; i<32; i++) sum += value(b, (u%(width/32))*32+i)*x[u*32+i];              \
-        return sum;                                                                            \
+static inline float4 q5k_codes(const device uchar* block, uint s, uint j) {
+    const device packed_uchar4* low = (const device packed_uchar4*)(block + 48 + 32 * (s / 2));
+    const device packed_uchar4* high = (const device packed_uchar4*)(block + 16);
+    return float4(((uint4(uchar4(low[j])) >> (4 * (s % 2))) & 15u) | (((uint4(uchar4(high[j])) >> s) & 1u) << 4));
+}
+static inline void widen_q5k_part(const device uchar* block, uint s, device float* out) {
+    float2 sm = q5k_scale_min(block, s);
+    device packed_float4* to = (device packed_float4*)out;
+    for (uint j = 0; j < 8; j++) to[j] = sm.x * q5k_codes(block, s, j) - sm.y;
+}
+WIDEN_KERNEL(widen_q5k, 256, 176)
+
+static inline float unit_q5k(const device uchar* row, const device float* x, uint unit) {
+    const device uchar* block = row + (unit / 8) * 176;
+    uint s = unit % 8;
+    const device packed_float4* v = (const device packed_float4*)(x + 32 * unit);
+    float4 dot = 0, sum = 0;
+    for (uint j = 0; j < 8; j++) {
+        float4 a = v[j];
+        dot += q5k_codes(block, s, j) * a;
+        sum += a;
     }
-EXTRA_BLOCK(q5k, 256, 176, q5k_value)
+    float2 sm = q5k_scale_min(block, s);
+    float4 result = dot * sm.x - sum * sm.y;
+    return result.x + result.y + result.z + result.w;
+}
 
 static inline void widen_nvfp4_part(const device uchar* block, uint part, device float* out) {
     for (uint i = 0; i < 32; i++) out[i] = nv_value(block, part * 32 + i);
