@@ -79,6 +79,7 @@ pub(crate) fn chat(model_dir: &std::path::Path, system: Option<&str>, run: &RunA
             std::io::stdout().flush()?;
             Ok(())
         };
+        let before = session.drafting();
         let (_, stop) = session.generate(&mut sampler, run.limits(), config.eos_token_id, |token, _| {
             generated.push(token);
             show(&generated)?;
@@ -94,11 +95,15 @@ pub(crate) fn chat(model_dir: &std::path::Path, system: Option<&str>, run: &RunA
         if let Some(note) = stop_note(stop, run.limits()) {
             tracing::info!("{note}");
         }
+        let after = session.drafting();
         tracing::info!(
-            "{} new prompt tokens in {prompt_seconds:.1}s ({reused} reused); {} tokens at {:.1}/s",
+            "{} new prompt tokens in {prompt_seconds:.1}s ({reused} reused); {} tokens at {:.1}/s; copied: {}/{} accepted in {} rounds",
             ids.len() - reused,
             generated.len(),
-            generated.len() as f32 / seconds
+            generated.len() as f32 / seconds,
+            after.copied_accepted - before.copied_accepted,
+            after.copied_proposed - before.copied_proposed,
+            after.copied_rounds - before.copied_rounds
         );
     }
     Ok(())
