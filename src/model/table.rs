@@ -100,14 +100,23 @@ impl Table {
 
     /// Makes room for `more` rows.
     pub(crate) fn reserve(&mut self, more: usize) {
-        if self.rows + more <= self.capacity {
-            return;
+        let capacity = self.capacity_for(more);
+        if capacity != self.capacity {
+            self.resize(capacity);
         }
-        self.resize((self.rows + more).max(2 * self.capacity).max(16));
+    }
+
+    fn capacity_for(&self, more: usize) -> usize {
+        let needed = self.rows + more;
+        if needed <= self.capacity { self.capacity } else { needed.max(2 * self.capacity).max(16) }
     }
 
     fn resize(&mut self, capacity: usize) {
-        let mut store = self.store.another(self.heads * capacity * self.dim);
+        let store = self.store.another(self.heads * capacity * self.dim);
+        self.move_into(store, capacity);
+    }
+
+    fn move_into(&mut self, mut store: Store, capacity: usize) {
         let used = self.rows * self.dim;
         for head in 0..self.heads {
             store.floats_mut()[head * capacity * self.dim..][..used].copy_from_slice(self.head(head));
@@ -157,23 +166,20 @@ impl Table {
         }
     }
 
-    /// Moves the rows into a buffer shared with the GPU, if they are not in one already.
+    /// Ensures GPU-visible rows and room for the next batch in a single allocation and copy.
     #[cfg(target_os = "macos")]
-    pub(crate) fn share(&mut self, gpu: &Gpu) -> anyhow::Result<()> {
-        if matches!(self.store, Store::Shared(_)) {
+    pub(crate) fn reserve_shared(&mut self, gpu: &Gpu, more: usize) -> anyhow::Result<()> {
+        let capacity = self.capacity_for(more);
+        if capacity == self.capacity && matches!(self.store, Store::Shared(_)) {
             return Ok(());
         }
         // Only the rows in use are copied: the rest of the room has never been touched and takes no memory yet.
-        let mut shared = gpu.shared(self.heads * self.capacity * self.dim * 4)?;
-        let used = self.rows * self.dim;
-        for head in 0..self.heads {
-            shared.floats_mut()[head * self.capacity * self.dim..][..used].copy_from_slice(self.head(head));
-        }
-        self.store = Store::Shared(shared);
+        let shared = gpu.shared(self.heads * capacity * self.dim * 4)?;
+        self.move_into(Store::Shared(shared), capacity);
         Ok(())
     }
 
-    /// The shared buffer, once [`Table::share`] has made one.
+    /// The shared buffer, once [`Table::reserve_shared`] has made one.
     #[cfg(target_os = "macos")]
     pub(crate) fn shared_mut(&mut self) -> Option<&mut Shared> {
         match &mut self.store {
@@ -222,6 +228,21 @@ impl<'de> Deserialize<'de> for Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sharing_full_tables_keeps_each_heads_stride_when_they_grow() {
+        let gpu = Gpu::new(&[], true).unwrap();
+        let mut table = Table::from_heads(vec![vec![1., 2., 3., 4.], vec![5., 6., 7., 8.]], 2);
+        table.reserve_shared(&gpu, 1).unwrap();
+        table.push(&[9., 10., 11., 12.]);
+        let capacity = table.capacity();
+        table.reserve_shared(&gpu, capacity).unwrap();
+        assert!(table.capacity() >= capacity + 3);
+        assert!(table.shared_mut().is_some());
+        assert_eq!(table.head(0), &[1., 2., 3., 4., 9., 10.]);
+        assert_eq!(table.head(1), &[5., 6., 7., 8., 11., 12.]);
+    }
 
     #[test]
     fn rows_survive_growing_dropping_and_copying() {

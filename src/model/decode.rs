@@ -748,8 +748,7 @@ impl Decoder {
         for (slots, visit) in self.visits.iter().zip(&mut state.visits) {
             visit.drop_stale(&model.cfg, slots.local, state.position);
             for table in [&mut visit.keys, &mut visit.values] {
-                table.share(gpu)?;
-                table.reserve(count);
+                table.reserve_shared(gpu, count)?;
             }
             words[slots.info] = visit.first as u32;
             words[slots.info + 1] = visit.keys.capacity() as u32;
