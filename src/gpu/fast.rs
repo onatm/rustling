@@ -10,6 +10,8 @@ fn ggml_pipeline_index(format: Format) -> Result<usize> {
         Format::Q5_0 => 1,
         Format::Q6K => 2,
         Format::Q8_0 => 3,
+        Format::Nvfp4 => 4,
+        Format::Q5K => 5,
         other => anyhow::bail!("no kernel unpacks {other:?}"),
     })
 }
@@ -347,6 +349,9 @@ impl Gpu {
             let stack = |values: &[u8], format: Format, (out_rows, cols): (usize, usize), from: &Buffer, to: &Buffer, slot: usize| -> Result<()> {
                 let row_bytes = format.row_bytes(cols).context("rows do not make whole blocks")?;
                 ensure!(values.len() == experts * out_rows * row_bytes, "bad expert stack");
+                let scales = job.scales[slot];
+                ensure!(scales.is_empty() || scales.len() == 4*experts, "bad expert scales");
+                let scale = |expert: usize| if scales.is_empty() { 1.0 } else { f32::from_le_bytes(scales[4*expert..][..4].try_into().unwrap()) };
                 let (values_buffer, values_offset) = self.weights(values)?;
                 let per_part = (WIDENED_BYTES / (out_rows * cols * 4)).max(1);
                 let widened: Vec<Buffer> = order
@@ -367,14 +372,16 @@ impl Gpu {
                             ensure!(out_rows % 4 == 0, "bad expert width");
                             let at = values_offset + expert * out_rows * row_bytes;
                             let buffers = [(&values_buffer, at), (from, first * cols * 4), (to, first * out_rows * 4)];
-                            step(&self.tail_ggml[index], &buffers, &[out_rows as u32, cols as u32], (out_rows * 8, count))?;
+                            step(&self.tail_ggml[index], &buffers, &[out_rows as u32, cols as u32, scale(expert).to_bits()], (out_rows * 8, count))?;
                         }
-                        Matrix::Widened(position) => self.multiply(
+                        Matrix::Widened(position) => self.product(
                             &commands,
                             (from, first * cols * 4, run, cols),
                             (&widened[position / per_part], (position % per_part) * out_rows * cols * 4, out_rows, cols),
                             (to, first * out_rows * 4),
                             1,
+                            true,
+                            scale(order[position] as usize) as f64,
                         ),
                     }
                 }

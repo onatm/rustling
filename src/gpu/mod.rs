@@ -53,9 +53,9 @@ pub struct Gpu {
     widen_nvfp4: Pipeline,
     widen_mxfp8: Pipeline,
     /// Unpacking kernels for a GGUF file's block formats: Q4_K, Q5_0, Q6_K, Q8_0.
-    widen_ggml: [Pipeline; 4],
+    widen_ggml: [Pipeline; 6],
     /// Direct products for short expert tails, in the same format order as `widen_ggml`.
-    tail_ggml: [Pipeline; 4],
+    tail_ggml: [Pipeline; 6],
     /// Turns a long batch's attention scores into weights.
     prompt_weights: Pipeline,
     /// The steps between a long batch's two expert products: gather, activation, weighted sum.
@@ -80,6 +80,8 @@ unsafe impl Sync for Gpu {}
 
 /// A GGUF layer's experts applied to a long batch, for [`Gpu::experts_whole`].
 pub struct WholeExperts<'a> {
+    /// Optional little-endian F32 multipliers per expert, for the gate/up and down stacks.
+    pub scales: [&'a [u8]; 2],
     /// The stored bytes and block format of the two stacks: `experts` matrices of `2 * units x hidden`, with
     /// each expert's gate rows before its up rows, and of `hidden x units`.
     pub gate_up: (&'a [u8], Format),
@@ -209,8 +211,8 @@ impl Gpu {
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|e| anyhow!("building kernel {name}: {}", e.localizedDescription()))
         };
-        let widen_ggml = [pipeline("widen_q4k")?, pipeline("widen_q5_0")?, pipeline("widen_q6k")?, pipeline("widen_q8_0")?];
-        let tail_ggml = [pipeline("tail_q4k")?, pipeline("tail_q5_0")?, pipeline("tail_q6k")?, pipeline("tail_q8_0")?];
+        let widen_ggml = [pipeline("widen_q4k")?, pipeline("widen_q5_0")?, pipeline("widen_q6k")?, pipeline("widen_q8_0")?, pipeline("widen_nvfp4")?, pipeline("widen_q5k")?];
+        let tail_ggml = [pipeline("tail_q4k")?, pipeline("tail_q5_0")?, pipeline("tail_q6k")?, pipeline("tail_q8_0")?, pipeline("tail_nvfp4")?, pipeline("tail_q5k")?];
         let source = NSString::from_str(include_str!("shaders/attend.metal"));
         let library = device
             .newLibraryWithSource_options_error(&source, Some(&options))

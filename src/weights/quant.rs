@@ -106,7 +106,7 @@ pub fn encode_e4m3(value: f32) -> u8 {
 }
 
 /// Twice the E2M1 values, so they fit in a byte.
-const TWICE_E2M1: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+pub(super) const TWICE_E2M1: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 /// Rounds to the nearest E2M1 code, ties to the even code, saturating at 6.
 fn encode_e2m1(value: f32) -> u8 {

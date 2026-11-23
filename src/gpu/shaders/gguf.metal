@@ -103,6 +103,43 @@ static inline void widen_q6k_part(const device uchar* block, uint part, device f
     }
 }
 
+// Unsloth's GGUF NVFP4 layout differs from the checkpoint: low and high
+// nibbles are eight positions apart. The expert-wide multiplier is applied to the product.
+constant float e2m1_values[16] = {0,.5,1,1.5,2,3,4,6,0,-.5,-1,-1.5,-2,-3,-4,-6};
+static inline float nv_value(const device uchar* b, uint i) {
+    uint s = i / 16, code = b[s], exp = (code >> 3) & 15, man = code & 7;
+    float scale = code == 127 ? 0.f : ldexp(float(exp ? 8 + man : man), exp ? int(exp)-10 : -9);
+    uint q = b[4 + 8*s + i%8];
+    return scale * e2m1_values[(q >> (4*((i/8)%2))) & 15];
+}
+static inline float q5k_value(const device uchar* b, uint i) {
+    uint s = i/32, j = i%32;
+    const device uchar* p = b+4;
+    uint sc = s < 4 ? p[s]&63 : (p[s+4]&15) | ((p[s-4]>>6)<<4);
+    uint m = s < 4 ? p[s+4]&63 : (p[s+4]>>4) | ((p[s]>>6)<<4);
+    uint q = ((b[48+32*(s/2)+j] >> (4*(s%2))) & 15) | (((b[16+j]>>s)&1)<<4);
+    return read_half(b)*float(sc)*float(q) - read_half(b+2)*float(m);
+}
+#define EXTRA_BLOCK(name, width, bytes, value)                                                 \
+    static inline void widen_##name##_part(const device uchar* b, uint part, device float* o) { \
+        for (uint i=0; i<32; i++) o[i] = value(b, part*32+i);                                  \
+    }                                                                                          \
+    WIDEN_KERNEL(widen_##name, width, bytes)                                                    \
+    static inline float unit_##name(const device uchar* row, const device float* x, uint u) {  \
+        const device uchar* b = row + (u/(width/32))*bytes;                                     \
+        float sum = 0;                                                                         \
+        for (uint i=0; i<32; i++) sum += value(b, (u%(width/32))*32+i)*x[u*32+i];              \
+        return sum;                                                                            \
+    }
+EXTRA_BLOCK(nvfp4, 64, 36, nv_value)
+EXTRA_BLOCK(q5k, 256, 176, q5k_value)
+
+static inline float unit_bf16(const device uchar* row, const device float* x, uint u) {
+    const device ushort* w = (const device ushort*)row + 32*u;
+    float sum = 0;
+    for (uint i=0; i<32; i++) sum += as_type<float>(uint(w[i])<<16)*x[32*u+i];
+    return sum;
+}
 WIDEN_KERNEL(widen_q8_0, 32, 34)
 WIDEN_KERNEL(widen_q5_0, 32, 22)
 WIDEN_KERNEL(widen_q4k, 256, 144)
@@ -262,23 +299,35 @@ ROW_KERNEL(row_q8_0, unit_q8_0, 32, p.cols / 32 * 34)
 ROW_KERNEL(row_q5_0, unit_q5_0, 32, p.cols / 32 * 22)
 ROW_KERNEL(row_q6k, unit_q6k, 64, p.cols / 256 * 210)
 ROW_KERNEL(row_f32, unit_f32, 32, p.cols * 4)
+ROW_KERNEL(row_bf16, unit_bf16, 32, p.cols * 2)
+ROW_KERNEL(row_nvfp4, unit_nvfp4, 32, p.cols / 64 * 36)
+ROW_KERNEL(row_q5k, unit_q5k, 32, p.cols / 256 * 176)
+
+kernel void expert_scale(device float* product [[buffer(0)]], const device uint* order [[buffer(1)]],
+                         const device float* scale [[buffer(2)]], constant uint2& shape [[buffer(3)]],
+                         uint3 id [[thread_position_in_grid]]) {
+    uint shift = id.z * shape.y;
+    product[shift + id.y * shape.x + id.x] *= scale[order[shift + id.y]];
+}
 
 // A short run of one expert's tokens. Read compressed weights directly rather than padding the
 // input to an MPS matrix of 256 rows. Each SIMD group computes four output rows for one token.
 #define TAIL_KERNEL(name, dot_unit, width, bytes)                                            \
     kernel void name(const device uchar* w [[buffer(0)]], const device float* x [[buffer(1)]], \
-                     device float* out [[buffer(2)]], constant uint2& shape [[buffer(3)]],     \
+                     device float* out [[buffer(2)]], constant uint* shape [[buffer(3)]],      \
                      uint3 group [[threadgroup_position_in_grid]],                            \
                      ushort lane [[thread_index_in_threadgroup]]) {                           \
-        uint rows = shape.x, cols = shape.y, row = group.x * 4 + lane / 8;                    \
+        uint rows = shape[0], cols = shape[1], row = group.x * 4 + lane / 8;                  \
         float sum = 0;                                                                        \
         for (uint u = lane % 8; u < cols / width; u += 8)                                     \
             sum += dot_unit(w + ulong(row) * (bytes), x + group.y * cols, u);                 \
         for (ushort d = 4; d; d /= 2) sum += simd_shuffle_xor(sum, d);                        \
-        if (lane % 8 == 0) out[group.y * rows + row] = sum;                                   \
+        if (lane % 8 == 0) out[group.y * rows + row] = sum * as_type<float>(shape[2]);        \
     }
 
 TAIL_KERNEL(tail_q4k, unit_q4k, 64, cols / 256 * 144)
 TAIL_KERNEL(tail_q5_0, unit_q5_0, 32, cols / 32 * 22)
 TAIL_KERNEL(tail_q6k, unit_q6k, 64, cols / 256 * 210)
 TAIL_KERNEL(tail_q8_0, unit_q8_0, 32, cols / 32 * 34)
+TAIL_KERNEL(tail_nvfp4, unit_nvfp4, 32, cols / 64 * 36)
+TAIL_KERNEL(tail_q5k, unit_q5k, 32, cols / 256 * 176)

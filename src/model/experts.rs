@@ -112,6 +112,7 @@ impl<'a> Model<'a> {
         // A batch this short does not repay unpacking every expert's weights; the decoder's kernels multiply
         // straight from the stored blocks.
         let job = WholeExperts {
+            scales: [experts.gate_up.raw_parts().1, experts.down.raw_parts().1],
             gate_up: (experts.gate_up.raw_parts().0, gate_up),
             down: (experts.down.raw_parts().0, down),
             experts: cfg.n_routed_experts,
@@ -222,7 +223,8 @@ impl<'a> Model<'a> {
                     for r in 0..outs[0].len() {
                         let (format, row) = matrix.ggml_row(expert, first + r);
                         dot_row_int8_many(format, row, xs, &mut dots[..xs.len()]);
-                        outs.iter_mut().zip(&dots).for_each(|(out, dot)| out[r] = *dot);
+                        let scale = matrix.outer_scale(expert);
+                        outs.iter_mut().zip(&dots).for_each(|(out, dot)| out[r] = *dot * scale);
                     }
                 }
             });
@@ -288,11 +290,13 @@ impl<'a> Model<'a> {
                 let gate_up = gpu.experts_fast(experts.gate_up.raw_parts(), (count, rows, cols), stack, &firsts, 0)?;
                 let acts: Vec<Vec<f32>> = gate_up
                     .par_iter()
-                    .map(|products| {
+                    .enumerate()
+                    .map(|(expert, products)| {
+                        let scale = experts.gate_up.outer_scale(expert);
                         let mut acts = Vec::with_capacity(products.len() / 2);
                         for products in products.chunks_exact(rows) {
                             let (mut gate, mut up): (Vec<f32>, Vec<f32>) =
-                                (0..inter).map(|unit| experts.gate_up_rows(unit)).map(|(g, u)| (products[g], products[u])).unzip();
+                                (0..inter).map(|unit| experts.gate_up_rows(unit)).map(|(g, u)| (products[g]*scale, products[u]*scale)).unzip();
                             capped_swiglu(&mut gate, &mut up, cfg.mlp_gate_softcap, cfg.mlp_up_softcap, 1.0);
                             acts.extend(gate);
                         }
@@ -312,7 +316,7 @@ impl<'a> Model<'a> {
                         continue;
                     }
                     for (product, &(t, weight)) in products.chunks_exact(rows).zip(tokens) {
-                        outputs.push((t, product.iter().map(|v| v * weight).collect()));
+                        outputs.push((t, product.iter().map(|v| v * experts.down.outer_scale(expert) * weight).collect()));
                     }
                 }
                 Ok((outputs, failed))

@@ -39,27 +39,28 @@ const SCORES: usize = 2;
 const TABLES: usize = 3;
 
 // Kernels, by their place in the two lists they are built from.
-const ROW_KERNELS: [&str; 5] = ["row_q4k", "row_q5_0", "row_q6k", "row_q8_0", "row_f32"];
+const ROW_KERNELS: [&str; 9] = ["row_q4k", "row_q5_0", "row_q6k", "row_q8_0", "row_f32", "row_bf16", "row_nvfp4", "row_q5k", "expert_scale"];
+const EXPERT_SCALE: usize = 8;
 const STEP_KERNELS: [&str; 16] = [
     "rms_norm", "scale_clip", "residual_read", "merge", "conv", "distance_bias", "attention_scores",
     "attention_weights", "attention_values", "store", "route", "activation", "combine", "soft_cap", "attention_blocks", "attention_reduce",
 ];
-const RMS_NORM: usize = 5;
-const SCALE_CLIP: usize = 6;
-const RESIDUAL_READ: usize = 7;
-const MERGE: usize = 8;
-const CONV: usize = 9;
-const DISTANCE_BIAS: usize = 10;
-const ATTENTION_SCORES: usize = 11;
-const ATTENTION_WEIGHTS: usize = 12;
-const ATTENTION_VALUES: usize = 13;
-const STORE: usize = 14;
-const ROUTE: usize = 15;
-const ACTIVATION: usize = 16;
-const COMBINE: usize = 17;
-const SOFT_CAP: usize = 18;
-const ATTENTION_BLOCKS: usize = 19;
-const ATTENTION_REDUCE: usize = 20;
+const RMS_NORM: usize = ROW_KERNELS.len();
+const SCALE_CLIP: usize = RMS_NORM + 1;
+const RESIDUAL_READ: usize = RMS_NORM + 2;
+const MERGE: usize = RMS_NORM + 3;
+const CONV: usize = RMS_NORM + 4;
+const DISTANCE_BIAS: usize = RMS_NORM + 5;
+const ATTENTION_SCORES: usize = RMS_NORM + 6;
+const ATTENTION_WEIGHTS: usize = RMS_NORM + 7;
+const ATTENTION_VALUES: usize = RMS_NORM + 8;
+const STORE: usize = RMS_NORM + 9;
+const ROUTE: usize = RMS_NORM + 10;
+const ACTIVATION: usize = RMS_NORM + 11;
+const COMBINE: usize = RMS_NORM + 12;
+const SOFT_CAP: usize = RMS_NORM + 13;
+const ATTENTION_BLOCKS: usize = RMS_NORM + 14;
+const ATTENTION_REDUCE: usize = RMS_NORM + 15;
 const KEY_BLOCK: usize = 128;
 /// Shorter conversations don't reliably repay merging the block results.
 const SPLIT_MIN_KEYS: usize = 32768;
@@ -71,7 +72,9 @@ fn row_kernel(format: Format) -> Result<usize> {
         Format::Q6K => 2,
         Format::Q8_0 => 3,
         Format::F32 => 4,
-        Format::Bf16 => anyhow::bail!("no GPU kernel for bfloat16 rows"),
+        Format::Bf16 => 5,
+        Format::Nvfp4 => 6,
+        Format::Q5K => 7,
     })
 }
 
@@ -458,11 +461,20 @@ impl<'m, 'a> Builder<'m, 'a> {
         ensure!(!experts.interleaved, "the activation kernel expects the gate rows before the up rows");
         let inter = cfg.intermediate_size;
         let picked = (SCRATCH, order * 4);
+        let apply_scale = |builder: &mut Self, scales: &[u8], rows, at| -> Result<()> {
+            if !scales.is_empty() {
+                let scale = builder.weight(scales)?;
+                builder.step(EXPERT_SCALE, vec![(SCRATCH, at), picked, scale], &[Word::Count(rows)], Grid::Threads(rows, top));
+            }
+            Ok(())
+        };
         let products = self.rows(gate_up_format, experts.gate_up.raw_parts().0, (2 * inter, h), top, picked, x, 0)?;
+        apply_scale(self, experts.gate_up.raw_parts().1, 2 * inter, products * 4)?;
         let activated = self.alloc(top * inter);
         let params = [Word::Count(inter), Word::Real(cfg.mlp_gate_softcap), Word::Real(cfg.mlp_up_softcap)];
         self.step(ACTIVATION, vec![(SCRATCH, products * 4), (SCRATCH, activated * 4)], &params, Grid::Threads(inter, top));
         let outputs = self.rows(down_format, experts.down.raw_parts().0, (h, inter), top, picked, activated, inter)?;
+        apply_scale(self, experts.down.raw_parts().1, h, outputs * 4)?;
         let mlp = self.alloc(h);
         let buffers = vec![(SCRATCH, outputs * 4), (SCRATCH, weight * 4), (SCRATCH, mlp * 4)];
         self.step(COMBINE, buffers, &[h, top].map(Word::Count), Grid::Threads(h, 1));
@@ -709,7 +721,7 @@ impl Decoder {
 
         let (gate_up, gate_up_at) = gpu.wrap(experts.gate_up.raw_parts().0)?;
         let (down, down_at) = gpu.wrap(experts.down.raw_parts().0)?;
-        let buffers = [scratch, gate_up, down];
+        let mut buffers = vec![scratch, gate_up, down];
         let rows = |format: Format, buffer: (usize, usize), (rows, cols): (usize, usize), x: usize, x_stride: usize, to: usize| -> Result<Step> {
             let row_bytes = format.row_bytes(cols).context("rows of whole blocks")?;
             let params = [rows, cols, rows * row_bytes, 8, x_stride, stride, 1].map(Word::Count);
@@ -721,7 +733,7 @@ impl Decoder {
             })
         };
         let activation = [Word::Count(inter), Word::Real(cfg.mlp_gate_softcap), Word::Real(cfg.mlp_up_softcap), Word::TokenStride];
-        let steps = [
+        let mut steps = vec![
             rows(gate_up_format, (1, gate_up_at), (2 * inter, h), 0, 0, first)?,
             Step { kernel: ACTIVATION, buffers: vec![(0, first * 4), (0, active * 4)], params: words(&activation, stride), grid: Grid::Threads(inter, top) },
             rows(down_format, (2, down_at), (h, inter), active, inter, second)?,
@@ -732,8 +744,19 @@ impl Decoder {
                 grid: Grid::Threads(h, 1),
             },
         ];
+        // Insert in reverse so both indices refer to the original four steps.
+        for (after, bytes, rows, at) in [(3, experts.down.raw_parts().1, h, second), (1, experts.gate_up.raw_parts().1, 2 * inter, first)] {
+            if !bytes.is_empty() {
+                let (scale, offset) = gpu.wrap(bytes)?;
+                steps.insert(after, Step {
+                    kernel: EXPERT_SCALE, buffers: vec![(0, at * 4), (0, order * 4), (buffers.len(), offset)],
+                    params: words(&[Word::Count(rows), Word::TokenStride], stride), grid: Grid::Threads(rows, top),
+                });
+                buffers.push(scale);
+            }
+        }
         let ran = gpu.run(&[&self.kernels[0], &self.kernels[1]], &steps, &buffers, [0, 0], tokens);
-        let [scratch, ..] = buffers;
+        let scratch = buffers.swap_remove(0);
         let outputs = (0..tokens).flat_map(|t| scratch.floats()[t * stride + out..][..h].iter().copied()).collect();
         self.short = Some((held, scratch));
         ran?;

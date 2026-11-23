@@ -422,7 +422,12 @@ fn the_whole_expert_step_matches_plain_sums() {
         let other = if t < 32 { 0 } else { 2 + (t % 2) as u32 };
         [(1u32, 0.75f32), (other, 0.25 + t as f32 / 1000.0)]
     }).collect();
+    let gate_scale = [0.5f32, 0.25, 1.5, 1., 0.75];
+    let down_scale = [1.5f32, 0.75, 0.5, 1., 0.25];
+    let scale_bytes = |scales: &[f32]| scales.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<_>>();
+    let (gate_bytes, down_bytes) = (scale_bytes(&gate_scale), scale_bytes(&down_scale));
     let job = WholeExperts {
+        scales: [&gate_bytes, &down_bytes],
         gate_up: (&gate_up, Format::Q8_0),
         down: (&down, Format::Q8_0),
         experts,
@@ -445,12 +450,13 @@ fn the_whole_expert_step_matches_plain_sums() {
             let active: Vec<f32> = (0..units)
                 .map(|u| {
                     let (gate, up) = (dot(&rows[u * hidden..][..hidden], input), dot(&rows[(units + u) * hidden..][..hidden], input));
+                    let (gate, up) = (gate * gate_scale[expert as usize], up * gate_scale[expert as usize]);
                     (gate / 4.0).tanh() * 4.0 / (1.0 + (-gate).exp()) * (up / 25.0).tanh() * 25.0
                 })
                 .collect();
             let rows = &down_values[expert as usize * hidden * units..][..hidden * units];
             for (c, expected) in expected.iter_mut().enumerate() {
-                *expected += weight * dot(&rows[c * units..][..units], &active);
+                *expected += weight * down_scale[expert as usize] * dot(&rows[c * units..][..units], &active);
             }
         }
         for (c, expected) in expected.iter().enumerate() {
@@ -488,7 +494,7 @@ fn the_fast_gates_match_plain_sums() {
 fn the_fast_paths_unpack_gguf_blocks() {
     use crate::weights::ggml::random_row;
     let gpu = Gpu::new(&[], true).unwrap();
-    for (f, format) in [Format::Q4K, Format::Q5_0, Format::Q6K, Format::Q8_0].into_iter().enumerate() {
+    for (f, format) in [Format::Q4K, Format::Q5_0, Format::Q6K, Format::Q8_0, Format::Q5K, Format::Nvfp4].into_iter().enumerate() {
         // A dense matrix.
         let (rows, cols, vectors) = (37, 768, 5);
         let weights: Vec<u8> = (0..rows).flat_map(|r| random_row(format, cols, (100 * f + r) as u32)).collect();

@@ -15,6 +15,10 @@ pub enum Format {
     Bf16,
     /// 4-bit values, eight sub-blocks of 32 with 6-bit scales and offsets: 4.5 bits per weight.
     Q4K,
+    /// Affine K blocks like Q4_K with a fifth bit per value.
+    Q5K,
+    /// GGML NVFP4: four groups of 16 E2M1 codes, with a UE4M3 scale per group.
+    Nvfp4,
     /// 5-bit values in blocks of 32: 5.5 bits per weight.
     Q5_0,
     /// 6-bit values, sixteen sub-blocks of 16 with 8-bit scales: 6.5625 bits per weight.
@@ -30,6 +34,8 @@ impl Format {
             Format::F32 => (1, 4),
             Format::Bf16 => (1, 2),
             Format::Q4K => (256, 144),
+            Format::Q5K => (256, 176),
+            Format::Nvfp4 => (64, 36),
             Format::Q5_0 => (32, 22),
             Format::Q6K => (256, 210),
             Format::Q8_0 => (32, 34),
@@ -59,7 +65,17 @@ impl Format {
             _ => {
                 for (block, out) in row.chunks_exact(bytes).zip(out.chunks_exact_mut(values)) {
                     match self {
-                        Format::Q4K => decode_q4k(block, out),
+                        Format::Q4K | Format::Q5K => decode_affine_k(block, out, self == Format::Q5K),
+                        Format::Nvfp4 => {
+                            for (s, group) in out.chunks_exact_mut(16).enumerate() {
+                                let scale = nv_scale(block[s]);
+                                for j in 0..8 {
+                                    let q = block[4 + 8 * s + j];
+                                    group[j] = quant::E2M1[(q & 15) as usize] * scale;
+                                    group[j + 8] = quant::E2M1[(q >> 4) as usize] * scale;
+                                }
+                            }
+                        }
                         Format::Q5_0 => decode_q5_0(block, out),
                         Format::Q6K => decode_q6k(block, out),
                         Format::Q8_0 => decode_q8_0(block, out),
@@ -122,17 +138,26 @@ pub(crate) fn q4k_scale_min(j: usize, packed: &[u8]) -> (u8, u8) {
 
 /// `d: f16`, `dmin: f16`, 12 bytes of scales and offsets, then 128 bytes of nibbles. Each 32 bytes hold two
 /// sub-blocks: the low nibbles, then the high ones. A value is `d * scale * q - dmin * offset`.
-fn decode_q4k(block: &[u8], out: &mut [f32]) {
+fn decode_affine_k(block: &[u8], out: &mut [f32], fifth: bool) {
     let (d, dmin) = (half(block), half(&block[2..]));
-    let (packed, nibbles) = (&block[4..16], &block[16..144]);
+    let (packed, nibbles) = (&block[4..16], &block[block.len()-128..]);
     for (pair, (q, out)) in nibbles.chunks_exact(32).zip(out.chunks_exact_mut(64)).enumerate() {
         let (low, high) = out.split_at_mut(32);
         let (scale, min) = q4k_scale_min(2 * pair, packed);
         let (scale, min) = (d * scale as f32, dmin * min as f32);
-        low.iter_mut().zip(q).for_each(|(o, q)| *o = scale * (q & 0x0F) as f32 - min);
+        let high_bit = |j: usize, s: usize| if fifth { ((block[16 + j] >> s) & 1) << 4 } else { 0 };
+        low.iter_mut().zip(q).enumerate().for_each(|(j, (o, q))| *o = scale * ((q & 15) | high_bit(j, 2 * pair)) as f32 - min);
         let (scale, min) = q4k_scale_min(2 * pair + 1, packed);
         let (scale, min) = (d * scale as f32, dmin * min as f32);
-        high.iter_mut().zip(q).for_each(|(o, q)| *o = scale * (q >> 4) as f32 - min);
+        high.iter_mut().zip(q).enumerate().for_each(|(j, (o, q))| *o = scale * ((q >> 4) | high_bit(j, 2 * pair + 1)) as f32 - min);
+    }
+}
+
+fn nv_scale(code: u8) -> f32 {
+    match code {
+        127 => 0.0,
+        255 => 480.0,
+        _ => quant::E4M3[(code & 127) as usize],
     }
 }
 
@@ -277,7 +302,9 @@ mod neon {
                 // SAFETY: the caller checked that the row is whole blocks covering every activation's length.
                 head.copy_from_slice(&unsafe {
                     match format {
-                        Format::Q4K => q4k(row, group),
+                        Format::Q4K => affine_k::<N, false>(row, group),
+                        Format::Q5K => affine_k::<N, true>(row, group),
+                        Format::Nvfp4 => nvfp4(row, group),
                         Format::Q5_0 => q5_0(row, group),
                         Format::Q6K => q6k(row, group),
                         Format::Q8_0 => q8_0(row, group),
@@ -353,12 +380,12 @@ mod neon {
     /// # Safety
     /// `row` must be whole 144-byte blocks, one for each 256 values of every activation.
     #[inline(always)]
-    unsafe fn q4k<const N: usize>(row: &[u8], xs: &[&Int8Activation; N]) -> [f32; N] {
+    unsafe fn affine_k<const N: usize, const FIFTH: bool>(row: &[u8], xs: &[&Int8Activation; N]) -> [f32; N] {
         unsafe {
             let nibble = vdupq_n_u8(15);
             let mut sums = [vdupq_n_f32(0.0); N];
             let mut offsets = [vdupq_n_f32(0.0); N];
-            for (b, block) in row.chunks_exact(144).enumerate() {
+            for (b, block) in row.chunks_exact(if FIFTH { 176 } else { 144 }).enumerate() {
                 let (d, dmin) = (half(block), half(&block[2..]));
                 let (mut scales, mut mins) = ([0.0f32; 8], [0.0f32; 8]);
                 for j in 0..8 {
@@ -374,10 +401,18 @@ mod neon {
                 }
                 // 32 bytes hold two sub-blocks: the low nibbles, then the high ones.
                 for pair in 0..4 {
-                    let packed = block.as_ptr().add(16 + 32 * pair);
+                    let packed = block.as_ptr().add(block.len() - 128 + 32 * pair);
                     let (first, second) = (vld1q_u8(packed), vld1q_u8(packed.add(16)));
-                    let low = [vreinterpretq_s8_u8(vandq_u8(first, nibble)), vreinterpretq_s8_u8(vandq_u8(second, nibble))];
-                    let high = [vreinterpretq_s8_u8(vshrq_n_u8::<4>(first)), vreinterpretq_s8_u8(vshrq_n_u8::<4>(second))];
+                    let mut low = [vreinterpretq_s8_u8(vandq_u8(first, nibble)), vreinterpretq_s8_u8(vandq_u8(second, nibble))];
+                    let mut high = [vreinterpretq_s8_u8(vshrq_n_u8::<4>(first)), vreinterpretq_s8_u8(vshrq_n_u8::<4>(second))];
+                    if FIFTH {
+                        for i in 0..2 {
+                            let bits = vld1q_u8(block.as_ptr().add(16 + 16*i));
+                            let fifth = |s| vreinterpretq_s8_u8(vandq_u8(vtstq_u8(bits, vdupq_n_u8(1u8 << s)), vdupq_n_u8(16)));
+                            low[i] = vorrq_s8(low[i], fifth(2*pair));
+                            high[i] = vorrq_s8(high[i], fifth(2*pair+1));
+                        }
+                    }
                     for (x, sum) in xs.iter().zip(&mut sums) {
                         let values = x.values.as_ptr().add(256 * b + 64 * pair);
                         let activation = x.scales.as_ptr().add(8 * b + 2 * pair);
@@ -392,6 +427,27 @@ mod neon {
             }
             let (sums, offsets) = (finish(sums), finish(offsets));
             std::array::from_fn(|i| sums[i] - offsets[i])
+        }
+    }
+
+    unsafe fn nvfp4<const N: usize>(row: &[u8], xs: &[&Int8Activation; N]) -> [f32; N] {
+        unsafe {
+            let lut = vld1q_s8(crate::weights::quant::TWICE_E2M1.as_ptr());
+            let mut sums = [vdupq_n_f32(0.0); N];
+            for (b, block) in row.chunks_exact(36).enumerate() {
+                for s in 0..4 {
+                    let q = vld1_u8(block.as_ptr().add(4 + 8*s));
+                    let codes = vcombine_u8(vand_u8(q, vdup_n_u8(15)), vshr_n_u8::<4>(q));
+                    let w = vqtbl1q_s8(lut, codes);
+                    let scale = super::nv_scale(block[s]) * 0.5;
+                    for (x, sum) in xs.iter().zip(&mut sums) {
+                        let a = vld1q_s8(x.values.as_ptr().add(64*b + 16*s));
+                        let dots = vdotq_s32(vdupq_n_s32(0), w, a);
+                        *sum = vfmaq_n_f32(*sum, vcvtq_f32_s32(dots), scale * x.scales[2*b+s/2]);
+                    }
+                }
+            }
+            finish(sums)
         }
     }
 
@@ -452,11 +508,15 @@ pub(crate) fn random_row(format: Format, cols: usize, seed: u32) -> Vec<u8> {
         })
         .collect();
     let scale_at: &[usize] = match format {
-        Format::Q4K => &[0, 2],
+        Format::Q4K | Format::Q5K => &[0, 2],
+        Format::Nvfp4 => &[],
         Format::Q6K => &[208],
         _ => &[0],
     };
     for block in row.chunks_exact_mut(block_bytes) {
+        if format == Format::Nvfp4 {
+            block[..4].iter_mut().for_each(|s| *s %= 127);
+        }
         for &at in scale_at {
             let scale = f16::from_f32(0.01 + block[at] as f32 * 1e-4).to_le_bytes();
             block[at..at + 2].copy_from_slice(&scale);
@@ -492,11 +552,15 @@ mod tests {
 
     #[test]
     fn rows_decode_as_the_reference_does() {
-        let rows: Vec<Row> = serde_json::from_str(include_str!("../../tests/golden/ggml_rows.json")).unwrap();
-        assert_eq!(rows.len(), 4);
+        let mut rows: Vec<Row> = serde_json::from_str(include_str!("../../tests/golden/ggml_rows.json")).unwrap();
+        // Block 7 of blk.3.ffn_down_exps and blk.21.ffn_gate_up_exps from Unsloth revision
+        // 8078d149, decoded with ggml_get_type_traits(type)->to_float at llama.cpp 690b87d8.
+        rows.extend(serde_json::from_str::<Vec<Row>>(include_str!("../../tests/golden/unsloth_rows.json")).unwrap());
         for row in rows {
             let format = match row.format.as_str() {
                 "Q4_K" => Format::Q4K,
+                "NVFP4" => Format::Nvfp4,
+                "Q5_K" => Format::Q5K,
                 "Q5_0" => Format::Q5_0,
                 "Q6_K" => Format::Q6K,
                 "Q8_0" => Format::Q8_0,
@@ -525,7 +589,7 @@ mod tests {
     /// format and however many activations share the row.
     #[test]
     fn integer_dot_products_match_the_decoded_rows() {
-        for format in [Format::Q4K, Format::Q5_0, Format::Q6K, Format::Q8_0] {
+        for format in [Format::Q4K, Format::Q5_0, Format::Q6K, Format::Q8_0, Format::Nvfp4, Format::Q5K] {
             let cols = 768;
             let row = random_row(format, cols, 7);
             let xs: Vec<Int8Activation> = (0..15)

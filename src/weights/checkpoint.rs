@@ -145,10 +145,12 @@ impl Checkpoint {
                 Type::F32 => Format::F32,
                 Type::BF16 => Format::Bf16,
                 Type::Q4_K => Format::Q4K,
+                Type::Q5_K => Format::Q5K,
+                Type::NVFP4 => Format::Nvfp4,
                 Type::Q5_0 => Format::Q5_0,
                 Type::Q6_K => Format::Q6K,
                 Type::Q8_0 => Format::Q8_0,
-                other => bail!("{name} is stored as {other:?}; this engine reads F32, BF16, Q4_K, Q5_0, Q6_K and Q8_0"),
+                other => bail!("{name} is stored as {other:?}; this engine reads F32, BF16, NVFP4, Q4_K, Q5_0, Q5_K, Q6_K and Q8_0"),
             };
             // GGUF lists dimensions innermost first.
             let stored_shape: Vec<usize> = tensor.shape().dims().iter().rev().map(|d| *d as usize).collect();
@@ -264,13 +266,21 @@ impl Checkpoint {
             let (experts, rows, cols) = (info.shape[0], info.shape[1], info.shape[2]);
             format.row_bytes(cols).with_context(|| format!("{name}: bad row length"))?;
             let (values_per_byte, block) = (0, format.block().0);
+            let scale_name = format!("{name}_expert_scale");
+            let outer = if self.contains(&scale_name) {
+                let (ty, shape, data) = self.rows(&scale_name)?;
+                ensure!(ty == Format::F32 && shape == [experts], "{name}: expected one F32 scale per expert");
+                data
+            } else {
+                &[]
+            };
             return Ok(ExpertMatrix {
                 format: ExpertFormat::Ggml(format),
                 experts,
                 rows,
                 cols,
                 values,
-                scales: &[],
+                scales: outer,
                 values_per_byte,
                 block,
             });
@@ -338,7 +348,13 @@ impl<'a> ExpertMatrix<'a> {
         match &self.format {
             ExpertFormat::Nvfp4 { outer_scales } => quant::decode_nvfp4_row(values, scales, outer_scales[expert], out),
             ExpertFormat::Mxfp8 => quant::decode_mxfp8_row(values, scales, out),
-            ExpertFormat::Ggml(format) => format.decode_row(values, out),
+            ExpertFormat::Ggml(format) => {
+                format.decode_row(values, out);
+                if !self.scales.is_empty() {
+                    let scale = self.outer_scale(expert);
+                    out.iter_mut().for_each(|v| *v *= scale);
+                }
+            }
         }
     }
 
@@ -363,7 +379,7 @@ impl<'a> ExpertMatrix<'a> {
         match &self.format {
             ExpertFormat::Nvfp4 { outer_scales } => quant::dot_nvfp4_row(values, scales, outer_scales[expert], x),
             ExpertFormat::Mxfp8 => quant::dot_mxfp8_row(values, scales, x),
-            ExpertFormat::Ggml(format) => format.dot_row(values, x, &mut Vec::new()),
+            ExpertFormat::Ggml(format) => format.dot_row(values, x, &mut Vec::new()) * self.outer_scale(expert),
         }
     }
 
@@ -384,6 +400,9 @@ impl<'a> ExpertMatrix<'a> {
     pub fn outer_scale(&self, expert: usize) -> f32 {
         match &self.format {
             ExpertFormat::Nvfp4 { outer_scales } => outer_scales[expert],
+            ExpertFormat::Ggml(_) if !self.scales.is_empty() => {
+                f32::from_le_bytes(self.scales[4*expert..][..4].try_into().unwrap())
+            }
             ExpertFormat::Mxfp8 | ExpertFormat::Ggml(_) => 1.0,
         }
     }
@@ -503,6 +522,8 @@ fn checkpoint_name(gguf: &str, full: bool) -> Option<(String, Layout)> {
         "exp_probs_b.bias" => format!("{p}.mlp.gate.bias"),
         "ffn_gate_up_exps.weight" => format!("{p}.mlp.experts.w13_weight"),
         "ffn_down_exps.weight" => format!("{p}.mlp.experts.w2_weight"),
+        "ffn_gate_up_exps.scale" => format!("{p}.mlp.experts.w13_weight_expert_scale"),
+        "ffn_down_exps.scale" => format!("{p}.mlp.experts.w2_weight_expert_scale"),
         "ffn_res_query.weight" => format!("{root}.attn_res.mlp_queries.{layer}"),
         // The checkpoint files a layer's attention queries under the layer before it.
         "attn_res_query.weight" => format!("{root}.attn_res.attn_queries.{}", layer.checked_sub(1)?),
