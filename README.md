@@ -10,7 +10,7 @@ runs of tokens the reply repeats from the conversation.
 
 ## Requirements
 
-- An Apple silicon Mac. The GPU path is Metal; other machines run on the CPU, which works and is slow.
+- An Apple silicon Mac. Nothing else is supported: the engine is built around Metal and tuned on these chips.
 - About 24 GB of free memory: 17.5 GB for the model and 1 to 5 GB for a conversation, depending on its length.
   Measured on a 64 GB machine; 32 GB should do.
 - A Rust toolchain to build it.
@@ -23,9 +23,12 @@ rustling chat
 ```
 
 The first run downloads the model (17.5 GB, a 4-bit conversion) to the Hugging Face cache, where other tools
-that use the Hub will find it too. `rustling pull` does only that, if you would rather fetch it ahead.
+that use the Hub will find it too. `rustling pull` does only that, if you would rather fetch it ahead. A
+download that is interrupted starts again from the beginning; on an unreliable connection,
+`hf download lmstudio-community/Inkling-2-Mini-GGUF Inkling-2-Mini-Q4_K_M.gguf` can resume, and rustling finds
+the file it leaves.
 
-To serve it:
+To serve it to other programs:
 
 ```sh
 rustling serve --cache-dir ~/.cache/rustling
@@ -36,6 +39,77 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
   "messages": [{"role": "user", "content": "What is the capital of France?"}],
   "reasoning_effort": "low", "stream": true
 }'
+```
+
+## Usage
+
+### Chat
+
+```sh
+rustling chat                                   # the defaults
+rustling chat --effort high                     # think longer before answering
+rustling chat --effort none                     # answer straight away
+rustling chat --system "You are a terse code reviewer."
+rustling chat --context 32768 --max-tokens 8192 # a larger window and longer replies
+```
+
+`--effort` is how much the model reasons before it replies: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`
+or `max`, or a number from 0 to 0.99. In a chat, `/reset` starts over and `/exit` quits.
+
+### One reply
+
+```sh
+rustling generate "Write a function that reverses a linked list." --effort low
+rustling generate "Write a haiku about rivers." --temperature 0.7 --top-p 0.95 --seed 1
+rustling generate "What is 17 * 23?" --temperature 0     # always the most likely token
+rustling generate "Hello" --timing                       # where the time went
+```
+
+### Server
+
+```sh
+rustling serve                                           # http://127.0.0.1:8080/v1
+rustling serve --port 9000 --host 0.0.0.0                # reachable from other machines
+rustling serve --context 32768 --max-tokens 8192         # a larger window and longer replies
+rustling serve --cache-dir ~/.cache/rustling --cache-gb 8 # keep processed prompts, up to 8 GiB of them
+rustling serve --temperature 0.2 --top-p 0.9             # sampling for requests that do not set their own
+rustling serve --log-level debug                         # also report progress through long prompts
+```
+
+A typical setup for a coding agent:
+
+```sh
+rustling serve --context 32768 --cache-dir ~/.cache/rustling
+```
+
+The server's flags are defaults. A request sets its own `temperature`, `top_p`, `top_k`, `seed`, `max_tokens`
+and `stop`, and its reasoning effort, which is not a server flag:
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Is 91 prime?"}],
+  "reasoning_effort": "high", "max_tokens": 2000
+}'
+```
+
+Reasoning comes back as `reasoning_content`, apart from the answer. `GET /v1/models` names the model and
+`GET /health` says the server is up.
+
+### Models
+
+```sh
+rustling pull                                            # fetch the default model ahead of time
+rustling pull thinkingmachines/Inkling-2-Mini            # the published checkpoint, 19 GB
+rustling chat --model thinkingmachines/Inkling-2-Mini    # run it
+rustling serve --model ~/models/Inkling-2-Mini-Q4_K_M.gguf   # a file you already have
+RUSTLING_MODEL=thinkingmachines/Inkling-2-Mini rustling chat # or by environment
+```
+
+### Without the GPU
+
+```sh
+rustling chat --backend cpu                              # about 15 tokens/s on an M1 Max
+rustling pull --draft && rustling chat --backend cpu --draft   # the draft model helps on the CPU
 ```
 
 ## Coding agents
@@ -175,7 +249,7 @@ file holds.
 
 - Text only. The model's vision tower is not implemented.
 - One request at a time; others queue.
-- The GPU path is Apple's Metal. There is no CUDA or Vulkan backend.
+- Apple silicon only. There is no CUDA or Vulkan backend, and none is planned.
 - A 4-bit conversion is a lossy copy of the checkpoint. See [Accuracy](#accuracy) for how close.
 
 ## How it works
