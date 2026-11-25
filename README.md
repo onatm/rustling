@@ -8,6 +8,10 @@ It runs one model family and does not try to be general. That is what lets it do
 not: generate whole tokens in one GPU submission, keep processed prompts between requests and restarts, and copy
 runs of tokens the reply repeats from the conversation.
 
+[![rustling chat on an M1 Max with 64 GB](rustling.gif)](https://asciinema.org/a/sgCI7bSgdqBMrOrl)
+
+`rustling chat` running on an M1 Max with 64 GB. [Watch it on asciinema](https://asciinema.org/a/sgCI7bSgdqBMrOrl).
+
 ## Requirements
 
 - An Apple silicon Mac. Nothing else is supported: the engine is built around Metal and tuned on these chips.
