@@ -6,13 +6,16 @@ description = "A fast local inference engine for Inkling 2 Mini on Apple silicon
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
+[workspace]
+members = ["cli"]
+# `cargo build`, `cargo test` and `cargo run` at the root cover the engine and the command line.
+default-members = [".", "cli"]
+
 [features]
 split-attention = []
 
 [dependencies]
 anyhow = "1.0.104"
-axum = "0.8.9"
-clap = { version = "4.6.9", features = ["derive", "env"] }
 gguf-rs-lib = "0.3.9"
 half = "2.7.1"
 hf-hub = { version = "1", features = ["blocking"] }
@@ -22,16 +25,12 @@ minijinja = { version = "3.1.0", features = ["preserve_order", "json", "serde"] 
 postcard = { version = "1.2.0", features = ["use-std"] }
 rand = "0.10.4"
 rayon = "1.12.0"
-rustyline = "19.0.0"
 safetensors = "0.8.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
-tiny_http = "0.12.0"
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "net", "signal"] }
-tokio-stream = "0.1.19"
+tokio = { version = "1.54.1", features = ["sync"] }
 tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"

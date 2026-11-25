@@ -1,93 +1,43 @@
-//! An OpenAI-compatible HTTP server: `POST /v1/chat/completions` (streaming or not), `GET /v1/models`,
-//! `GET /health`.
+//! An OpenAI-compatible HTTP server: `POST /v1/chat/completions` (streaming or not), `POST /v1/responses`,
+//! `GET /v1/models`, `GET /health`.
 //!
-//! One worker thread owns the model and a single [`Session`]. Requests queue for it. A request whose prompt
-//! extends what the session last saw, as the next turn of the same conversation does, only pays for its new
-//! tokens; anything else starts over.
+//! The model runs in the [engine](rustling::engine), which takes requests one at a time; this module only
+//! translates between HTTP and its requests and events.
 
-use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc as std_mpsc;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rustling::generate::cache::PromptCache;
-use rustling::weights::checkpoint::Checkpoint;
-use rustling::config::Config;
-use rustling::generate::draft::Draft;
-use rustling::model::{Model, Options};
-use rustling::prompt::{Prompter, SegmentKind, parse_reply, reply_message};
-use rustling::generate::sampler::{Sampler, SamplerConfig};
-use rustling::generate::session::{Limits, Session, Stop};
+use rustling::engine::{self, Client, Engine, EngineOptions, Failure, FailureKind, Request, Usage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
+mod openai;
 mod responses;
-mod worker;
 
+use openai::*;
 use responses::*;
-use worker::*;
-
-/// The name the API reports for the model: the checkpoint's own, lower-cased, with the pass count when one was
-/// chosen. A Hugging Face cache directory is `models--<owner>--<name>/snapshots/<revision>`.
-fn model_name(model_dir: &Path, passes: Option<usize>) -> String {
-    let from_cache = model_dir.ancestors().filter_map(|dir| dir.file_name()?.to_str()).find_map(|name| {
-        name.strip_prefix("models--").and_then(|rest| rest.rsplit("--").next())
-    });
-    // A GGUF file is named after itself, without the extension.
-    let gguf = model_dir.extension().is_some_and(|extension| extension == "gguf");
-    let own = if gguf { model_dir.file_stem() } else { model_dir.file_name() }.and_then(|name| name.to_str());
-    let name = if gguf { own } else { from_cache.or(own) }.unwrap_or("model").to_lowercase();
-    match passes {
-        Some(passes) => format!("{name}-{passes}-passes"),
-        None => name,
-    }
-}
 
 #[derive(Clone)]
 struct App {
-    jobs: std_mpsc::Sender<Job>,
-    model: std::sync::Arc<str>,
+    client: Client,
+    clients: Clients,
 }
-
-const GIB: f64 = (1u64 << 30) as f64;
-
-/// How many of its own replies the server remembers the reasoning of; see [`Memory`].
-const REMEMBERED_REPLIES: usize = 64;
 
 pub struct ServerOptions {
     pub host: String,
     pub port: u16,
-    pub model: Options,
-    /// Sampling when a request does not say.
-    pub sampling: SamplerConfig,
-    /// The reply length limit when a request does not say.
-    pub max_tokens: usize,
-    pub stop_on_loop: bool,
-    /// Generate with the draft model, proposing only runs it is at least this confident of.
-    pub draft_confidence: Option<f32>,
-    /// Guess at coming tokens by copying from the context.
-    pub copying: bool,
-    /// Never let a reply open a reasoning block, whatever effort the request asks for.
-    pub no_reasoning: bool,
-    /// Overrides how many times the looped layers run, for a variable-loop checkpoint.
-    pub passes: Option<usize>,
-    /// The context window in tokens, prompt and reply together.
-    pub context: usize,
-    /// How much memory processed prompts may take up, for reuse by later requests.
-    pub cache_bytes: usize,
-    /// Where to keep the processed prompts between runs.
-    pub cache_dir: Option<PathBuf>,
+    pub engine: EngineOptions,
 }
 
 /// The fields of a chat completion request that the server acts on. Unknown fields are ignored.
@@ -109,6 +59,28 @@ struct ChatRequest {
     stop: Option<StopSequences>,
 }
 
+impl ChatRequest {
+    fn into_request(self) -> Request {
+        Request {
+            messages: self.messages,
+            tools: self.tools,
+            max_tokens: self.max_completion_tokens.or(self.max_tokens),
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            seed: self.seed,
+            reasoning_effort: self.reasoning_effort,
+            cancel: Default::default(),
+            no_reasoning: false,
+            stop: match self.stop {
+                None => vec![],
+                Some(StopSequences::One(stop)) => vec![stop],
+                Some(StopSequences::Many(stops)) => stops,
+            },
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct StreamOptions {
     #[serde(default)]
@@ -122,52 +94,19 @@ enum StopSequences {
     Many(Vec<String>),
 }
 
-/// How many requests are queued for the model and not yet taken up.
-static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-struct Job {
-    request: ChatRequest,
-    events: mpsc::Sender<Event>,
-}
-
-/// What the worker reports back while handling a request.
-enum Event {
-    Started,
-    Reasoning(String),
-    Content(String),
-    ToolCall { index: usize, id: String, name: String, arguments: String },
-    Done { finish_reason: &'static str, usage: Usage },
-    Failed { status: StatusCode, message: String },
-}
-
-#[derive(Clone, Copy)]
-struct Usage {
-    prompt_tokens: usize,
-    /// Prompt tokens whose state was already cached from the previous request.
-    cached_tokens: usize,
-    completion_tokens: usize,
-}
-
-impl Usage {
-    fn json(self) -> Value {
-        json!({
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.prompt_tokens + self.completion_tokens,
-            "prompt_tokens_details": { "cached_tokens": self.cached_tokens },
-        })
-    }
+fn usage_json(usage: Usage) -> Value {
+    json!({
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+        "prompt_tokens_details": { "cached_tokens": usage.cached_tokens },
+    })
 }
 
 pub fn serve(model_dir: &Path, options: ServerOptions) -> Result<()> {
-    let (jobs, queue) = std_mpsc::channel::<Job>();
-    let (ready, loaded) = std_mpsc::channel::<Result<()>>();
     let address = format!("{}:{}", options.host, options.port);
-    let model: std::sync::Arc<str> = model_name(model_dir, options.passes).into();
-    let model_dir: PathBuf = model_dir.to_owned();
-    let worker =
-        std::thread::Builder::new().name("model".into()).spawn(move || worker(&model_dir, options, queue, ready))?;
-    loaded.recv().context("the model thread stopped while loading")??;
+    let engine = Engine::start(model_dir, options.engine)?;
+    let client = engine.client();
 
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     let served = runtime.block_on(async move {
@@ -176,7 +115,7 @@ pub fn serve(model_dir: &Path, options: ServerOptions) -> Result<()> {
             .route("/v1/models", get(models))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/responses", post(responses))
-            .with_state(App { jobs, model });
+            .with_state(App { client, clients: Clients::default() });
         let listener = tokio::net::TcpListener::bind(&address).await.with_context(|| format!("binding {address}"))?;
         tracing::info!("listening on http://{address}/v1");
         axum::serve(listener, app)
@@ -186,14 +125,34 @@ pub fn serve(model_dir: &Path, options: ServerOptions) -> Result<()> {
             .await?;
         Ok(())
     });
-    // Dropping the runtime drops the last sender to the model thread, which then saves its cache and ends.
+    // Dropping the runtime drops the last client, so the model thread saves its cache and ends.
     drop(runtime);
-    worker.join().map_err(|_| anyhow!("the model thread panicked"))?;
+    engine.shutdown()?;
     served
 }
 
 async fn models(State(app): State<App>) -> Json<Value> {
-    Json(json!({ "object": "list", "data": [{ "id": &*app.model, "object": "model", "owned_by": "thinkingmachines" }] }))
+    let model = app.client.model_name();
+    Json(json!({ "object": "list", "data": [{ "id": model, "object": "model", "owned_by": "thinkingmachines" }] }))
+}
+
+fn failure_response(failure: &Failure) -> Response {
+    let status = match failure.kind {
+        FailureKind::BadRequest | FailureKind::ContextOverflow => StatusCode::BAD_REQUEST,
+        FailureKind::Internal | FailureKind::Cancelled => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error_response(status, &failure.message)
+}
+
+/// Queues the request and waits for the engine to accept it, which decides the status code.
+async fn start(app: &App, mut request: Request) -> Result<mpsc::Receiver<Event>, Failure> {
+    app.clients.normalise(&mut request.messages)?;
+    let mut received = app.client.submit(request)?;
+    match received.recv().await {
+        Some(engine::Event::Started) => Ok(relay(received, &app.clients)),
+        Some(engine::Event::Failed(failure)) => Err(failure),
+        _ => Err(Failure { kind: FailureKind::Internal, message: "the model thread dropped the request".into() }),
+    }
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -205,27 +164,20 @@ fn unix_time() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-async fn chat_completions(State(App { jobs, model }): State<App>, body: axum::body::Bytes) -> Response {
+async fn chat_completions(State(app): State<App>, body: axum::body::Bytes) -> Response {
     // Parsed by hand so a malformed body gets an OpenAI-style error instead of axum's plain text.
     let request: ChatRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid request body: {error}")),
     };
     let (stream, include_usage) = (request.stream, request.stream_options.as_ref().is_some_and(|o| o.include_usage));
-    let (events, mut received) = mpsc::channel(64);
-    WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if jobs.send(Job { request, events }).is_err() {
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "the model thread has stopped");
-    }
+    let mut received = match start(&app, request.into_request()).await {
+        Ok(received) => received,
+        Err(failure) => return failure_response(&failure),
+    };
+    let model: std::sync::Arc<str> = app.client.model_name().into();
     let id = format!("chatcmpl-{:x}", SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
     let created = unix_time();
-
-    // The first event says whether the request was accepted, which decides the status code.
-    match received.recv().await {
-        Some(Event::Started) => {}
-        Some(Event::Failed { status, message }) => return error_response(status, &message),
-        _ => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "the model thread dropped the request"),
-    }
 
     if stream {
         let chunk = move |delta: Value, finish_reason: Option<&str>| {
@@ -261,15 +213,15 @@ async fn chat_completions(State(App { jobs, model }): State<App>, body: axum::bo
                         });
                         (false, vec![chunk(json!({ "tool_calls": [call] }), None)])
                     }
-                    Event::Done { finish_reason, usage } => {
-                        let mut last = chunk(json!({}), Some(finish_reason));
+                    Event::Done { finish, usage } => {
+                        let mut last = chunk(json!({}), Some(finish.as_str()));
                         if include_usage {
-                            last["usage"] = usage.json();
+                            last["usage"] = usage_json(usage);
                         }
                         (true, vec![last])
                     }
-                    Event::Failed { message, .. } => {
-                        (true, vec![json!({ "error": { "message": message, "type": "server_error" } })])
+                    Event::Failed(failure) => {
+                        (true, vec![json!({ "error": { "message": failure.message, "type": "server_error" } })])
                     }
                 };
                 for chunk in chunks {
@@ -297,8 +249,8 @@ async fn chat_completions(State(App { jobs, model }): State<App>, body: axum::bo
             Event::ToolCall { id, name, arguments, .. } => {
                 tool_calls.push(json!({ "id": id, "type": "function", "function": { "name": name, "arguments": arguments } }));
             }
-            Event::Failed { status, message } => return error_response(status, &message),
-            Event::Done { finish_reason, usage } => {
+            Event::Failed(failure) => return failure_response(&failure),
+            Event::Done { finish, usage } => {
                 let mut message = json!({ "role": "assistant", "content": content });
                 if !reasoning.is_empty() {
                     message["reasoning_content"] = reasoning.into();
@@ -308,8 +260,8 @@ async fn chat_completions(State(App { jobs, model }): State<App>, body: axum::bo
                 }
                 return Json(json!({
                     "id": id, "object": "chat.completion", "created": created, "model": &*model,
-                    "choices": [{ "index": 0, "message": message, "finish_reason": finish_reason }],
-                    "usage": usage.json(),
+                    "choices": [{ "index": 0, "message": message, "finish_reason": finish.as_str() }],
+                    "usage": usage_json(usage),
                 }))
                 .into_response();
             }
@@ -321,14 +273,6 @@ async fn chat_completions(State(App { jobs, model }): State<App>, body: axum::bo
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_reported_model_name_comes_from_the_checkpoint() {
-        let cached = Path::new("/home/u/.cache/huggingface/hub/models--thinkingmachines--TML-d24-varloop-research/snapshots/657b53");
-        assert_eq!(model_name(cached, Some(2)), "tml-d24-varloop-research-2-passes");
-        assert_eq!(model_name(Path::new("/models/Inkling-2-Mini"), None), "inkling-2-mini");
-        assert_eq!(model_name(Path::new("/models/x/Inkling-2-Mini-Q4_K_M.gguf"), None), "inkling-2-mini-q4_k_m");
-    }
 
     #[test]
     fn a_responses_conversation_becomes_chat_messages() {
@@ -390,55 +334,11 @@ mod tests {
         // A free-form tool gets its plain text back.
         let events = items.take(call("apply_patch", "{\"input\":\"*** Begin Patch\"}"));
         assert_eq!((&events[0]["item"]["type"], &events[0]["item"]["input"]), (&json!("custom_tool_call"), &json!("*** Begin Patch")));
-        let usage = Usage { prompt_tokens: 10, cached_tokens: 4, completion_tokens: 6 };
-        let events = items.take(Event::Done { finish_reason: "stop", usage });
+        let usage = Usage { prompt_tokens: 10, cached_tokens: 4, completion_tokens: 6, ..Usage::default() };
+        let events = items.take(Event::Done { finish: rustling::engine::Finish::Stop, usage });
         assert_eq!(kinds(&events), ["response.completed"]);
         let response = &events[0]["response"];
         assert_eq!(response["output"].as_array().unwrap().len(), 4);
         assert_eq!(response["usage"]["input_tokens_details"]["cached_tokens"], 4);
-    }
-
-    #[test]
-    fn remembered_reasoning_is_put_back() {
-        let mut memory = Memory::default();
-        memory.remember(&json!({"role": "assistant", "content": "Paris.", "reasoning_content": "Easy."}));
-        let mut messages = vec![
-            json!({"role": "developer", "content": "Be brief."}),
-            json!({"role": "user", "content": "Capital of France?"}),
-            json!({"role": "assistant", "content": "Paris."}),
-            json!({"role": "assistant", "content": "Something the server never said."}),
-        ];
-        assert!(normalise(&mut messages, &memory).is_ok());
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[2]["reasoning_content"], "Easy.");
-        assert!(messages[3].get("reasoning_content").is_none());
-    }
-
-    #[test]
-    fn replies_are_told_apart_by_their_tool_calls() {
-        let mut memory = Memory::default();
-        let call = |city: &str| json!({"type": "function", "function": {"name": "weather", "arguments": {"city": city}}});
-        memory.remember(&json!({"role": "assistant", "content": "", "reasoning_content": "Look it up.", "tool_calls": [call("Paris")]}));
-        // As a client sends it back: null content, arguments as a JSON string.
-        let sent = |city: &str| {
-            json!({"role": "assistant", "content": null, "tool_calls": [
-                {"id": "call_1", "type": "function", "function": {"name": "weather", "arguments": format!(r#"{{"city":"{city}"}}"#)}}
-            ]})
-        };
-        let mut messages = vec![sent("Paris"), sent("Rome")];
-        assert!(normalise(&mut messages, &memory).is_ok());
-        assert_eq!(messages[0]["tool_calls"][0]["function"]["arguments"], json!({"city": "Paris"}));
-        assert_eq!(messages[0]["content"], "");
-        assert_eq!(messages[0]["reasoning_content"], "Look it up.");
-        assert!(messages[1].get("reasoning_content").is_none());
-    }
-
-    #[test]
-    fn unsupported_input_is_a_client_error() {
-        let memory = Memory::default();
-        let mut images = vec![json!({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]})];
-        assert!(normalise(&mut images, &memory).is_err_and(|f| f.status == StatusCode::BAD_REQUEST));
-        let mut bad_arguments = vec![json!({"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": "{"}}]})];
-        assert!(normalise(&mut bad_arguments, &memory).is_err_and(|f| f.status == StatusCode::BAD_REQUEST));
     }
 }

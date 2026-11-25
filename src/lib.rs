@@ -2,6 +2,7 @@
 
 mod accel;
 pub mod config;
+pub mod engine;
 pub mod generate;
 #[cfg(target_os = "macos")]
 pub mod gpu;

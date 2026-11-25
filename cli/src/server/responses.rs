@@ -1,4 +1,4 @@
-//! `POST /v1/responses`: the Responses API, translated to and from the chat form the worker speaks.
+//! `POST /v1/responses`: the Responses API, translated to and from the chat form the engine speaks.
 
 use super::*;
 
@@ -190,7 +190,7 @@ impl ResponseItems {
         self.open.as_mut().expect("opened above").1.push_str(&delta);
     }
 
-    /// The stream events, or the final item, that a worker event amounts to.
+    /// The stream events, or the final item, that an engine event amounts to.
     pub(crate) fn take(&mut self, event: Event) -> Vec<Value> {
         let mut events = Vec::new();
         match event {
@@ -218,9 +218,9 @@ impl ResponseItems {
                 self.close(&mut events);
                 events.push(json!({ "type": "response.completed", "response": self.response("completed", Some(usage)) }));
             }
-            Event::Failed { message, .. } => {
+            Event::Failed(failure) => {
                 let mut response = self.response("failed", None);
-                response["error"] = json!({ "code": "server_error", "message": message });
+                response["error"] = json!({ "code": "server_error", "message": failure.message });
                 events.push(json!({ "type": "response.failed", "response": response }));
             }
         }
@@ -247,7 +247,7 @@ impl ResponseItems {
 /// `POST /v1/responses`: OpenAI's Responses API, as far as a coding agent uses it. Each request carries the
 /// whole conversation (nothing is stored between requests), tools are functions or free-form, and the reply
 /// streams as reasoning, text and tool-call items.
-pub(crate) async fn responses(State(App { jobs, .. }): State<App>, body: axum::body::Bytes) -> Response {
+pub(crate) async fn responses(State(app): State<App>, body: axum::body::Bytes) -> Response {
     let body: Value = match serde_json::from_slice(&body) {
         Ok(body) => body,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid request body: {error}")),
@@ -257,16 +257,10 @@ pub(crate) async fn responses(State(App { jobs, .. }): State<App>, body: axum::b
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
     let stream = request.stream;
-    let (events, mut received) = mpsc::channel(64);
-    WAITING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if jobs.send(Job { request, events }).is_err() {
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "the model thread has stopped");
-    }
-    match received.recv().await {
-        Some(Event::Started) => {}
-        Some(Event::Failed { status, message }) => return error_response(status, &message),
-        _ => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "the model thread dropped the request"),
-    }
+    let mut received = match start(&app, request.into_request()).await {
+        Ok(received) => received,
+        Err(failure) => return failure_response(&failure),
+    };
     let id = format!("resp_{:x}", SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
     let mut items = ResponseItems { id, custom, output: Vec::new(), open: None };
 
@@ -278,7 +272,7 @@ pub(crate) async fn responses(State(App { jobs, .. }): State<App>, body: axum::b
                 return;
             }
             loop {
-                // As in the chat endpoint: the client leaving while a prompt is processed must reach the worker.
+                // As in the chat endpoint: the client leaving while a prompt is processed must reach the engine.
                 let event = tokio::select! {
                     _ = payloads.closed() => return,
                     event = received.recv() => event,
@@ -304,9 +298,9 @@ pub(crate) async fn responses(State(App { jobs, .. }): State<App>, body: axum::b
 
     while let Some(event) = received.recv().await {
         match event {
-            Event::Failed { status, message } => return error_response(status, &message),
-            Event::Done { usage, .. } => {
-                items.take(Event::Done { finish_reason: "stop", usage });
+            Event::Failed(failure) => return failure_response(&failure),
+            Event::Done { finish, usage } => {
+                items.take(Event::Done { finish, usage });
                 return Json(items.response("completed", Some(usage))).into_response();
             }
             event => drop(items.take(event)),

@@ -19,7 +19,7 @@ runs of tokens the reply repeats from the conversation.
 ## Quick start
 
 ```sh
-cargo install --path .
+cargo install --path cli
 rustling chat
 ```
 
@@ -46,16 +46,73 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 
 ### Chat
 
+`rustling chat` is an assistant for the current directory, with the model in the same process: no server, no
+network. It can read and search files (`read`, `grep` and `glob`), asking before each call; it changes
+nothing and runs no commands. It is built on manifatura, an agent framework. Its own instructions are one line,
+[`cli/src/agent/system.md`](cli/src/agent/system.md); the tools' guidelines, the `AGENTS.md` files, the
+directory and the date follow it.
+
 ```sh
-rustling chat                                   # the defaults
+rustling chat                                   # a new session
+rustling chat --continue                        # the latest session in this directory
+rustling chat --resume                          # list this directory's sessions
+rustling chat --resume 019aa1b2c3d4-5e6f7a8b    # continue one of them
+rustling chat --yes                             # read and search without asking
 rustling chat --effort high                     # think longer before answering
-rustling chat --effort none                     # answer straight away
-rustling chat --system "You are a terse code reviewer."
+rustling chat --system "Answer in French."      # add to the agent's instructions
+rustling chat --logs                            # keep the log, behind a `logs` button
 rustling chat --context 32768 --max-tokens 8192 # a larger window and longer replies
 ```
 
+Its instructions follow the `AGENTS.md` convention: `~/.config/rustling/AGENTS.md`, then `AGENTS.md` (or
+`CLAUDE.md`) in each directory from the repository root down to the current one. Sessions are kept per directory
+under `~/.local/share/rustling/sessions`. Processed prompts are kept as `serve` keeps them (`--cache-gb`,
+`--cache-dir`, `--no-cache-dir`), so a resumed session, even after a restart, starts in seconds.
+
+#### MCP servers
+
+The chat can use the tools of MCP servers, reached at a URL (streamable HTTP) or run on this machine (stdio), set
+up in `~/.config/rustling/mcp.toml`. For [Exa](https://exa.ai)'s web search, through its hosted server:
+
+```toml
+[servers.exa]
+url = "https://mcp.exa.ai/mcp"
+env_headers = { x-api-key = "EXA_API_KEY" }   # optional: without a key, Exa's free rate limit applies
+eager = true                                  # offer its tools directly
+```
+
+A local server is a `command`, with `args`, `env` and `cwd`; an HTTP one takes `headers` and `env_headers`.
+Servers start while the model loads; one that does not start is reported and left out. A server's tools are
+named `<server>__<tool>`. Without `eager` they are kept out of the prompt, which matters with a small context
+window, and the model finds them with `find_tools` and runs them with `run_tool`. `approve = true` asks before
+each call. `/mcp` lists the servers and their tools.
+
+The conversation goes into the terminal's own scrollback, so it scrolls, selects and copies like any output.
+Below it, the screen shows the reply as it is written, the input, and a line of statistics: how much of the
+context window is in use, how many prompt tokens were new and how many reused, and how fast the last prompt and
+reply went.
+
+There is no log unless you ask for one with `--logs` (at `--log-level`). Then a `logs` button at the end of the
+statistics opens it; click it, or press Ctrl-L. The button needs the mouse, so with `--logs` the scroll wheel goes
+to rustling instead of scrolling the terminal, and selecting text needs the modifier your terminal uses for that
+(Option in iTerm2 and Terminal.app, Shift in most others).
+
+| Key | What it does |
+|---|---|
+| Enter, Shift+Enter | Send; a new line. Sent while the agent works, a message reaches it before its next step. |
+| Esc, Ctrl-C | Stop the agent at once. Ctrl-C twice, or Ctrl-D, quits. |
+| `y`, `a`, `n` | At a question: allow, allow for the rest of the session, deny. |
+| Tab | Complete a command, or after `/resume `, a session id; Up and Down pick among them. |
+| Ctrl-L | Open or close the log, with `--logs`. |
+| Up, Down | Recall what you sent. |
+
+Typing `/` lists the commands: `/mcp` lists the MCP servers, `/new` starts a new session, `/resume ID` switches to another, `/sessions` lists them, `/compact [focus]`
+summarises older messages to make room, `/effort` shows or sets how much the model reasons, and `/exit` quits.
+`/effort off` stops the reasoning altogether, as `--no-reasoning` does, and `/effort high` (or any level) brings
+it back. The effort is part of the prompt, so the reply after a change processes the conversation again.
+
 `--effort` is how much the model reasons before it replies: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`
-or `max`, or a number from 0 to 0.99. In a chat, `/reset` starts over and `/exit` quits.
+or `max`, or a number from 0 to 0.99.
 
 Even `none` leaves a little reasoning: the model was built that way, and its makers say so. To have none at all:
 
@@ -284,16 +341,19 @@ The GGUF loader reads F32, BF16, NVFP4, Q4_K, Q5_0, Q5_K, Q6_K and Q8_0 tensors.
 processing, reuse of processed prompts, copying from the context, the draft model, the checkpoint's native
 formats, and how the engine is tested against the reference implementation.
 
-The source is laid out by concern:
+The workspace has two crates: the engine as a library (`rustling`, at the root), and the `rustling` command
+(`rustling-cli`, in `cli/`), which uses only the library's public API.
 
 ```
-src/
-  cli/        the commands
-  server/     the HTTP API
+src/          the library
+  engine/     the model thread: requests in, events out, the prompt cache kept
   generate/   sessions, sampling, copying, the draft model, the prompt cache
   model/      the layers and the state they keep
   gpu/        Metal: kernels, prompt paths, shaders
   weights/    checkpoint and GGUF formats, downloads
+cli/src/      the command
+  cli/        the commands
+  server/     the HTTP API, over the engine
 ```
 
 ## Development

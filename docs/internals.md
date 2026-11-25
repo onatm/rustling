@@ -25,7 +25,7 @@ is simply on. The default conversion is now Unsloth's UD-Q4_K_M; the historical 
 | Fast path for prompts of 256 tokens or more, not bit-identical: tuned matrix products on the GPU and for attention | done, opt-in with `--backend metal-fast`; a 2,413-token prompt in 35 s against 85 s on the CPU (measured before the changes below), and for a Q4_K_M conversion a 2,424-token prompt in 21 s and a 15,194-token one in 118 s |
 | Sampler: temperature, top-k, top-p, seed (`src/generate/sampler.rs`) | done |
 | Multi-turn chat that reuses the conversation's state, with a stop on repeating output (`src/generate/session.rs`) | done |
-| OpenAI-compatible HTTP server: chat completions, streaming, tool calls (`src/server.rs`) | done |
+| OpenAI-compatible HTTP server: chat completions, streaming, tool calls (`cli/src/server/`, over `src/engine/`) | done |
 | Processed prompts reused across conversations and restarts (`src/generate/cache.rs`) | done |
 | DSpark draft model: proposes several tokens at a time for the main model to check (`src/generate/draft.rs`) | done, opt-in with `--draft`; up to 35% faster on predictable text, and it rests where it would slow things down |
 | Copying from the context: text the reply repeats is proposed in runs and checked in one batch (`src/generate/lookup.rs`) | done, on by default; a reply that writes out code from a 15,000-token prompt went from 9.4 to 14.8 tokens/s |

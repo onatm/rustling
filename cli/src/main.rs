@@ -10,15 +10,15 @@ use rustling::weights::checkpoint::{Checkpoint, ExpertFormat, ExpertMatrix, DEFA
 use rustling::config::Config;
 use rustling::generate::draft::Draft;
 use rustling::model::{Activations, Backend, Model, Options};
-use rustling::prompt::{Prompter, SegmentKind, parse_reply, reply_message};
+use rustling::prompt::Prompter;
 use rustling::generate::sampler::{Sampler, SamplerConfig};
 use rustling::generate::session::{Limits, Session, Stop};
 
+mod agent;
 mod cli;
 mod server;
 
 use cli::args::*;
-use cli::chat::*;
 use cli::dev::*;
 use cli::generate::*;
 use cli::inspect::*;
@@ -56,8 +56,15 @@ enum LogLevel {
     Trace,
 }
 
-/// Sends the log to stderr at the level asked for. A server's lines carry the time; a command's do not.
-fn start_logging(level: LogLevel, timed: bool) {
+/// Where the log goes: stderr, with the time on a server's lines, or the chat screen.
+enum LogTo {
+    Stderr { timed: bool },
+    Screen(agent::ui::logs::LogSink),
+    Nowhere,
+}
+
+/// Sends the log where it is wanted, at the level asked for.
+fn start_logging(level: LogLevel, to: LogTo) {
     use tracing_subscriber::Layer;
     use tracing_subscriber::filter::LevelFilter;
     let level = match level {
@@ -72,12 +79,22 @@ fn start_logging(level: LogLevel, timed: bool) {
     use tracing_subscriber::util::SubscriberInitExt;
     // The libraries underneath, the Hub client above all, log a good deal of their own: only their problems.
     let ours = tracing_subscriber::filter::Targets::new().with_default(LevelFilter::WARN.min(level)).with_target("rustling", level);
-    // Colour only where someone is looking: a log sent to a file should hold plain text.
-    let coloured = std::io::IsTerminal::is_terminal(&std::io::stderr());
-    let log = tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_target(false).with_ansi(coloured);
-    match timed {
-        true => tracing_subscriber::registry().with(log.with_filter(ours)).init(),
-        false => tracing_subscriber::registry().with(log.without_time().with_filter(ours)).init(),
+    let log = tracing_subscriber::fmt::layer().with_target(false);
+    match to {
+        LogTo::Nowhere => {}
+        LogTo::Screen(sink) => {
+            let log = log.with_writer(sink).with_ansi(false).without_time().with_level(false);
+            tracing_subscriber::registry().with(log.with_filter(ours)).init()
+        }
+        LogTo::Stderr { timed } => {
+            // Colour only where someone is looking: a log sent to a file should hold plain text.
+            let coloured = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            let log = log.with_writer(std::io::stderr).with_ansi(coloured);
+            match timed {
+                true => tracing_subscriber::registry().with(log.with_filter(ours)).init(),
+                false => tracing_subscriber::registry().with(log.without_time().with_filter(ours)).init(),
+            }
+        }
     }
 }
 
@@ -128,24 +145,34 @@ enum Command {
         host: String,
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        /// Memory, in GiB, for keeping processed prompts so later requests that share them start from there, and
-        /// as much again on disk. 0 keeps only the latest conversation.
-        #[arg(long, default_value_t = 8.0)]
-        cache_gb: f64,
-        /// Where processed prompts are kept between runs. Defaults to `~/.cache/rustling`.
-        #[arg(long)]
-        cache_dir: Option<PathBuf>,
-        /// Keep processed prompts in memory only, and forget them when the server stops.
-        #[arg(long, conflicts_with = "cache_dir")]
-        no_cache_dir: bool,
+        #[command(flatten)]
+        cache: CacheArgs,
         #[command(flatten)]
         run: RunArgs,
     },
-    /// Chat interactively. Each turn reuses the state of the conversation so far.
+    /// Chat with an agent that reads and searches the files of the current directory, asking first, with the
+    /// model in the same process. Its instructions include the `AGENTS.md` files from the repository root
+    /// down, and `~/.config/rustling/AGENTS.md`. Sessions are kept, per directory, under
+    /// `~/.local/share/rustling/sessions`.
     Chat {
-        /// A system message to start the conversation with.
+        /// Text added to the agent's instructions.
         #[arg(long)]
         system: Option<String>,
+        /// Continue the most recent session in this directory.
+        #[arg(long, short = 'c', conflicts_with = "resume")]
+        r#continue: bool,
+        /// Continue the session with this id; without one, list this directory's sessions.
+        #[arg(long, value_name = "ID")]
+        resume: Option<Option<String>>,
+        /// Read and search files without asking first.
+        #[arg(long)]
+        yes: bool,
+        /// Keep the log (at --log-level), behind a `logs` button on the screen. This captures the mouse for the
+        /// button, so the scroll wheel no longer scrolls the terminal while the chat runs.
+        #[arg(long)]
+        logs: bool,
+        #[command(flatten)]
+        cache: CacheArgs,
         #[command(flatten)]
         run: RunArgs,
     },
@@ -166,6 +193,44 @@ enum Command {
     },
 }
 
+/// Where processed prompts are kept: shared by `serve` and `chat`, which use the same fingerprints.
+#[derive(clap::Args)]
+struct CacheArgs {
+    /// Memory, in GiB, for keeping processed prompts so later requests that share them start from there, and
+    /// as much again on disk. 0 keeps only the latest conversation.
+    #[arg(long, default_value_t = 8.0)]
+    cache_gb: f64,
+    /// Where processed prompts are kept between runs. Defaults to `~/.cache/rustling`.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Keep processed prompts in memory only, and forget them when the command ends.
+    #[arg(long, conflicts_with = "cache_dir")]
+    no_cache_dir: bool,
+}
+
+/// What the engine needs from the command line.
+fn engine_options(run: &RunArgs, cache: CacheArgs, passes: Option<usize>) -> Result<rustling::engine::EngineOptions> {
+    anyhow::ensure!(cache.cache_gb >= 0.0, "--cache-gb must not be negative");
+    run.sampler()?;
+    let cache_dir = match cache.no_cache_dir {
+        true => None,
+        false => cache.cache_dir.or_else(default_cache_dir),
+    };
+    Ok(rustling::engine::EngineOptions {
+        model: run.model(),
+        sampling: SamplerConfig { temperature: run.temperature, top_k: run.top_k, top_p: run.top_p },
+        max_tokens: run.max_tokens,
+        stop_on_loop: !run.allow_loops,
+        draft_confidence: run.draft.then_some(run.draft_confidence),
+        copying: !run.no_copying,
+        no_reasoning: run.no_reasoning,
+        passes,
+        context: run.window(),
+        cache_bytes: (cache.cache_gb * (1u64 << 30) as f64) as usize,
+        cache_dir,
+    })
+}
+
 /// Where processed prompts are kept when no place is given: `rustling` under `$XDG_CACHE_HOME`, or under
 /// `~/.cache`.
 fn default_cache_dir() -> Option<PathBuf> {
@@ -182,7 +247,22 @@ fn main() -> Result<()> {
         unsafe { std::env::set_var("HF_HUB_DISABLE_TELEMETRY", "1") };
     }
     let cli = Cli::parse();
-    start_logging(cli.log_level, matches!(cli.command, Command::Serve { .. }));
+    // The chat screen shows the log itself; everything else writes it to stderr.
+    let mut chat_logs = None;
+    let to = match &cli.command {
+        // The chat keeps no log unless asked: the screen is the conversation.
+        Command::Chat { logs, .. } => {
+            let (sink, receiver) = agent::ui::logs::channel();
+            chat_logs = Some(receiver);
+            match logs {
+                true => LogTo::Screen(sink),
+                false => LogTo::Nowhere,
+            }
+        }
+        Command::Serve { .. } => LogTo::Stderr { timed: true },
+        _ => LogTo::Stderr { timed: false },
+    };
+    start_logging(cli.log_level, to);
     let drafting = match &cli.command {
         Command::Generate { run, .. } | Command::Chat { run, .. } | Command::Serve { run, .. } => run.draft,
         _ => false,
@@ -209,31 +289,25 @@ fn main() -> Result<()> {
         Command::Expert { layer, expert } => expert_stats(&model_dir, layer, expert),
         Command::Prompt { text, effort } => prompt(&model_dir, &text, effort.as_deref()),
         Command::Generate { text, run, top, timing } => generate(&model_dir, &text, &run, top, timing),
-        Command::Chat { system, run } => chat(&model_dir, system.as_deref(), &run),
-        Command::Serve { host, port, cache_gb, cache_dir, no_cache_dir, run } => {
-            let cache_dir = match no_cache_dir {
-                true => None,
-                false => cache_dir.or_else(default_cache_dir),
-            };
-            anyhow::ensure!(cache_gb >= 0.0, "--cache-gb must not be negative");
-            run.sampler()?;
-            anyhow::ensure!(run.effort.is_none(), "--effort does not apply to serve: requests set reasoning_effort");
-            let options = server::ServerOptions {
-                host,
-                port,
-                model: run.model(),
-                sampling: SamplerConfig { temperature: run.temperature, top_k: run.top_k, top_p: run.top_p },
+        Command::Chat { system, r#continue, resume, yes, logs, cache, run } => {
+            let options = agent::ChatOptions {
+                system,
+                resume_latest: r#continue,
+                resume,
+                yes,
+                effort: agent::reasoning::Effort::from_flags(run.effort.as_deref(), run.no_reasoning).map_err(anyhow::Error::msg)?,
                 max_tokens: run.max_tokens,
-                stop_on_loop: !run.allow_loops,
-                draft_confidence: run.draft.then_some(run.draft_confidence),
-                copying: !run.no_copying,
-                no_reasoning: run.no_reasoning,
-                passes: cli.passes,
-                context: run.window(),
-                cache_bytes: (cache_gb * (1u64 << 30) as f64) as usize,
-                cache_dir,
+                logs,
             };
-            server::serve(&model_dir, options)
+            let logs = chat_logs.expect("set up for chat above");
+            // The chat turns reasoning off per reply instead, so that /effort can turn it back on.
+            let engine = rustling::engine::EngineOptions { no_reasoning: false, ..engine_options(&run, cache, cli.passes)? };
+            agent::chat(&model_dir, engine, options, logs)
+        }
+        Command::Serve { host, port, cache, run } => {
+            anyhow::ensure!(run.effort.is_none(), "--effort does not apply to serve: requests set reasoning_effort");
+            let engine = engine_options(&run, cache, cli.passes)?;
+            server::serve(&model_dir, server::ServerOptions { host, port, engine })
         }
         Command::Probe { golden, activations } => probe(&model_dir, &golden, activations.into()),
         Command::Compare { golden, activations } => compare(&model_dir, &golden, activations.into()),
