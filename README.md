@@ -228,31 +228,27 @@ with the model name `inkling-2-mini`.
 
 ## Performance
 
+On a 64 GB M4 Max with a 40-core GPU, rustling and llama.cpp ran the default Unsloth UD-Q4_K_M model on
+Metal. Each engine processed the same three prompts from scratch and generated 128 tokens per reply.
+The table shows medians across three runs per prompt, with greedy sampling and token copying disabled.
+
+| Measurement | Engine | 30 input tokens | 2,413 input tokens | 15,194 input tokens |
+|---|---|---:|---:|---:|
+| Prompt time (s) | rustling | 0.5 | 12.3 | 73.9 |
+| Prompt time (s) | llama.cpp | 0.23 | 8.9 | 73.5 |
+| Generation (tokens/s) | rustling | 43.2 | 35.0 | 29.3 |
+| Generation (tokens/s) | llama.cpp | 37.1 | 35.7 | 30.7 |
+
+In an agent session, rustling can reuse the part of the conversation it has already processed. Replies
+that repeat earlier text can also benefit from token copying. For run ranges, reproduction commands, and
+earlier M1 Max and M4 Max results with the LM Studio model, see the [full benchmark results](benchmarks/README.md).
+
 To try experimental split attention for long-context GGUF generation, build with
 `cargo build --release --features split-attention` and run `target/release/rustling` with a context
 window large enough for the prompt and reply (for example, `serve --context 65536`).
 It splits full attention across blocks of cached keys on the same GPU when generating one token
 with at least 32,768 visible keys. Prompt processing in large batches and speculative verification
 batches use the usual kernels. The different order of floating-point sums can change a reply.
-
-Both Macs have 64 GB of memory and ran the LM Studio Q4_K_M conversion on Metal. The M4 Max has a 40-core
-GPU. Its figures show the median of three runs, with the range in parentheses.
-
-| Workload | M1 Max rustling | M1 Max llama.cpp | M4 Max rustling | M4 Max llama.cpp |
-|---|---:|---:|---:|---:|
-| Generating, short conversation (tokens/s) | 24 | 21 | 51 (50–53) | 44 (31–45) |
-| Generating, 15,000 tokens of context (tokens/s) | 21 | 18 | 33 (27–36) | 31 (28–39) |
-| Processing a 2,400-token prompt (seconds) | 21 | 19 | 12.1 (10.7–12.9) | 6.9 (6.5–12.0) |
-| Processing a 15,000-token prompt (seconds) | 102 | 182 | 61.3 (60.6–77.3) | 63.4 (51.1–85.0) |
-
-On the M4 Max, `rustling generate` (release build at `228c479`, with `--no-copying`) and `llama-completion`
-(`b12757`) used identical prompts and a 16,384-token window. Each run processed a short question (30 tokens)
-or a Rust source excerpt (2,413 or 15,194 tokens including the chat template) from scratch, then generated
-128 tokens at temperature 0.
-
-In an agent session, most turns add a few hundred tokens to a conversation the server already holds, and those
-take 3 to 10 seconds before the reply starts. Replies that repeat text from the conversation, as edits to a
-file do, go faster than the figures above.
 
 ## Accuracy
 
