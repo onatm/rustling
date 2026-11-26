@@ -2,23 +2,27 @@
 //! live part (the reply as it streams, the tools running) redrawn below them. It is fed manifatura's session
 //! events only.
 
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use manifatura::{Content, Event, Message, Outcome, Role};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::text::{markdown, plain, wrap};
 
 /// A finished piece of the transcript.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Item {
+    Header { directory: String, model: String },
     User(String),
     Assistant(String),
     /// Reasoning, collapsed to its first line once the answer starts, with how long it went on.
     Reasoning { first: String, seconds: u64 },
-    Tool { name: String, summary: String, output: String, is_error: bool },
+    Tool(Arc<ToolOutput>),
+    ToolDetails(Arc<ToolOutput>),
     Notice(Level, String),
 }
 
@@ -30,7 +34,40 @@ pub(crate) enum Level {
 }
 
 pub(crate) fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
+    Style::new().add_modifier(Modifier::DIM)
+}
+
+// Many terminals advertise their ANSI background in COLORFGBG. Give the highlighted
+// prompt its own readable foreground as well, including when the background is unknown.
+static LIGHT: LazyLock<bool> = LazyLock::new(|| {
+    let background = std::env::var("COLORFGBG").unwrap_or_default();
+    matches!(background.rsplit(';').next(), Some("7" | "15"))
+});
+
+pub(crate) fn copper() -> Style {
+    let color = if *LIGHT { Color::Rgb(156, 65, 36) } else { Color::Rgb(207, 127, 83) };
+    Style::new().fg(color).add_modifier(Modifier::BOLD)
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct ToolOutput {
+    name: String,
+    summary: String,
+    output: String,
+    is_error: bool,
+}
+
+impl ToolOutput {
+    fn heading(&self) -> String {
+        let mark = if self.is_error { "✗" } else { "✓" };
+        let name = match self.name.as_str() {
+            "read" => "Read",
+            "grep" => "Search",
+            "glob" => "Find",
+            other => other,
+        };
+        format!("{mark} {name} {}", self.summary)
+    }
 }
 
 impl Item {
@@ -38,12 +75,28 @@ impl Item {
     pub(crate) fn lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut out = vec![Line::default()];
         match self {
+            Item::Header { directory, model } => {
+                let mut header = Line::from(vec![Span::styled("rustling  ", copper()), Span::styled(directory.clone(), dim())]);
+                if header.width() + model.width() + 2 <= width {
+                    header.push_span(" ".repeat(width - header.width() - model.width()));
+                    header.push_span(Span::styled(model.clone(), dim()));
+                }
+                out.push(header);
+            }
             Item::User(text) => {
+                let (ink, paper) = if *LIGHT {
+                    (Color::Rgb(38, 35, 31), Color::Rgb(239, 236, 227))
+                } else {
+                    (Color::Rgb(238, 234, 225), Color::Rgb(39, 38, 32))
+                };
                 let style = Style::new().add_modifier(Modifier::BOLD);
                 for (i, line) in text.split('\n').enumerate() {
                     let prefix = if i == 0 { "› " } else { "  " };
-                    let spans = vec![Span::styled(prefix, style.fg(Color::Cyan)), Span::styled(line.to_owned(), style)];
-                    out.extend(wrap(spans, width, "  "));
+                    let spans = vec![Span::styled(prefix, copper()), Span::styled(line.to_owned(), style)];
+                    for mut row in wrap(spans, width, "  ") {
+                        row.push_span(" ".repeat(width.saturating_sub(row.width())));
+                        out.push(row.style(Style::new().fg(ink).bg(paper)));
+                    }
                 }
             }
             Item::Assistant(text) => out.extend(markdown(text, width)),
@@ -52,16 +105,17 @@ impl Item {
                 let line = format!("∴ Thought for {seconds}s · {first}");
                 out.push(Line::styled(clip(&line, width.saturating_sub(1).max(8)), style));
             }
-            Item::Tool { name, summary, output, is_error } => {
-                let (mark, colour) = if *is_error { ("✗", Color::Red) } else { ("●", Color::Green) };
-                let spans = vec![
-                    Span::styled(format!("{mark} "), Style::new().fg(colour)),
-                    Span::styled(name.clone(), Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(" "),
-                    Span::styled(summary.clone(), dim()),
-                ];
-                out.extend(wrap(spans, width, "  "));
-                out.extend(preview(output, width, *is_error));
+            Item::Tool(tool) => {
+                let style = if tool.is_error { Style::new().fg(Color::Red) } else { dim() };
+                out.push(Line::styled(clip(&tool.heading(), width), style));
+                if tool.is_error {
+                    let cause = tool.output.lines().find(|line| !line.trim().is_empty()).unwrap_or("tool failed");
+                    out.extend(plain(&format!("  {cause}"), width, style).into_iter().take(2));
+                }
+            }
+            Item::ToolDetails(tool) => {
+                out.extend(plain(&tool.heading(), width, dim()));
+                out.extend(plain(&tool.output.replace('\t', "  "), width, Style::new()));
             }
             Item::Notice(level, text) => {
                 let style = match level {
@@ -76,29 +130,21 @@ impl Item {
     }
 }
 
-/// The first lines of a tool's result, under the call.
-fn preview(output: &str, width: usize, is_error: bool) -> Vec<Line<'static>> {
-    const SHOW: usize = 4;
-    let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
-    let style = if is_error { Style::new().fg(Color::Red) } else { dim() };
-    let mut out = Vec::new();
-    for (i, line) in lines.iter().take(SHOW).enumerate() {
-        let prefix = if i == 0 { "  ⎿ " } else { "    " };
-        // Tabs, as `read` puts after its line numbers, would take no room on screen.
-        let line = line.replace('\t', "  ");
-        out.push(Line::from(vec![Span::styled(prefix, dim()), Span::styled(clip(&line, width.saturating_sub(4).max(8)), style)]));
+/// Clip to terminal cells, leaving room for an ellipsis.
+pub(crate) fn clip(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
     }
-    if lines.len() > SHOW {
-        out.push(Line::styled(format!("    … {} more lines", lines.len() - SHOW), dim()));
+    if width == 0 {
+        return String::new();
     }
-    out
-}
-
-pub(crate) fn clip(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((end, _)) => format!("{}…", &text[..end]),
-        None => text.to_owned(),
-    }
+    let mut used = 0;
+    let mut clipped: String = text.chars().take_while(|c| {
+        used += c.width().unwrap_or(0);
+        used < width
+    }).collect();
+    clipped.push('…');
+    clipped
 }
 
 /// A call in a line: its path or pattern when it has one, else its input.
@@ -124,7 +170,7 @@ pub(crate) enum Activity {
     Idle,
     Thinking,
     Generating,
-    Running(Vec<String>),
+    Running,
     Compacting,
 }
 
@@ -149,6 +195,7 @@ pub(crate) struct View {
     reasoning: String,
     thinking_since: Option<Instant>,
     running: Vec<Running>,
+    tools: Vec<Arc<ToolOutput>>,
     pub(crate) activity: Activity,
     /// When the turn started.
     pub(crate) since: Option<Instant>,
@@ -163,6 +210,7 @@ impl View {
             reasoning: String::new(),
             thinking_since: None,
             running: Vec::new(),
+            tools: Vec::new(),
             activity: Activity::Idle,
             since: None,
         }
@@ -183,6 +231,35 @@ impl View {
     /// The items finished since the last call, oldest first, for the scrollback.
     pub(crate) fn take_committed(&mut self) -> Vec<Item> {
         std::mem::take(&mut self.committed)
+    }
+
+    fn finish_tool(&mut self, name: String, summary: String, output: String, is_error: bool) {
+        let tool = Arc::new(ToolOutput { name, summary, output, is_error });
+        self.tools.push(tool.clone());
+        self.push(Item::Tool(tool));
+    }
+
+    pub(crate) fn show_tools(&mut self) {
+        if self.tools.is_empty() {
+            self.notice(Level::Info, "No tool results in this turn");
+        } else {
+            self.committed.extend(self.tools.iter().cloned().map(Item::ToolDetails));
+        }
+    }
+
+    pub(crate) fn running_label(&self) -> String {
+        let Some(call) = self.running.first() else { return "Running tools".into() };
+        let verb = match call.name.as_str() {
+            "read" => "Reading",
+            "grep" => "Searching",
+            "glob" => "Finding",
+            other => other,
+        };
+        let mut label = format!("{verb} {}", call.summary);
+        if self.running.len() > 1 {
+            label.push_str(&format!(" (+{} more)", self.running.len() - 1));
+        }
+        label
     }
 
     /// Ends the reasoning: it goes to the scrollback as one line.
@@ -222,8 +299,12 @@ impl View {
 
     /// A stored conversation as items, when a session is resumed.
     pub(crate) fn replay(&mut self, messages: &[Message]) {
+        self.tools.clear();
         let mut calls = std::collections::HashMap::new();
         for message in messages {
+            if message.role == Role::User {
+                self.tools.clear();
+            }
             for content in &message.content {
                 match (message.role, content) {
                     (Role::User, Content::Text { text }) => self.push(Item::User(text.clone())),
@@ -235,7 +316,7 @@ impl View {
                     }
                     (Role::Tool, Content::ToolResult { call_id, output, is_error }) => {
                         let (name, summary) = calls.remove(call_id).unwrap_or_else(|| ("tool".into(), String::new()));
-                        self.push(Item::Tool { name, summary, output: output.clone(), is_error: *is_error });
+                        self.finish_tool(name, summary, output.clone(), *is_error);
                     }
                     _ => {}
                 }
@@ -248,6 +329,7 @@ impl View {
             Event::TurnStarted { .. } => {
                 self.activity = Activity::Thinking;
                 self.since = Some(Instant::now());
+                self.tools.clear();
             }
             Event::StepStarted { .. } => self.activity = Activity::Thinking,
             Event::ReasoningDelta { text, .. } => {
@@ -271,17 +353,17 @@ impl View {
             }
             Event::ActionStarted { call_id, name, input, .. } => {
                 self.running.push(Running { call_id: call_id.clone(), name: name.clone(), summary: tool_summary(name, input) });
-                self.activity = Activity::Running(self.running.iter().map(|r| r.name.clone()).collect());
+                self.activity = Activity::Running;
             }
             Event::ActionResult { call_id, name, output, is_error, .. } => {
                 let summary = match self.running.iter().position(|r| &r.call_id == call_id) {
                     Some(i) => self.running.remove(i).summary,
                     None => String::new(),
                 };
-                self.push(Item::Tool { name: name.clone(), summary, output: output.clone(), is_error: *is_error });
+                self.finish_tool(name.clone(), summary, output.clone(), *is_error);
                 self.activity = match self.running.is_empty() {
                     true => Activity::Thinking,
-                    false => Activity::Running(self.running.iter().map(|r| r.name.clone()).collect()),
+                    false => Activity::Running,
                 };
             }
             Event::Compacted { tokens_before, tokens_after, .. } => {
@@ -306,7 +388,7 @@ impl View {
     }
 
     /// The live part: what is being written and not yet in the scrollback (the reasoning's latest lines, the
-    /// answer's unfinished paragraph) and the tools running; at most its last `max` lines.
+    /// answer's unfinished paragraph), limited to its last `max` lines.
     pub(crate) fn live_lines(&self, width: usize, max: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
         if !self.reasoning.trim().is_empty() {
@@ -320,18 +402,6 @@ impl View {
         let text = &self.streaming[self.streamed..];
         if !text.trim().is_empty() {
             out.extend(markdown(text, width));
-        }
-        for running in &self.running {
-            out.extend(wrap(
-                vec![
-                    Span::styled("◌ ", Style::new().fg(Color::Yellow)),
-                    Span::styled(running.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(" "),
-                    Span::styled(running.summary.clone(), dim()),
-                ],
-                width,
-                "  ",
-            ));
         }
         if out.len() > max {
             out.drain(..out.len() - max);
@@ -398,7 +468,7 @@ mod tests {
             name: "grep".into(),
             input: json!({ "pattern": "fn main" }),
         });
-        assert_eq!(view.activity, Activity::Running(vec!["grep".into()]));
+        assert_eq!(view.activity, Activity::Running);
         view.apply(&Event::ActionResult {
             turn: turn.clone(),
             call_id: "1".into(),
@@ -409,10 +479,16 @@ mod tests {
         view.apply(&Event::TurnCompleted { turn, outcome: Outcome::Failed, error: Some("boom".into()), usage: Usage::default() });
         let items = view.take_committed();
         assert_eq!(items[0], Item::Assistant("Let me look.".into()));
-        assert!(matches!(&items[1], Item::Tool { summary, .. } if summary == "fn main"));
+        assert!(matches!(&items[1], Item::Tool(tool) if tool.summary == "fn main"));
         assert_eq!(items[2], Item::Notice(Level::Error, "error: boom".into()));
         assert!(!view.is_busy());
-        assert!(items[1].lines(40).len() >= 4);
+        assert_eq!(items[1].lines(40).len(), 2);
+        view.show_tools();
+        let details = view.take_committed();
+        assert!(details[0].lines(40).iter().any(|line| line.to_string().contains("src/bin.rs")));
+        view.apply(&Event::TurnStarted { turn: "next".into() });
+        view.show_tools();
+        assert!(matches!(&view.take_committed()[..], [Item::Notice(..)]));
     }
 
     #[test]

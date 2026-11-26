@@ -5,12 +5,13 @@
 //! agent is doing, the input (or an approval question in its place), a strip with the latest log lines, and a
 //! line of statistics.
 
+mod layout;
 pub(crate) mod logs;
 mod text;
 mod view;
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,17 +25,15 @@ use crossterm::{execute, terminal};
 use manifatura::kit::Answer;
 use manifatura::{Abort, Event, Session, SessionId, ToolCall};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
-use ratatui::{DefaultTerminal, Frame, TerminalOptions, Viewport};
+use ratatui::style::Style;
+use ratatui::widgets::{Paragraph, Widget};
+use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
 use ratatui_textarea::TextArea;
 use rustling::engine::{Engine, EngineOptions, Usage};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tracing::Level as LogLevel;
 
 use self::logs::{LogLine, Logs};
-use self::view::{Activity, Item, Level, View, dim, tokens, tool_summary};
+use self::view::{Activity, Item, Level, View, dim, tokens};
 use super::reasoning::{Effort, LEVELS};
 use super::{ChatOptions, Prepared};
 
@@ -53,6 +52,8 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/sessions", "", "list this directory's sessions"),
     ("/compact", "[focus]", "summarise older messages to make room"),
     ("/effort", "[level]", "how much the model reasons: off, none … max, or 0–0.99"),
+    ("/status", "", "show model, session and token statistics"),
+    ("/tools", "", "show tool output from the current or last turn"),
     ("/mcp", "", "the MCP servers and their tools"),
     ("/help", "", "what the keys and commands do"),
     ("/exit", "", "quit"),
@@ -174,56 +175,11 @@ async fn session_ids(ready: &Prepared) -> Vec<String> {
         .collect()
 }
 
-/// Hands out the viewport's rows from the top down.
-struct Rows {
-    area: Rect,
-    top: u16,
-}
-
-impl Rows {
-    fn take(&mut self, height: u16) -> Rect {
-        let height = height.min(self.area.bottom().saturating_sub(self.top));
-        let rect = Rect { y: self.top, height, ..self.area };
-        self.top += height;
-        rect
-    }
-}
-
-/// An approval question: the call, and the keys that answer it.
-fn question_lines(ask: &Ask, width: usize) -> Vec<Line<'static>> {
-    let accent = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let mut lines = vec![Line::from(vec![Span::styled("? ", accent), Span::styled(format!("Allow {}", ask.call.name), accent)])];
-    let summary = vec![Span::raw("  "), Span::raw(tool_summary(&ask.call.name, &ask.call.input))];
-    lines.extend(text::wrap(summary, width, "  ").into_iter().take(6));
-    lines.push(Line::from(vec![
-        Span::styled("  [y]", accent),
-        Span::raw(" yes  "),
-        Span::styled("[a]", accent),
-        Span::raw(" always this session  "),
-        Span::styled("[n]", accent),
-        Span::raw(" no"),
-    ]));
-    lines
-}
-
-/// A line of the log panel, coloured by level.
-fn log_line(line: &LogLine, width: usize) -> Line<'static> {
-    let style = match line.level {
-        LogLevel::ERROR => Style::new().fg(Color::Red),
-        LogLevel::WARN => Style::new().fg(Color::Yellow),
-        _ => dim(),
-    };
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(view::clip(&line.text, width.saturating_sub(3)), style),
-    ])
-}
-
 /// Runs the screen until the person quits. Returns the engine, so the caller can shut it down once the runtime
 /// holding its clients is gone, and the session to mention on the way out.
 pub(crate) async fn run(start: Start, logs: &mut Logs) -> (Option<Engine>, Option<SessionId>, Result<()>) {
     let rows = terminal::size().map(|(_, rows)| rows).unwrap_or(24);
-    let height = rows.saturating_sub(2).clamp(10, 24);
+    let height = (rows / 2).clamp(6, 10);
     let mut term = ratatui::init_with_options(TerminalOptions { viewport: Viewport::Inline(height) });
     let enhanced = matches!(terminal::supports_keyboard_enhancement(), Ok(true));
     let mut out = std::io::stdout();
@@ -280,31 +236,11 @@ async fn screen(
     let Start { model_dir, engine: engine_options, cwd, store, options, mcp } = start;
     // The servers start while the model loads.
     let mut servers = Some(tokio::spawn(super::mcp::start(mcp)));
-    let mut app = App {
-        view: View::new(),
-        input: composer(),
-        history: Vec::new(),
-        browsing: None,
-        log: VecDeque::new(),
-        logs: options.logs,
-        logs_open: false,
-        log_button: None,
-        picked: 0,
-        sessions: Vec::new(),
-        asks: VecDeque::new(),
-        armed: false,
-        tick: 0,
-        quit: false,
-        abort: None,
-        ready: None,
-        events: None,
-        last: None,
-        generated: 0,
-        model: rustling::engine::model_name(&model_dir, engine_options.passes),
-        window: engine_options.context,
-        effort: options.effort.label(),
-        yes: options.yes,
-    };
+    let mut app = App::new(rustling::engine::model_name(&model_dir, engine_options.passes), engine_options.context, &options);
+    let directory = std::env::var_os("HOME")
+        .and_then(|home| cwd.strip_prefix(home).ok().map(|relative| Path::new("~").join(relative)))
+        .unwrap_or_else(|| cwd.clone());
+    app.view.push(Item::Header { directory: directory.display().to_string(), model: app.model.clone() });
     let (ask_tx, mut asks) = mpsc::unbounded_channel::<Ask>();
     let (stats_tx, mut stats) = watch::channel::<Option<Usage>>(None);
     let mut loading = Some(tokio::task::spawn_blocking(move || Engine::start(&model_dir, engine_options)));
@@ -375,9 +311,7 @@ async fn recv(events: &mut Option<broadcast::Receiver<Event>>) -> Result<Event, 
 
 fn composer() -> TextArea<'static> {
     let mut input = TextArea::default();
-    input.set_block(Block::bordered().border_style(dim()));
     input.set_cursor_line_style(Style::new());
-    input.set_placeholder_text("Ask the agent, or /help");
     input.set_placeholder_style(dim());
     input
 }
@@ -389,8 +323,9 @@ fn flush(term: &mut DefaultTerminal, view: &mut View, height: u16) -> Result<()>
     if items.is_empty() {
         return Ok(());
     }
+    term.autoresize()?;
     let size = term.size()?;
-    let lines: Vec<Line<'static>> = items.iter().flat_map(|item| item.lines(size.width as usize)).collect();
+    let lines: Vec<_> = items.iter().flat_map(|item| item.lines(size.width as usize)).collect();
     let room = usize::from(size.height.saturating_sub(height)).max(1);
     for chunk in lines.chunks(room) {
         let chunk = chunk.to_vec();
@@ -400,28 +335,43 @@ fn flush(term: &mut DefaultTerminal, view: &mut View, height: u16) -> Result<()>
 }
 
 impl App {
+    fn new(model: String, window: usize, options: &ChatOptions) -> Self {
+        Self {
+            view: View::new(),
+            input: composer(),
+            history: Vec::new(),
+            browsing: None,
+            log: VecDeque::new(),
+            logs: options.logs,
+            logs_open: false,
+            log_button: None,
+            picked: 0,
+            sessions: Vec::new(),
+            asks: VecDeque::new(),
+            armed: false,
+            tick: 0,
+            quit: false,
+            abort: None,
+            ready: None,
+            events: None,
+            last: None,
+            generated: 0,
+            model,
+            window,
+            effort: options.effort.label(),
+            yes: options.yes,
+        }
+    }
+
     async fn ready(&mut self, prepared: Prepared) -> Result<()> {
         let session = &prepared.session;
-        match prepared.history.len() {
-            0 => self.view.notice(Level::Info, format!("rustling · {} · new session {}", self.model, session.id().as_str())),
-            n => {
-                self.view.replay(&prepared.history);
-                self.view.notice(Level::Info, format!("rustling · {} · resumed session {} ({n} messages)", self.model, session.id().as_str()));
-            }
-        }
-        for (name, tools, eager) in &prepared.servers {
-            let offered = if *eager { "offered" } else { "found with find_tools" };
-            self.view.notice(Level::Info, format!("MCP {name}: {} tools, {offered}", tools.len()));
+        if !prepared.history.is_empty() {
+            self.view.notice(Level::Info, format!("Resumed session {}", session.id().as_str()));
+            self.view.replay(&prepared.history);
         }
         for problem in &prepared.problems {
             self.view.notice(Level::Warn, problem.clone());
         }
-        if !prepared.files.is_empty() {
-            let paths: Vec<String> = prepared.files.iter().map(|path| path.display().to_string()).collect();
-            self.view.notice(Level::Info, format!("instructions from {}", paths.join(", ")));
-        }
-        let logs = if self.logs { " · click logs or press Ctrl-L for the log" } else { "" };
-        self.view.notice(Level::Info, format!("Enter sends · Shift+Enter new line · Esc interrupts · /help for commands{logs}"));
         self.events = Some(session.subscribe());
         self.sessions = session_ids(&prepared).await;
         self.ready = Some(prepared);
@@ -433,10 +383,6 @@ impl App {
         if self.log.len() > KEPT_LOG_LINES {
             self.log.pop_front();
         }
-    }
-
-    fn busy(&self) -> bool {
-        self.view.is_busy() || !self.asks.is_empty()
     }
 
     async fn input(&mut self, input: Input) {
@@ -533,6 +479,9 @@ impl App {
                     self.input.insert_newline();
                 } else {
                     let text = self.text();
+                    if self.ready.is_none() && !text.trim_start().starts_with('/') {
+                        return; // Keep the draft and cursor until it can actually be sent.
+                    }
                     if !text.trim().is_empty() {
                         self.input = composer();
                         self.browsing = None;
@@ -638,9 +587,18 @@ impl App {
             }
             self.view.notice(
                 Level::Info,
-                "Tab completes a command · Esc or Ctrl-C stops the agent · Ctrl-D or Ctrl-C twice quits · Up and Down \
+                "Enter sends · Shift+Enter inserts a line · Tab completes a command · Esc or Ctrl-C stops the agent · Ctrl-D or Ctrl-C twice quits · Up and Down \
                  recall what you sent · with --logs, click logs (or Ctrl-L) for the log",
             );
+            return;
+        }
+        if command == "/tools" {
+            self.view.show_tools();
+            return;
+        }
+        if command == "/status" {
+            let details = self.status();
+            self.view.notice(Level::Info, details);
             return;
         }
         let Some(ready) = &mut self.ready else {
@@ -654,6 +612,7 @@ impl App {
         match command {
             "/new" => {
                 let session = ready.runtime.session(&ready.agent, SessionId::new());
+                self.view.replay(&[]);
                 self.view.notice(Level::Info, format!("new session {}", session.id().as_str()));
                 self.switch(session);
             }
@@ -740,113 +699,13 @@ impl App {
         }
     }
 
-    /// Draws, from the top of the viewport down: what is being written, what the agent is doing, the input (or a
-    /// question), the log strip and the statistics. They sit right under the last message, as the conversation
-    /// continues there; the rows the viewport has to spare stay empty below them.
-    fn draw(&mut self, f: &mut Frame) {
-        let area = f.area();
-        let width = area.width as usize;
-
-        let activity = self.activity_line();
-        let activity_height = u16::from(!activity.spans.is_empty());
-        let (question, input_height) = match self.asks.front() {
-            Some(ask) => {
-                let lines = question_lines(ask, width);
-                let height = lines.len() as u16;
-                (Some(lines), height)
-            }
-            None => (None, (self.input.lines().len() as u16).clamp(1, 6) + 2),
-        };
-        let completions = self.completions();
-        let picked = self.picked.min(completions.len().saturating_sub(1));
-        let completion_lines: Vec<Line> = completions
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let (mark, style) = match i == picked {
-                    true => ("› ", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    false => ("  ", Style::new()),
-                };
-                Line::from(vec![Span::styled(format!("{mark}{:<18}", c.label), style), Span::styled(c.about.clone(), dim())])
-            })
-            .collect();
-        let completion_height = completion_lines.len() as u16;
-        let panel = match self.logs_open {
-            true => self.log.len().clamp(1, LOG_PANEL) as u16 + 1,
-            false => 0,
-        };
-        let chrome = activity_height + input_height + completion_height + panel + 1;
-        let live = self.view.live_lines(width, area.height.saturating_sub(chrome) as usize);
-
-        let mut rows = Rows { area, top: area.y };
-        f.render_widget(Paragraph::new(live.clone()), rows.take(live.len() as u16));
-        f.render_widget(Paragraph::new(activity), rows.take(activity_height));
-        match question {
-            Some(lines) => f.render_widget(Paragraph::new(lines), rows.take(input_height)),
-            None => f.render_widget(&self.input, rows.take(input_height)),
-        }
-        f.render_widget(Paragraph::new(completion_lines), rows.take(completion_height));
-        if panel > 0 {
-            let shown = (panel - 1) as usize;
-            let mut lines = vec![Line::styled("─ log (click logs or Ctrl-L to close) ".to_owned() + &"─".repeat(width.saturating_sub(38)), dim())];
-            lines.extend(self.log.iter().skip(self.log.len().saturating_sub(shown)).map(|line| log_line(line, width)));
-            if self.log.is_empty() {
-                lines.push(Line::styled("  nothing logged yet", dim()));
-            }
-            f.render_widget(Paragraph::new(lines), rows.take(panel));
-        }
-        let stats = rows.take(1);
-        let button = LOG_BUTTON.len() as u16;
-        match self.logs {
-            true if stats.width > button + 10 => {
-                let text = Rect { width: stats.width - button - 1, ..stats };
-                f.render_widget(Paragraph::new(self.stats_line()), text);
-                let rect = Rect { x: stats.right() - button, width: button, ..stats };
-                let style = match self.logs_open {
-                    true => Style::new().fg(Color::Black).bg(Color::Cyan),
-                    false => dim().add_modifier(Modifier::REVERSED),
-                };
-                f.render_widget(Paragraph::new(Line::styled(LOG_BUTTON, style)), rect);
-                self.log_button = Some(rect);
-            }
-            _ => f.render_widget(Paragraph::new(self.stats_line()), stats),
-        }
+    fn effort_label(&self) -> String {
+        self.ready.as_ref().map_or_else(|| self.effort.clone(), |ready| ready.reasoning.get().label())
     }
 
-    fn activity_line(&self) -> Line<'static> {
-        let spinner = Span::styled(format!("{} ", SPINNER[self.tick % SPINNER.len()]), Style::new().fg(Color::Cyan));
-        if self.ready.is_none() {
-            return Line::from(vec![spinner, Span::styled("Loading the model", Style::new().add_modifier(Modifier::BOLD))]);
-        }
-        if !self.asks.is_empty() {
-            return Line::from(vec![
-                Span::styled("? ", Style::new().fg(Color::Yellow)),
-                Span::styled("Waiting for you", Style::new().add_modifier(Modifier::BOLD)),
-            ]);
-        }
-        if self.armed {
-            return Line::styled("Press Ctrl-C again to quit", Style::new().fg(Color::Yellow));
-        }
-        let what = match &self.view.activity {
-            Activity::Idle => return Line::default(),
-            Activity::Thinking => "Thinking".to_owned(),
-            Activity::Generating => "Writing".to_owned(),
-            Activity::Running(names) => format!("Running {}", names.join(", ")),
-            Activity::Compacting => "Compacting".to_owned(),
-        };
-        let seconds = self.view.since.map_or(0, |since| since.elapsed().as_secs());
-        Line::from(vec![
-            spinner,
-            Span::styled(what, Style::new().add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" · {seconds}s · Esc to interrupt · Enter sends a note"), dim()),
-        ])
-    }
-
-    /// `inkling-2-mini · effort low · ctx 9% 1.4k/16k · last: 19 new (99% reused) · 74 out at 25 tok/s · …`
-    fn stats_line(&self) -> Line<'static> {
+    fn status(&self) -> String {
         let mut parts = vec![self.model.clone()];
-        let effort = self.ready.as_ref().map_or_else(|| self.effort.clone(), |ready| ready.reasoning.get().label());
-        parts.push(format!("effort {effort}"));
+        parts.push(format!("effort {}", self.effort_label()));
         if let Some(usage) = self.last {
             let used = (usage.prompt_tokens + usage.completion_tokens) as u64;
             parts.push(format!(
@@ -878,13 +737,12 @@ impl App {
         }
         if let Some(ready) = &self.ready {
             let id = ready.session.id().as_str();
-            parts.push(format!("session {}", id.rsplit('-').next().unwrap_or(id)));
+            parts.push(format!("session {id}"));
+            for path in &ready.files {
+                parts.push(format!("instructions from {}", path.display()));
+            }
         }
-        let mut line = vec![Span::styled(parts.join(" · "), dim())];
-        if self.busy() {
-            line.insert(0, Span::styled("● ", Style::new().fg(Color::Cyan)));
-        }
-        Line::from(line)
+        parts.join("\n")
     }
 }
 
@@ -892,12 +750,52 @@ impl App {
 mod tests {
     use super::*;
 
+    fn loading_app() -> App {
+        let options = ChatOptions {
+            system: None, resume_latest: false, resume: None, yes: false,
+            effort: Effort::Default, max_tokens: 4096, logs: false,
+        };
+        App::new("inkling-2-mini".into(), 16_384, &options)
+    }
+
+    #[tokio::test]
+    async fn loading_and_approval_preserve_the_composer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = loading_app();
+        app.input(Input::Paste("draft\r\nsecond line".into())).await;
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.key(enter).await;
+        assert_eq!(app.text(), "draft\nsecond line");
+        assert!(app.history.is_empty());
+
+        let (reply, answer) = oneshot::channel();
+        app.asks.push_back(Ask {
+            call: ToolCall { id: "r".into(), name: "read".into(), input: serde_json::json!({"path": "README.md"}) },
+            reply,
+        });
+        for (width, height) in [(80, 24), (60, 16)] {
+            let backend = TestBackend::new(width, height);
+            let mut term = Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(height / 2) }).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            let rendered = term.backend().to_string();
+            for label in ["Allow file read?", "README.md", "[y] Once", "[a] Always this session", "[n] Deny"] {
+                assert!(rendered.contains(label), "{rendered}");
+            }
+            assert!(!rendered.contains("second line"));
+        }
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)).await;
+        assert!(matches!(answer.await, Ok(Answer::Deny(None))));
+        assert_eq!(app.text(), "draft\nsecond line");
+    }
+
     #[test]
     fn commands_and_sessions_complete() {
         let sessions = vec!["01a2-aaaa".to_owned(), "01b3-bbbb".to_owned()];
         let names = |line: &str| -> Vec<String> { completions(line, &sessions).into_iter().map(|c| c.text).collect() };
         assert_eq!(names("/re"), ["/resume "]);
-        assert_eq!(names("/s"), ["/sessions"]);
+        assert_eq!(names("/s"), ["/sessions", "/status"]);
         assert_eq!(names("/"), COMMANDS.iter().map(|(n, a, _)| if a.is_empty() { n.to_string() } else { format!("{n} ") }).collect::<Vec<_>>());
         assert_eq!(names("/resume 01b"), ["/resume 01b3-bbbb"]);
         assert_eq!(names("/resume 01a2-aaaa"), Vec::<String>::new(), "a complete id needs no completing");

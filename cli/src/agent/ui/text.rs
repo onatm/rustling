@@ -8,7 +8,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// Wraps spans to `width` columns, breaking at spaces and splitting words longer than a line. `indent` starts
 /// each continuation line.
 pub(crate) fn wrap(spans: Vec<Span<'static>>, width: usize, indent: &str) -> Vec<Line<'static>> {
-    let width = width.max(8);
+    let width = width.max(1);
+    let indent = if indent.width() < width { indent } else { "" };
     let indent_width = indent.width();
     let mut lines = Vec::new();
     let mut line: Vec<Span<'static>> = Vec::new();

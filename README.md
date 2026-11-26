@@ -91,13 +91,17 @@ named `<server>__<tool>`. Without `eager` they are kept out of the prompt, which
 window, and the model finds them with `find_tools` and runs them with `run_tool`. `approve = true` asks before
 each call. `/mcp` lists the servers and their tools.
 
-The conversation goes into the terminal's own scrollback, so it scrolls, selects and copies like any output.
-Below it, the screen shows the reply as it is written, the input, and a line of statistics: how much of the
-context window is in use, how many prompt tokens were new and how many reused, and how fast the last prompt and
-reply went.
+The conversation stays in the terminal's scrollback for scrolling, selecting and copying. A copper prompt marks
+your messages. Type while the model loads and press Enter when it is ready. During a turn you can send a
+follow-up or press Esc to interrupt. An approval shows the tool and its target in place of the composer.
+Your draft returns when you answer.
+
+Successful tools occupy one line. Errors include their cause, and `/tools` shows the output from the current
+or most recent turn. The footer shows reasoning effort and context usage. Use `/status` for the full session
+ID, prompt reuse, generation speed and loaded instruction files.
 
 There is no log unless you ask for one with `--logs` (at `--log-level`). Then a `logs` button at the end of the
-statistics opens it; click it, or press Ctrl-L. The button needs the mouse, so with `--logs` the scroll wheel goes
+footer opens it; click it, or press Ctrl-L. The button needs the mouse, so with `--logs` the scroll wheel goes
 to rustling instead of scrolling the terminal, and selecting text needs the modifier your terminal uses for that
 (Option in iTerm2 and Terminal.app, Shift in most others).
 
