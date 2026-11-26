@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding};
 use tracing::Level as LogLevel;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::view::{clip, copper, dim, prompt_text_width, tokens, user_message_style};
 use super::{Activity, App, LOG_BUTTON, LOG_PANEL, SPINNER, ago};
@@ -19,6 +20,24 @@ fn take(area: &mut Rect, count: u16) -> Rect {
     taken
 }
 
+/// Keep the filename visible when its parent directories exceed the menu width.
+fn path_label(path: &str, width: usize) -> String {
+    if path.width() <= width {
+        return path.to_owned();
+    }
+    let mut room = width.saturating_sub(1);
+    let mut start = path.len();
+    for (i, ch) in path.char_indices().rev() {
+        let cells = ch.width().unwrap_or(0);
+        if cells > room {
+            break;
+        }
+        room -= cells;
+        start = i;
+    }
+    format!("…{}", &path[start..])
+}
+
 impl App {
     pub(super) fn pane_height(&self, width: u16, height: u16) -> u16 {
         let limit = (height / 2).clamp(6, 12).min(height.saturating_sub(2).max(1));
@@ -30,13 +49,12 @@ impl App {
         }
         let editor = self.editor_rows(width);
         let logs = if self.logs_open { self.log.len().clamp(1, LOG_PANEL) + 1 } else { 0 };
-        let extras = (logs + self.completions().len()).min(usize::from(limit)) as u16;
+        let extras = logs + self.completions().len() + usize::from(self.files.hint().is_some());
         // Leave a blank row between the transcript and the controls when space permits.
-        (editor + 2 + extras).min(limit)
+        (editor + 2 + extras.min(usize::from(limit)) as u16).min(limit)
     }
 
     fn editor_rows(&self, width: u16) -> u16 {
-        use unicode_width::UnicodeWidthStr;
         let columns = prompt_text_width(width.into());
         let mut rows = 0;
         for line in self.input.lines() {
@@ -61,23 +79,32 @@ impl App {
         }
         let width = rows.width as usize;
         // Budget the editor first. Suggestions and logs only use spare rows.
-        let editor = self.editor_rows(rows.width).min(rows.height);
+        let reserved = if self.files.active() && rows.height >= 4 { 2 } else { 0 };
+        let editor = self.editor_rows(rows.width).min(rows.height - reserved);
         let mut spare = rows.height - editor;
         let footer = spare.min(1);
         spare -= footer;
         let completions = self.completions();
-        let menu = completions.len().min(spare as usize) as u16;
+        let hint = self.files.hint();
+        let menu = (completions.len() + usize::from(hint.is_some())).min(spare as usize) as u16;
         spare -= menu;
         let logs = if self.logs_open { (1 + self.log.len().clamp(1, LOG_PANEL)).min(spare as usize) as u16 } else { 0 };
         take(&mut rows, spare - logs);
         let picked = self.picked.min(completions.len().saturating_sub(1));
         let first = (picked + 1).saturating_sub(menu as usize);
+        if let Some(hint) = hint && menu > 0 {
+            f.render_widget(Line::styled(format!("  {hint}"), dim()), take(&mut rows, 1));
+        }
         for (i, completion) in completions.iter().enumerate().skip(first).take(menu as usize) {
             let (mark, style) = if i == picked { ("› ", copper()) } else { ("  ", Style::new()) };
-            let line = Line::from(vec![
-                Span::styled(format!("{mark}{:<18}", completion.label), style),
-                Span::styled(completion.about.as_str(), dim()),
-            ]);
+            let line = if self.files.active() {
+                Line::styled(format!("{mark}{}", path_label(&completion.label, width.saturating_sub(2))), style)
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("{mark}{:<18}", completion.label), style),
+                    Span::styled(completion.about.as_str(), dim()),
+                ])
+            };
             f.render_widget(line, take(&mut rows, 1));
         }
         if logs > 0 {
@@ -207,20 +234,22 @@ impl App {
         if self.yes {
             left.push_str(" · auto-allow");
         }
-        let hint = if self.view.is_busy() && body.width < 65 {
+        let hint = if self.files.active() {
+            "↑↓ select · Tab/Enter insert · Esc close"
+        } else if self.view.is_busy() && body.width < 65 {
             "Esc interrupt"
         } else if self.view.is_busy() {
             "Enter follow-up · Esc interrupt"
         } else if !self.completions().is_empty() {
             "↑↓ select · Tab complete · Esc close"
         } else {
-            "/ commands"
+            "@ files · / commands"
         };
         let gap = (body.width as usize).saturating_sub(Line::raw(&left).width() + Line::raw(hint).width());
         if gap > 0 {
             left.push_str(&" ".repeat(gap));
             left.push_str(hint);
-        } else if self.view.is_busy() {
+        } else if self.view.is_busy() || self.files.active() {
             left = hint.to_owned();
         }
         f.render_widget(Line::styled(left, dim()), body);

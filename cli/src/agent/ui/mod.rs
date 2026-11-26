@@ -2,6 +2,7 @@
 //! thinking and replies stream into the transcript above the pinned controls.
 
 mod approval;
+mod files;
 mod layout;
 mod screen;
 pub(crate) mod logs;
@@ -81,6 +82,7 @@ pub(crate) struct Start {
 struct App {
     view: View,
     input: TextArea<'static>,
+    files: files::FilePicker,
     history: Vec<String>,
     /// The recalled entry and the draft to restore when Down reaches the end.
     browsing: Option<(usize, TextArea<'static>)>,
@@ -227,7 +229,7 @@ async fn screen(
     let Start { model_dir, engine: engine_options, cwd, store, options, mcp } = start;
     // The servers start while the model loads.
     let mut servers = Some(tokio::spawn(super::mcp::start(mcp)));
-    let mut app = App::new(rustling::engine::model_name(&model_dir, engine_options.passes), engine_options.context, &options);
+    let mut app = App::new(rustling::engine::model_name(&model_dir, engine_options.passes), engine_options.context, cwd.clone(), &options);
     let directory = std::env::var_os("HOME")
         .and_then(|home| cwd.strip_prefix(home).ok().map(|relative| Path::new("~").join(relative)))
         .unwrap_or_else(|| cwd.clone());
@@ -267,6 +269,7 @@ async fn screen(
                     Err(broadcast::error::RecvError::Closed) => app.events = None,
                 },
                 Some(ask) = asks.recv() => app.asks.push_back(ask),
+                () = app.files.receive() => {}
                 Some(line) = logs.0.recv() => app.log_line(line),
                 Ok(()) = stats.changed() => {
                     let usage = *stats.borrow_and_update();
@@ -311,10 +314,11 @@ fn composer() -> TextArea<'static> {
 }
 
 impl App {
-    fn new(model: String, window: usize, options: &ChatOptions) -> Self {
+    fn new(model: String, window: usize, cwd: PathBuf, options: &ChatOptions) -> Self {
         Self {
             view: View::new(),
             input: composer(),
+            files: files::FilePicker::new(cwd),
             history: Vec::new(),
             browsing: None,
             log: VecDeque::new(),
@@ -373,11 +377,13 @@ impl App {
                 }
             }
             Input::Paste(text) if self.asks.is_empty() && self.resume_pick.is_none() => {
+                self.picked = 0;
                 self.completions_hidden = false;
                 self.input.insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
             }
             _ => {}
         }
+        self.files.sync(&self.input, self.completions_hidden);
     }
 
     async fn key(&mut self, key: KeyEvent) {
@@ -414,39 +420,8 @@ impl App {
             }
             return;
         }
-        let completions = self.completions();
-        if key.code == KeyCode::Esc && !completions.is_empty() && !self.view.is_busy() {
-            self.completions_hidden = true;
+        if self.completion_key(key) {
             return;
-        }
-        if !matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Esc) {
-            self.completions_hidden = false;
-        }
-        if !completions.is_empty() && !ctrl {
-            let picked = self.picked.min(completions.len() - 1);
-            match key.code {
-                KeyCode::Up => {
-                    self.picked = picked.checked_sub(1).unwrap_or(completions.len() - 1);
-                    return;
-                }
-                KeyCode::Down => {
-                    self.picked = (picked + 1) % completions.len();
-                    return;
-                }
-                KeyCode::Tab => {
-                    self.complete(&completions[picked]);
-                    return;
-                }
-                KeyCode::Enter if key.modifiers.is_empty() && self.text().trim() != completions[picked].text.trim() => {
-                    let completion = completions[picked].clone();
-                    self.complete(&completion);
-                    // A command that takes nothing more runs at once; one that takes an argument waits for it.
-                    if !completion.runs {
-                        return;
-                    }
-                }
-                _ => {}
-            }
         }
         if !matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab) {
             self.picked = 0;
@@ -500,9 +475,49 @@ impl App {
         self.input.lines().join("\n")
     }
 
-    /// What the input could complete to, while it is a command being typed on one line: the commands it begins,
-    /// or after `/resume `, the sessions.
+    /// A completion consumes Enter when it inserts a file or a command argument.
+    /// Fully specified slash commands continue to the normal submission handler.
+    fn completion_key(&mut self, key: KeyEvent) -> bool {
+        let files = self.files.active();
+        let options = self.completions();
+        if key.code == KeyCode::Esc && (files || !options.is_empty() && !self.view.is_busy()) {
+            self.completions_hidden = true;
+            return true;
+        }
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Esc) {
+            self.completions_hidden = false;
+        }
+        let code = match (key.code, key.modifiers) {
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) if files => KeyCode::Up,
+            (KeyCode::Char('n'), KeyModifiers::CONTROL) if files => KeyCode::Down,
+            (_, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => return false,
+            (code, _) => code,
+        };
+        let picked = self.picked.min(options.len().saturating_sub(1));
+        let Some(option) = options.get(picked) else {
+            return files && (matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::Tab)
+                || code == KeyCode::Enter && key.modifiers.is_empty() && self.files.searching());
+        };
+        match code {
+            KeyCode::Up => self.picked = picked.checked_sub(1).unwrap_or(options.len() - 1),
+            KeyCode::Down => self.picked = (picked + 1) % options.len(),
+            KeyCode::Tab => self.complete(option),
+            KeyCode::Enter if key.modifiers.is_empty() && (files || self.text().trim() != option.text.trim()) => {
+                self.complete(option);
+                return !option.runs;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Matches for the active file mention or slash command.
     fn completions(&self) -> Vec<Completion> {
+        if self.files.active() && self.asks.is_empty() && !self.completions_hidden {
+            return self.files.matches.iter().map(|path| Completion {
+                text: path.clone(), label: path.clone(), about: String::new(), runs: false,
+            }).collect();
+        }
         match (self.input.lines(), self.asks.is_empty() && !self.completions_hidden) {
             ([line], true) => completions(line, &self.sessions),
             _ => Vec::new(),
@@ -510,9 +525,12 @@ impl App {
     }
 
     fn complete(&mut self, completion: &Completion) {
-        let mut input = composer();
-        input.insert_str(&completion.text);
-        self.input = input;
+        if self.files.active() {
+            files::insert_path(&mut self.input, &completion.text);
+        } else {
+            self.input = composer();
+            self.input.insert_str(&completion.text);
+        }
         self.picked = 0;
     }
 
@@ -590,7 +608,7 @@ impl App {
             }
             self.view.notice(
                 Level::Info,
-                "Enter sends · Shift+Enter inserts a line · Tab completes a command · Esc or Ctrl-C stops the agent · Ctrl-D or Ctrl-C twice quits · Up and Down \
+                "Enter sends · Shift+Enter inserts a line · @ picks a file · Tab completes · Esc or Ctrl-C stops the agent · Ctrl-D or Ctrl-C twice quits · Up and Down \
                  recall what you sent · with --logs, click logs (or Ctrl-L) for the log",
             );
             return;
@@ -779,7 +797,7 @@ mod tests {
             system: None, resume_latest: false, resume: None, yes: false,
             effort: Effort::Default, max_tokens: 4096, logs: false,
         };
-        App::new("inkling-2-mini".into(), 16_384, &options)
+        App::new("inkling-2-mini".into(), 16_384, PathBuf::from("."), &options)
     }
 
     #[tokio::test]
@@ -891,6 +909,61 @@ mod tests {
         }
         assert!(buf[(0, 2)].modifier.contains(Modifier::DIM));
         assert!(buf[(0, height - 5)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[tokio::test]
+    async fn at_opens_a_file_picker_and_escape_keeps_the_draft() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = loading_app();
+        app.input(Input::Paste("Compare\nthe @".into())).await;
+        let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(term.backend().to_string().contains("Type a file name"));
+        app.input(Input::Key(KeyEvent::from(KeyCode::Esc))).await;
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(!term.backend().to_string().contains("Type a file name"));
+        assert_eq!(app.text(), "Compare\nthe @");
+    }
+
+    #[tokio::test]
+    async fn file_selection_replaces_only_the_active_mention() {
+        use std::fs;
+        use ratatui_textarea::CursorMove;
+
+        let root = std::env::temp_dir().join(format!("rustling-file-picker-{}", std::process::id()));
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        for name in ["docs/report one.md", "docs/report two.md", "report.tmp", ".git/report"] {
+            fs::write(root.join(name), "").unwrap();
+        }
+        fs::write(root.join(".gitignore"), "*.tmp\n").unwrap();
+        let mut app = loading_app();
+        app.files = files::FilePicker::new(root.clone());
+        app.input(Input::Paste("@previous\nRésumé @rpt with me".into())).await;
+        app.input.move_cursor(CursorMove::Jump(1, 9));
+        app.input(Input::Key(KeyEvent::from(KeyCode::Left))).await;
+        assert!(app.files.searching());
+        app.files.receive().await;
+        let mut matches = app.files.matches.clone();
+        matches.sort();
+        assert_eq!(matches, ["docs/report one.md", "docs/report two.md"]);
+        let chosen = app.files.matches[1].clone();
+        app.input(Input::Key(KeyEvent::from(KeyCode::Down))).await;
+        app.input(Input::Key(KeyEvent::from(KeyCode::Enter))).await;
+        assert_eq!(app.text(), format!("@previous\nRésumé \"{chosen}\" with me"));
+        assert!(!app.files.active());
+        assert!(app.history.is_empty());
+        app.input(Input::Paste("and ".into())).await;
+        assert!(app.text().ends_with("and with me"));
+        app.input(Input::Key(KeyEvent::from(KeyCode::End))).await;
+        app.input(Input::Paste(" dev@example.org".into())).await;
+        assert!(!app.files.active());
+        app.input(Input::Paste(" @zzz".into())).await;
+        app.input(Input::Paste("q".into())).await;
+        app.files.receive().await;
+        assert_eq!(app.files.hint(), Some("No matching files"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
