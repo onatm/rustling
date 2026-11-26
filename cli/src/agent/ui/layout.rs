@@ -4,10 +4,10 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Padding, Paragraph};
 use tracing::Level as LogLevel;
 
-use super::view::{clip, copper, dim, tokens, tool_summary};
+use super::view::{clip, copper, dim, prompt_text_width, tokens, tool_summary, user_message_style};
 use super::{Activity, App, Ask, LOG_BUTTON, LOG_PANEL, SPINNER, ago, text};
 
 /// Take rows from the top of the remaining area.
@@ -48,12 +48,13 @@ impl App {
         let editor = self.editor_rows(width);
         let logs = if self.logs_open { self.log.len().clamp(1, LOG_PANEL) + 1 } else { 0 };
         let extras = (logs + self.completions().len()).min(usize::from(limit)) as u16;
-        (editor + 1 + extras).min(limit)
+        // Leave a blank row between the transcript and the controls when space permits.
+        (editor + 2 + extras).min(limit)
     }
 
     fn editor_rows(&self, width: u16) -> u16 {
         use unicode_width::UnicodeWidthStr;
-        let columns = usize::from(width.saturating_sub(2).max(1));
+        let columns = prompt_text_width(width.into());
         let mut rows = 0;
         for line in self.input.lines() {
             rows += line.width().div_ceil(columns).max(1);
@@ -143,19 +144,18 @@ impl App {
     }
 
     fn draw_composer(&mut self, f: &mut Frame, area: Rect) {
-        let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).border_style(dim());
-        let inner = if area.height >= 3 {
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-            inner
-        } else {
-            area
-        };
+        let block = Block::new().style(user_message_style()).padding(Padding::vertical(u16::from(area.height >= 3)));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
         let gutter = inner.width.min(2);
-        f.render_widget(Span::styled("›", copper()), inner);
+        f.render_widget(Span::styled("›", Style::new().add_modifier(Modifier::BOLD)), inner);
+        let width = (prompt_text_width(inner.width.into()) as u16).min(inner.width - gutter);
+        if width == 0 {
+            return;
+        }
         let placeholder = if self.view.is_busy() { "Send a follow-up…" } else { "Ask Rustling…" };
         self.input.set_placeholder_text(placeholder);
-        f.render_widget(&self.input, Rect { x: inner.x + gutter, width: inner.width - gutter, ..inner });
+        f.render_widget(&self.input, Rect { x: inner.x + gutter, width, ..inner });
     }
 
     /// Use the same leading separator as a finished transcript item, space permitting.

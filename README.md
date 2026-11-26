@@ -91,11 +91,14 @@ named `<server>__<tool>`. Without `eager` they are kept out of the prompt, which
 window, and the model finds them with `find_tools` and runs them with `run_tool`. `approve = true` asks before
 each call. `/mcp` lists the servers and their tools.
 
-The conversation stays in the terminal's scrollback for scrolling, selecting and copying. A copper prompt marks
-your messages. The composer stays at the bottom of the terminal. Multiline drafts grow upward, and command
-suggestions and logs open above the input. Type while the model loads and press Enter when it is ready. During a turn you can send a
-follow-up or press Esc to interrupt. An approval shows the tool and its target in place of the composer.
-Your draft returns when you answer.
+Thinking and replies appear directly below the preceding message as they stream. The conversation stays in
+the terminal's scrollback for scrolling, selecting and copying. A shaded prompt with a `›` and a blank row
+above and below the text marks both your draft and your sent messages. The composer stays at the bottom as
+multiline drafts grow upward. Command suggestions and logs open above the input.
+
+Type while the model loads and press Enter when it is ready. During a turn you can send a follow-up or press
+Esc to interrupt. An approval shows the tool and its target in place of the composer. Your draft returns when
+you answer.
 
 Successful tools occupy one line. Errors include their cause, and `/tools` shows the output from the current
 or most recent turn. The footer shows reasoning effort and context usage. Use `/status` for the full session

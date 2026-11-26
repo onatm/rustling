@@ -49,6 +49,16 @@ pub(crate) fn copper() -> Style {
     Style::new().fg(color).add_modifier(Modifier::BOLD)
 }
 
+pub(super) fn user_message_style() -> Style {
+    let (ink, paper) = if *LIGHT { (38, 239) } else { (235, 38) };
+    Style::new().fg(Color::Rgb(ink, ink, ink)).bg(Color::Rgb(paper, paper, paper))
+}
+
+/// Leave two cells for the chevron and one at the right edge.
+pub(super) fn prompt_text_width(width: usize) -> usize {
+    width.saturating_sub(3).max(1)
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) struct ToolOutput {
     name: String,
@@ -84,20 +94,17 @@ impl Item {
                 out.push(header);
             }
             Item::User(text) => {
-                let (ink, paper) = if *LIGHT {
-                    (Color::Rgb(38, 35, 31), Color::Rgb(239, 236, 227))
-                } else {
-                    (Color::Rgb(238, 234, 225), Color::Rgb(39, 38, 32))
-                };
-                let style = Style::new().add_modifier(Modifier::BOLD);
-                for (i, line) in text.split('\n').enumerate() {
-                    let prefix = if i == 0 { "› " } else { "  " };
-                    let spans = vec![Span::styled(prefix, copper()), Span::styled(line.to_owned(), style)];
-                    for mut row in wrap(spans, width, "  ") {
-                        row.push_span(" ".repeat(width.saturating_sub(row.width())));
-                        out.push(row.style(Style::new().fg(ink).bg(paper)));
-                    }
+                let style = user_message_style();
+                let padding = Line::styled(" ".repeat(width), style);
+                out.push(padding.clone());
+                let body = text.trim_end_matches(['\r', '\n']);
+                for (i, mut row) in plain(body, prompt_text_width(width), Style::new()).into_iter().enumerate() {
+                    let prefix = if i == 0 { Span::styled("› ", dim().add_modifier(Modifier::BOLD)) } else { Span::raw("  ") };
+                    row.spans.insert(0, prefix);
+                    row.push_span(" ".repeat(width.saturating_sub(row.width())));
+                    out.push(row.style(style));
                 }
+                out.push(padding);
             }
             Item::Assistant(text) => out.extend(markdown(text, width)),
             Item::Reasoning { first, seconds } => {

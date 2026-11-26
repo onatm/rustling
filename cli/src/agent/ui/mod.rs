@@ -837,7 +837,7 @@ mod tests {
                 let mut term = Terminal::with_options(TestBackend::new(width, height), TerminalOptions { viewport: Viewport::Fixed(area) }).unwrap();
                 term.draw(|f| app.draw(f)).unwrap();
                 let buf = term.backend().buffer();
-                assert_eq!(buf[(0, height - 2)].symbol(), "─");
+                assert_eq!(buf[(0, height - 2)].symbol(), " ");
                 assert_eq!(buf[(0, height - 1)].symbol(), "h", "high effort in footer");
                 if draft == "/" {
                     assert_eq!(buf[(0, height - 3)].symbol(), "›");
@@ -854,6 +854,44 @@ mod tests {
         app.browse(-1);
         app.browse(1);
         assert_eq!(app.text(), "/st");
+    }
+
+    #[test]
+    fn draft_and_sent_message_share_padding_and_text_alignment() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::{Color, Modifier};
+        use ratatui::widgets::Paragraph;
+
+        let mut app = loading_app();
+        let draft = "short\n12345678901";
+        app.input.insert_str(draft);
+        let (width, height) = (13, 20);
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| {
+            let sent = Item::User(draft.into()).lines(width.into());
+            f.render_widget(Paragraph::new(sent), f.area());
+            app.draw(f);
+        }).unwrap();
+        let buf = term.backend().buffer();
+        let surface = buf[(0, 1)].bg;
+        assert_ne!(surface, Color::Reset);
+        for top in [1, height - 6] {
+            for y in top..top + 5 {
+                assert!((0..width).all(|x| buf[(x, y)].bg == surface), "missing shading on row {y}");
+                assert_eq!(buf[(width - 1, y)].symbol(), " ");
+            }
+            for y in [top, top + 4] {
+                assert!((0..width).all(|x| buf[(x, y)].symbol() == " "));
+            }
+            assert_eq!(buf[(0, top + 1)].symbol(), "›");
+            assert_eq!(buf[(2, top + 1)].symbol(), "s");
+            assert!(!buf[(2, top + 1)].modifier.contains(Modifier::BOLD));
+            assert_eq!(buf[(2, top + 2)].symbol(), "1");
+            assert_eq!(buf[(2, top + 3)].symbol(), "1");
+        }
+        assert!(buf[(0, 2)].modifier.contains(Modifier::DIM));
+        assert!(buf[(0, height - 5)].modifier.contains(Modifier::BOLD));
     }
 
     #[tokio::test]
