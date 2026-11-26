@@ -167,7 +167,7 @@ pub(crate) async fn prepare(
             let asks = asks.clone();
             async move {
                 let (reply, answer) = oneshot::channel();
-                if asks.send(Ask { call, reply }).is_err() {
+                if asks.send(Ask::new(call, reply)).is_err() {
                     return Answer::Deny(Some("nobody is there to ask".into()));
                 }
                 answer.await.unwrap_or(Answer::Deny(None))

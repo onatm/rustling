@@ -4,11 +4,11 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Padding, Paragraph};
+use ratatui::widgets::{Block, Padding};
 use tracing::Level as LogLevel;
 
-use super::view::{clip, copper, dim, prompt_text_width, tokens, tool_summary, user_message_style};
-use super::{Activity, App, Ask, LOG_BUTTON, LOG_PANEL, SPINNER, ago, text};
+use super::view::{clip, copper, dim, prompt_text_width, tokens, user_message_style};
+use super::{Activity, App, LOG_BUTTON, LOG_PANEL, SPINNER, ago};
 
 /// Take rows from the top of the remaining area.
 fn take(area: &mut Rect, count: u16) -> Rect {
@@ -19,31 +19,14 @@ fn take(area: &mut Rect, count: u16) -> Rect {
     taken
 }
 
-fn approval(ask: &Ask, width: usize, height: usize) -> Vec<Line<'static>> {
-    let amber = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let action = match ask.call.name.as_str() {
-        "read" => "file read",
-        other => other,
-    };
-    let mut lines = vec![Line::styled(format!("▏ ? Allow {action}?"), amber)];
-    let choices = if width >= 43 { "[y] Once  [a] Always this session  [n] Deny" } else { "[y] Once  [a] Session  [n] Deny" };
-    let choices = text::wrap(vec![Span::styled(choices, amber)], width, "  ");
-    let summary = tool_summary(&ask.call.name, &ask.call.input);
-    let room = height.saturating_sub(lines.len() + choices.len());
-    let target = text::wrap(vec![Span::raw(format!("  {summary}"))], width, "  ");
-    lines.extend(target.into_iter().take(room));
-    lines.extend(choices);
-    lines
-}
-
 impl App {
     pub(super) fn pane_height(&self, width: u16, height: u16) -> u16 {
         let limit = (height / 2).clamp(6, 12).min(height.saturating_sub(2).max(1));
+        if let Some(ask) = self.asks.front() {
+            return ask.height(width, limit);
+        }
         if self.resume_pick.is_some() {
             return (self.sessions.len() + 2).min(usize::from(limit)) as u16;
-        }
-        if let Some(ask) = self.asks.front() {
-            return (approval(ask, width.into(), limit.into()).len() + 1).min(usize::from(limit)) as u16;
         }
         let editor = self.editor_rows(width);
         let logs = if self.logs_open { self.log.len().clamp(1, LOG_PANEL) + 1 } else { 0 };
@@ -67,17 +50,18 @@ impl App {
 
     pub(super) fn draw(&mut self, f: &mut Frame) {
         let mut rows = f.area();
-        if let Some(selected) = self.resume_pick && self.asks.is_empty() {
+        if let Some(ask) = self.asks.front() {
+            self.log_button = None;
+            ask.draw(f, rows);
+            return;
+        }
+        if let Some(selected) = self.resume_pick {
             self.draw_sessions(f, rows, selected);
             return;
         }
         let width = rows.width as usize;
-        // Budget the editor or approval first. Suggestions and logs only use spare rows.
-        let question = self.asks.front().map(|ask| approval(ask, width, rows.height as usize));
-        let editor = question.as_ref().map_or_else(
-            || usize::from(self.editor_rows(rows.width)),
-            Vec::len,
-        ).min(rows.height as usize) as u16;
+        // Budget the editor first. Suggestions and logs only use spare rows.
+        let editor = self.editor_rows(rows.width).min(rows.height);
         let mut spare = rows.height - editor;
         let footer = spare.min(1);
         spare -= footer;
@@ -110,12 +94,7 @@ impl App {
                 f.render_widget(Line::styled(clip(&line.text, width), style), take(&mut rows, 1));
             }
         }
-        let edit_area = take(&mut rows, editor);
-        if let Some(lines) = question {
-            f.render_widget(Paragraph::new(lines), edit_area);
-        } else {
-            self.draw_composer(f, edit_area);
-        }
+        self.draw_composer(f, take(&mut rows, editor));
         self.draw_footer(f, take(&mut rows, footer));
     }
 
@@ -228,9 +207,7 @@ impl App {
         if self.yes {
             left.push_str(" · auto-allow");
         }
-        let hint = if !self.asks.is_empty() {
-            ""
-        } else if self.view.is_busy() && body.width < 65 {
+        let hint = if self.view.is_busy() && body.width < 65 {
             "Esc interrupt"
         } else if self.view.is_busy() {
             "Enter follow-up · Esc interrupt"
@@ -243,7 +220,7 @@ impl App {
         if gap > 0 {
             left.push_str(&" ".repeat(gap));
             left.push_str(hint);
-        } else if self.view.is_busy() && self.asks.is_empty() {
+        } else if self.view.is_busy() {
             left = hint.to_owned();
         }
         f.render_widget(Line::styled(left, dim()), body);

@@ -97,8 +97,9 @@ above and below the text marks both your draft and your sent messages. The compo
 multiline drafts grow upward. Command suggestions and logs open above the input.
 
 Type while the model loads and press Enter when it is ready. During a turn you can send a follow-up or press
-Esc to interrupt. An approval shows the tool and its target in place of the composer. Your draft returns when
-you answer.
+Esc to interrupt. When a tool needs approval, the composer shows the action, its target and three choices.
+Use ↑ or ↓ and Enter, or press `y` to allow once, `a` to allow that tool for the session, or Esc to deny.
+Your draft returns when you answer.
 
 Successful tools occupy one line. Errors include their cause, and `/tools` shows the output from the current
 or most recent turn. The footer shows reasoning effort and context usage. Use `/status` for the full session

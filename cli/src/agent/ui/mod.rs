@@ -1,6 +1,7 @@
 //! Chat on the terminal's main screen. The transcript goes into native scrollback;
 //! thinking and replies stream into the transcript above the pinned controls.
 
+mod approval;
 mod layout;
 mod screen;
 pub(crate) mod logs;
@@ -21,23 +22,18 @@ use crossterm::event::{
 use crossterm::{execute, terminal};
 use self::screen::ChatScreen;
 use manifatura::kit::Answer;
-use manifatura::{Abort, Event, Session, SessionId, SessionMeta, ToolCall};
+use manifatura::{Abort, Event, Session, SessionId, SessionMeta};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui_textarea::{TextArea, WrapMode};
 use rustling::engine::{Engine, EngineOptions, Usage};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
+pub(crate) use self::approval::Ask;
 use self::logs::{LogLine, Logs};
 use self::view::{Activity, Item, Level, View, dim, tokens};
 use super::reasoning::{Effort, LEVELS};
 use super::{ChatOptions, Prepared, ago, recent_sessions};
-
-/// An approval the agent is waiting for.
-pub(crate) struct Ask {
-    pub(crate) call: ToolCall,
-    pub(crate) reply: oneshot::Sender<Answer>,
-}
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 const KEPT_LOG_LINES: usize = 200;
@@ -244,12 +240,12 @@ async fn screen(
 
     let result: Result<()> = async {
         loop {
+            // A turn can stop waiting for its approval when interrupted.
+            app.asks.retain(|ask| !ask.reply.is_closed());
             term.draw(&mut app)?;
             if app.quit {
                 return Ok(());
             }
-            // Approvals the turn stopped waiting for (it was interrupted) go.
-            app.asks.retain(|ask| !ask.reply.is_closed());
             let waiting_for_engine = loading.is_some();
             tokio::select! {
                 input = keys.recv() => match input {
@@ -389,16 +385,12 @@ impl App {
         if !(ctrl && key.code == KeyCode::Char('c')) {
             self.armed = false;
         }
-        if !self.asks.is_empty() {
-            let answer = match key.code {
-                KeyCode::Char('y' | 'Y') | KeyCode::Enter => Some(Answer::Allow),
-                KeyCode::Char('a' | 'A') => Some(Answer::AllowAlways),
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(Answer::Deny(None)),
-                KeyCode::Char('c') if ctrl => {
-                    self.interrupt();
-                    Some(Answer::Deny(Some("the user interrupted".into())))
-                }
-                _ => None,
+        if let Some(ask) = self.asks.front_mut() {
+            let answer = if ctrl && key.code == KeyCode::Char('c') {
+                self.interrupt();
+                Some(Answer::Deny(Some("the user interrupted".into())))
+            } else {
+                ask.key(key)
             };
             if let Some(answer) = answer {
                 let ask = self.asks.pop_front().expect("checked");
@@ -802,23 +794,30 @@ mod tests {
         assert_eq!(app.text(), "draft\nsecond line");
         assert!(app.history.is_empty());
 
-        let (reply, answer) = oneshot::channel();
-        app.asks.push_back(Ask {
-            call: ToolCall { id: "r".into(), name: "read".into(), input: serde_json::json!({"path": "README.md"}) },
-            reply,
-        });
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let call = manifatura::ToolCall { id: "r".into(), name: "read".into(), input: serde_json::json!({"path": "README.md"}) };
+        app.asks.push_back(Ask::new(call.clone(), reply));
+        let (reply, mut next) = tokio::sync::oneshot::channel();
+        app.asks.push_back(Ask::new(call, reply));
         for (width, height) in [(80, 24), (60, 16)] {
             let backend = TestBackend::new(width, height);
             let mut term = Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(height / 2) }).unwrap();
             term.draw(|f| app.draw(f)).unwrap();
             let rendered = term.backend().to_string();
-            for label in ["Allow file read?", "README.md", "[y] Once", "[a] Always this session", "[n] Deny"] {
+            for label in ["Read this file?", "README.md", "› 1. Allow once (y)", "2. Allow this tool for the session (a)", "3. Deny (n)", "Enter confirm"] {
                 assert!(rendered.contains(label), "{rendered}");
             }
             assert!(!rendered.contains("second line"));
         }
-        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)).await;
+        app.key(KeyEvent::from(KeyCode::Down)).await;
+        app.key(KeyEvent::from(KeyCode::Down)).await;
+        app.key(KeyEvent::from(KeyCode::Enter)).await;
         assert!(matches!(answer.await, Ok(Answer::Deny(None))));
+        app.key(KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat)).await;
+        app.input(Input::Paste("y".into())).await;
+        assert!(matches!(next.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        app.key(KeyEvent::from(KeyCode::Enter)).await;
+        assert_eq!(next.await.unwrap(), Answer::Allow);
         assert_eq!(app.text(), "draft\nsecond line");
     }
 
