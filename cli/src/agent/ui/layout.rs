@@ -37,6 +37,38 @@ fn approval(ask: &Ask, width: usize, height: usize) -> Vec<Line<'static>> {
 }
 
 impl App {
+    pub(super) fn pane_height(&self, width: u16, height: u16) -> u16 {
+        let limit = (height / 2).clamp(6, 12).min(height.saturating_sub(2).max(1));
+        if self.resume_pick.is_some() {
+            return (self.sessions.len() + 2).min(usize::from(limit)) as u16;
+        }
+        if let Some(ask) = self.asks.front() {
+            return (approval(ask, width.into(), limit.into()).len() + 1).min(usize::from(limit)) as u16;
+        }
+        // Keep the same live area for a whole turn, including between streamed paragraphs.
+        if self.view.is_busy() {
+            return limit;
+        }
+        let editor = self.editor_rows(width);
+        let activity = u16::from(!self.activity_line(width.into()).spans.is_empty());
+        let logs = if self.logs_open { self.log.len().clamp(1, LOG_PANEL) + 1 } else { 0 };
+        let extras = (logs + self.completions().len()).min(usize::from(limit)) as u16;
+        (editor + 1 + activity + extras).min(limit)
+    }
+
+    fn editor_rows(&self, width: u16) -> u16 {
+        use unicode_width::UnicodeWidthStr;
+        let columns = usize::from(width.saturating_sub(2).max(1));
+        let mut rows = 0;
+        for line in self.input.lines() {
+            rows += line.width().div_ceil(columns).max(1);
+            if rows >= 6 {
+                return 8;
+            }
+        }
+        rows as u16 + 2
+    }
+
     pub(super) fn draw(&mut self, f: &mut Frame) {
         let mut rows = f.area();
         if let Some(selected) = self.resume_pick && self.asks.is_empty() {
@@ -47,7 +79,7 @@ impl App {
         // Budget the editor or approval first. Suggestions and logs only use spare rows.
         let question = self.asks.front().map(|ask| approval(ask, width, rows.height as usize));
         let editor = question.as_ref().map_or_else(
-            || self.input.lines().len().clamp(1, 6) + 2,
+            || usize::from(self.editor_rows(rows.width)),
             Vec::len,
         ).min(rows.height as usize) as u16;
         let mut spare = rows.height - editor;
@@ -61,16 +93,11 @@ impl App {
         spare -= menu;
         let logs = if self.logs_open { (1 + self.log.len().clamp(1, LOG_PANEL)).min(spare as usize) as u16 } else { 0 };
         let live = self.view.live_lines(width, (spare - logs) as usize);
+        // Unused space is above the pane. Suggestions and logs open above the
+        // editor so a changing menu never moves the input or its shortcut row.
+        take(&mut rows, spare - logs - live.len() as u16);
         let live_area = take(&mut rows, live.len() as u16);
         f.render_widget(Paragraph::new(live), live_area);
-        f.render_widget(activity, take(&mut rows, activity_rows));
-
-        let edit_area = take(&mut rows, editor);
-        if let Some(lines) = question {
-            f.render_widget(Paragraph::new(lines), edit_area);
-        } else {
-            self.draw_composer(f, edit_area);
-        }
         let picked = self.picked.min(completions.len().saturating_sub(1));
         let first = (picked + 1).saturating_sub(menu as usize);
         for (i, completion) in completions.iter().enumerate().skip(first).take(menu as usize) {
@@ -95,11 +122,21 @@ impl App {
                 f.render_widget(Line::styled(clip(&line.text, width), style), take(&mut rows, 1));
             }
         }
+        f.render_widget(activity, take(&mut rows, activity_rows));
+        let edit_area = take(&mut rows, editor);
+        if let Some(lines) = question {
+            f.render_widget(Paragraph::new(lines), edit_area);
+        } else {
+            self.draw_composer(f, edit_area);
+        }
         self.draw_footer(f, take(&mut rows, footer));
     }
 
     fn draw_sessions(&mut self, f: &mut Frame, mut rows: Rect, selected: usize) {
         self.log_button = None;
+        let needed = (self.sessions.len() + 2).min(rows.height.into()) as u16;
+        let unused = rows.height - needed;
+        take(&mut rows, unused);
         f.render_widget(Line::styled("Resume a session", copper()), take(&mut rows, 1));
         let count = usize::from(rows.height.saturating_sub(1));
         let first = (selected + 1).saturating_sub(count);
@@ -192,6 +229,8 @@ impl App {
             "Esc interrupt"
         } else if self.view.is_busy() {
             "Enter follow-up · Esc interrupt"
+        } else if !self.completions().is_empty() {
+            "↑↓ select · Tab complete · Esc close"
         } else {
             "/ commands"
         };

@@ -92,7 +92,8 @@ window, and the model finds them with `find_tools` and runs them with `run_tool`
 each call. `/mcp` lists the servers and their tools.
 
 The conversation stays in the terminal's scrollback for scrolling, selecting and copying. A copper prompt marks
-your messages. Type while the model loads and press Enter when it is ready. During a turn you can send a
+your messages. The composer stays at the bottom of the terminal. Multiline drafts grow upward, and command
+suggestions and logs open above the input. Type while the model loads and press Enter when it is ready. During a turn you can send a
 follow-up or press Esc to interrupt. An approval shows the tool and its target in place of the composer.
 Your draft returns when you answer.
 
@@ -110,9 +111,9 @@ to rustling instead of scrolling the terminal, and selecting text needs the modi
 | Enter, Shift+Enter | Send; a new line. Sent while the agent works, a message reaches it before its next step. |
 | Esc, Ctrl-C | Stop the agent at once. Ctrl-C twice, or Ctrl-D, quits. |
 | `y`, `a`, `n` | At a question: allow, allow for the rest of the session, deny. |
-| Tab | Complete a command, or after `/resume `, a session id; Up and Down pick among them. |
+| Tab | Complete a command or session ID. Use Up and Down to select a suggestion and Esc to dismiss the idle menu. |
 | Ctrl-L | Open or close the log, with `--logs`. |
-| Up, Down | Recall what you sent. |
+| Up, Down | Browse sent messages. Moving past the newest message restores your draft. |
 
 Typing `/` lists the commands: `/mcp` lists the MCP servers, `/new` starts a new session, `/resume` opens a picker ordered by last activity (↑/↓ to select, Enter to resume, Esc to cancel),
 `/resume ID` switches directly, `/sessions` lists them, `/compact [focus]`

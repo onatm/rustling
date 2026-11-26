@@ -3068,6 +3068,7 @@ dependencies = [
  "futures-util",
  "manifatura",
  "ratatui",
+ "ratatui-crossterm",
  "ratatui-textarea",
  "rayon",
  "rustling",

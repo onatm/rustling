@@ -1,11 +1,8 @@
-//! The chat screen: an inline viewport at the bottom of the terminal, with finished messages written into the
-//! terminal's own scrollback above it, so they scroll, select and copy as any output does.
-//!
-//! The viewport holds, from the top: the reply as it streams and the tools running, a line saying what the
-//! agent is doing, the input (or an approval question in its place), a strip with the latest log lines, and a
-//! line of statistics.
+//! Chat on the terminal's main screen. The transcript goes into native scrollback;
+//! a bottom pane holds the streaming tail, menus, activity, editor or approval, and footer.
 
 mod layout;
+mod screen;
 pub(crate) mod logs;
 mod text;
 mod view;
@@ -22,13 +19,12 @@ use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::{execute, terminal};
+use self::screen::ChatScreen;
 use manifatura::kit::Answer;
 use manifatura::{Abort, Event, Session, SessionId, SessionMeta, ToolCall};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::widgets::{Paragraph, Widget};
-use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{TextArea, WrapMode};
 use rustling::engine::{Engine, EngineOptions, Usage};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -90,8 +86,8 @@ struct App {
     view: View,
     input: TextArea<'static>,
     history: Vec<String>,
-    /// Where Up and Down are in the history, while browsing it.
-    browsing: Option<usize>,
+    /// The recalled entry and the draft to restore when Down reaches the end.
+    browsing: Option<(usize, TextArea<'static>)>,
     log: VecDeque<LogLine>,
     /// Whether the log is kept at all (`--logs`), and whether its panel is open.
     logs: bool,
@@ -100,6 +96,7 @@ struct App {
     log_button: Option<Rect>,
     /// The highlighted completion, while the input is a command being typed.
     picked: usize,
+    completions_hidden: bool,
     /// This directory's sessions, for completing `/resume`.
     sessions: Vec<SessionMeta>,
     /// Selected row while the session picker is open.
@@ -173,9 +170,13 @@ fn completions(line: &str, sessions: &[SessionMeta]) -> Vec<Completion> {
 /// Runs the screen until the person quits. Returns the engine, so the caller can shut it down once the runtime
 /// holding its clients is gone, and the session to mention on the way out.
 pub(crate) async fn run(start: Start, logs: &mut Logs) -> (Option<Engine>, Option<SessionId>, Result<()>) {
-    let rows = terminal::size().map(|(_, rows)| rows).unwrap_or(24);
-    let height = (rows / 2).clamp(6, 10);
-    let mut term = ratatui::init_with_options(TerminalOptions { viewport: Viewport::Inline(height) });
+    let mut term = match ChatScreen::open() {
+        Ok(term) => term,
+        Err(error) => {
+            ratatui::restore();
+            return (None, None, Err(error.into()));
+        }
+    };
     let enhanced = matches!(terminal::supports_keyboard_enhancement(), Ok(true));
     let mut out = std::io::stdout();
     let _ = execute!(out, EnableBracketedPaste);
@@ -205,7 +206,7 @@ pub(crate) async fn run(start: Start, logs: &mut Logs) -> (Option<Engine>, Optio
         }
     });
 
-    let (engine, session, result) = screen(&mut term, height, start, logs, &mut input).await;
+    let (engine, session, result) = screen(&mut term, start, logs, &mut input).await;
 
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -216,14 +217,13 @@ pub(crate) async fn run(start: Start, logs: &mut Logs) -> (Option<Engine>, Optio
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
-    let _ = term.clear();
+    let _ = term.finish();
     ratatui::restore();
     (engine, session, result)
 }
 
 async fn screen(
-    term: &mut DefaultTerminal,
-    height: u16,
+    term: &mut ChatScreen,
     start: Start,
     logs: &mut Logs,
     keys: &mut mpsc::UnboundedReceiver<Input>,
@@ -244,8 +244,7 @@ async fn screen(
 
     let result: Result<()> = async {
         loop {
-            flush(term, &mut app.view, height)?;
-            term.draw(|f| app.draw(f))?;
+            term.draw(&mut app)?;
             if app.quit {
                 return Ok(());
             }
@@ -309,27 +308,10 @@ async fn recv(events: &mut Option<broadcast::Receiver<Event>>) -> Result<Event, 
 
 fn composer() -> TextArea<'static> {
     let mut input = TextArea::default();
+    input.set_wrap_mode(WrapMode::Glyph);
     input.set_cursor_line_style(Style::new());
     input.set_placeholder_style(dim());
     input
-}
-
-/// Writes finished items into the scrollback above the viewport, a screenful of rows at a time (more at once
-/// garbles the screen).
-fn flush(term: &mut DefaultTerminal, view: &mut View, height: u16) -> Result<()> {
-    let items = view.take_committed();
-    if items.is_empty() {
-        return Ok(());
-    }
-    term.autoresize()?;
-    let size = term.size()?;
-    let lines: Vec<_> = items.iter().flat_map(|item| item.lines(size.width as usize)).collect();
-    let room = usize::from(size.height.saturating_sub(height)).max(1);
-    for chunk in lines.chunks(room) {
-        let chunk = chunk.to_vec();
-        term.insert_before(chunk.len() as u16, move |buf| Paragraph::new(chunk).render(buf.area, buf))?;
-    }
-    Ok(())
 }
 
 impl App {
@@ -344,6 +326,7 @@ impl App {
             logs_open: false,
             log_button: None,
             picked: 0,
+            completions_hidden: false,
             sessions: Vec::new(),
             resume_pick: None,
             asks: VecDeque::new(),
@@ -394,6 +377,7 @@ impl App {
                 }
             }
             Input::Paste(text) if self.asks.is_empty() && self.resume_pick.is_none() => {
+                self.completions_hidden = false;
                 self.input.insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
             }
             _ => {}
@@ -439,6 +423,13 @@ impl App {
             return;
         }
         let completions = self.completions();
+        if key.code == KeyCode::Esc && !completions.is_empty() && !self.view.is_busy() {
+            self.completions_hidden = true;
+            return;
+        }
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Esc) {
+            self.completions_hidden = false;
+        }
         if !completions.is_empty() && !ctrl {
             let picked = self.picked.min(completions.len() - 1);
             match key.code {
@@ -474,6 +465,7 @@ impl App {
                     self.interrupt();
                 } else if !self.text().is_empty() {
                     self.input = composer();
+                    self.browsing = None;
                 } else if self.armed {
                     self.quit = true;
                 } else {
@@ -519,7 +511,7 @@ impl App {
     /// What the input could complete to, while it is a command being typed on one line: the commands it begins,
     /// or after `/resume `, the sessions.
     fn completions(&self) -> Vec<Completion> {
-        match (self.input.lines(), self.asks.is_empty()) {
+        match (self.input.lines(), self.asks.is_empty() && !self.completions_hidden) {
             ([line], true) => completions(line, &self.sessions),
             _ => Vec::new(),
         }
@@ -538,14 +530,18 @@ impl App {
             return;
         }
         let last = self.history.len() as isize;
-        let at = self.browsing.map_or(last, |i| i as isize) + step;
+        let at = self.browsing.as_ref().map_or(last, |(i, _)| *i as isize) + step;
         if at >= last {
-            self.browsing = None;
-            self.input = composer();
+            if let Some((_, draft)) = self.browsing.take() {
+                self.input = draft;
+            }
             return;
         }
-        let at = at.clamp(0, last - 1) as usize;
-        self.browsing = Some(at);
+        let at = at.max(0) as usize;
+        match &mut self.browsing {
+            Some((i, _)) => *i = at,
+            None => self.browsing = Some((at, std::mem::replace(&mut self.input, composer()))),
+        }
         let mut input = composer();
         input.insert_str(&self.history[at]);
         self.input = input;
@@ -796,7 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn loading_and_approval_preserve_the_composer() {
-        use ratatui::Terminal;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
         use ratatui::backend::TestBackend;
 
         let mut app = loading_app();
@@ -824,6 +820,40 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)).await;
         assert!(matches!(answer.await, Ok(Answer::Deny(None))));
         assert_eq!(app.text(), "draft\nsecond line");
+    }
+
+    #[tokio::test]
+    async fn prompt_and_footer_stay_at_the_bottom_as_input_grows() {
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+        use ratatui::backend::TestBackend;
+
+        let mut app = loading_app();
+        for (width, height) in [(80, 24), (60, 16), (100, 32)] {
+            for draft in ["/", "first line\nsecond line", "wrap ".repeat(22).as_str()] {
+                app.input = composer();
+                app.input.insert_str(draft);
+                let rows = app.pane_height(width, height);
+                let area = Rect::new(0, height - rows, width, rows);
+                let mut term = Terminal::with_options(TestBackend::new(width, height), TerminalOptions { viewport: Viewport::Fixed(area) }).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+                let buf = term.backend().buffer();
+                assert_eq!(buf[(0, height - 2)].symbol(), "─");
+                assert_eq!(buf[(0, height - 1)].symbol(), "h", "high effort in footer");
+                if draft == "/" {
+                    assert_eq!(buf[(0, height - 3)].symbol(), "›");
+                    assert!(term.backend().to_string().contains("/new"));
+                }
+            }
+        }
+        app.input = composer();
+        app.input.insert_str("/st");
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        assert!(app.completions().is_empty());
+        assert_eq!(app.text(), "/st");
+        app.history.push("earlier question".into());
+        app.browse(-1);
+        app.browse(1);
+        assert_eq!(app.text(), "/st");
     }
 
     #[tokio::test]
