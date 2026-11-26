@@ -1,9 +1,10 @@
 //! Wrapping styled text to lines of a known count, which writing into the terminal's scrollback needs, and
 //! markdown through `tui-markdown`.
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use tui_markdown::{Options, StyleSheet};
 
 /// Wraps spans to `width` columns, breaking at spaces and splitting words longer than a line. `indent` starts
 /// each continuation line.
@@ -94,9 +95,35 @@ pub(crate) fn plain(text: &str, width: usize, style: Style) -> Vec<Line<'static>
     text.split('\n').flat_map(|line| wrap(vec![Span::styled(line.to_owned(), style)], width, "")).collect()
 }
 
+#[derive(Clone)]
+struct ChatMarkdown;
+
+impl StyleSheet for ChatMarkdown {
+    fn heading(&self, _level: u8) -> Style {
+        Style::new().add_modifier(Modifier::BOLD)
+    }
+
+    fn heading_marker(&self, _level: u8) -> &str {
+        ""
+    }
+
+    fn code(&self) -> Style {
+        Style::new().fg(Color::Reset)
+    }
+
+    fn code_block_fence(&self) -> &str {
+        ""
+    }
+
+    fn blockquote(&self) -> Style {
+        super::view::dim()
+    }
+}
+
 /// Markdown as wrapped lines: headings, lists, quotes, code and inline styles, as `tui-markdown` renders them.
 pub(crate) fn markdown(text: &str, width: usize) -> Vec<Line<'static>> {
-    let rendered = tui_markdown::from_str(text);
+    let options = Options::new(ChatMarkdown).table_width(width.min(u16::MAX as usize) as u16);
+    let rendered = tui_markdown::from_str_with_options(text, &options);
     let mut out = Vec::new();
     for line in rendered.lines {
         let spans: Vec<Span<'static>> = line
@@ -104,6 +131,14 @@ pub(crate) fn markdown(text: &str, width: usize) -> Vec<Line<'static>> {
             .into_iter()
             .map(|span| Span::styled(span.content.into_owned(), line.style.patch(span.style)))
             .collect();
+        // The renderer styles the whole line for a block, and just the span for inline code.
+        if line.style == ChatMarkdown.code() && width >= 3 {
+            for mut row in wrap(spans, width - 2, "") {
+                row.spans.insert(0, Span::styled("│ ", super::view::dim()));
+                out.push(row);
+            }
+            continue;
+        }
         // Continuation lines of a list item or quote keep its indent.
         let indent: String = spans.first().map_or(String::new(), |s| {
             let lead = s.content.len() - s.content.trim_start_matches([' ', '>', '-', '*', '•']).len();
@@ -128,6 +163,16 @@ mod tests {
         assert_eq!(text(&lines), ["the quick", "  brown", "  fox"]);
         let lines = wrap(vec![Span::raw("abcdefghijkl")], 8, "");
         assert_eq!(text(&lines), ["abcdefgh", "ijkl"]);
+    }
+
+    #[test]
+    fn fenced_code_keeps_its_indent_and_wraps_inside_the_gutter() {
+        let lines = markdown("```rs\n    count += 1;\n```", 12);
+        let rows = text(&lines);
+        assert!(rows.contains(&"│     count".to_owned()), "{rows:?}");
+        assert!(rows.iter().all(|row| row.starts_with("│ ") && row.width() <= 12), "{rows:?}");
+        assert_eq!(text(&markdown("Use `count`.", 20)), ["Use count."]);
+        assert_eq!(text(&markdown("# Heading", 20)), ["Heading"]);
     }
 
     #[test]

@@ -10,7 +10,7 @@ runs of tokens the reply repeats from the conversation.
 
 [![rustling chat on an M1 Max with 64 GB](rustling.gif)](https://asciinema.org/a/sgCI7bSgdqBMrOrl)
 
-`rustling chat` running on an M1 Max with 64 GB. [Watch it on asciinema](https://asciinema.org/a/sgCI7bSgdqBMrOrl).
+An earlier version of `rustling chat` running on an M1 Max with 64 GB. [Watch it on asciinema](https://asciinema.org/a/sgCI7bSgdqBMrOrl).
 
 ## Requirements
 

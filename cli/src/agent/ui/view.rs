@@ -276,7 +276,7 @@ impl View {
         let rest = &self.streaming[self.streamed..];
         let end = match all {
             true => rest.len(),
-            false => paragraph_end(&self.streaming[..self.streamed], rest),
+            false => paragraph_end(rest),
         };
         if end == 0 {
             return;
@@ -410,28 +410,32 @@ impl View {
     }
 }
 
-/// Where the finished paragraphs of `rest` end: after its last blank line that is outside a code block,
-/// counting the fences in `before` (the part of the reply already shown) too. 0 when no paragraph has ended.
-fn paragraph_end(before: &str, rest: &str) -> usize {
-    let mut fences = before.lines().filter(|l| l.trim_start().starts_with("```")).count();
+/// Only commit at a complete paragraph or closing fence. Every previous commit ended outside a block.
+fn paragraph_end(rest: &str) -> usize {
+    let mut fence: Option<(u8, usize)> = None;
     let mut end = 0;
     let mut at = 0;
-    let mut previous_blank = false;
     for line in rest.split_inclusive('\n') {
-        at += line.len();
         if !line.ends_with('\n') {
-            break; // still being written
+            break;
         }
-        if line.trim_start().starts_with("```") {
-            fences += 1;
-            // A closed code block ends a paragraph of its own.
-            if fences % 2 == 0 {
-                end = at;
+        at += line.len();
+        let trimmed = line.trim_start_matches(' ');
+        let marker = trimmed.as_bytes().first().copied();
+        if line.len() - trimmed.len() <= 3 && let Some(marker @ (b'`' | b'~')) = marker {
+            let length = trimmed.bytes().take_while(|&b| b == marker).count();
+            let tail = &trimmed[length..];
+            match fence {
+                Some((open, min)) if marker == open && length >= min && tail.trim().is_empty() => {
+                    fence = None;
+                    end = at;
+                }
+                None if length >= 3 && (marker == b'~' || !tail.contains('`')) => fence = Some((marker, length)),
+                _ => {}
             }
-        } else if line.trim().is_empty() && fences % 2 == 0 && !previous_blank {
+        } else if fence.is_none() && line.trim().is_empty() {
             end = at;
         }
-        previous_blank = line.trim().is_empty();
     }
     end
 }
@@ -522,6 +526,16 @@ mod tests {
         delta(&mut view, "Look at the file.", true);
         view.apply(&Event::MessageAppended { turn, message: Message::new(Role::Assistant, Vec::new()), usage: None });
         assert!(matches!(&view.take_committed()[..], [Item::Reasoning { first, .. }] if first == "Look at the file."));
+    }
+
+    #[test]
+    fn a_streamed_block_waits_for_its_matching_fence() {
+        for (open, body, close) in [("~~~~rs", "~~~", "~~~~"), ("````md", "```", "````")] {
+            let partial = format!("{open}\n{body}\n\ncode\n");
+            assert_eq!(paragraph_end(&partial), 0);
+            let finished = format!("{partial}{close}\n");
+            assert_eq!(paragraph_end(&format!("{finished}next")), finished.len());
+        }
     }
 
     #[test]
