@@ -393,11 +393,10 @@ impl View {
         let mut out = Vec::new();
         if !self.reasoning.trim().is_empty() {
             let style = dim().add_modifier(Modifier::ITALIC);
-            let mut lines = Vec::new();
-            for line in self.reasoning.lines().map(str::trim).filter(|line| !line.is_empty()) {
-                lines.extend(wrap(vec![Span::styled(format!("∴ {line}"), style)], width, "  "));
+            let tail: Vec<_> = self.reasoning.lines().rev().map(str::trim).filter(|line| !line.is_empty()).take(max).collect();
+            for line in tail.into_iter().rev() {
+                out.extend(wrap(vec![Span::styled(format!("∴ {line}"), style)], width, "  "));
             }
-            out.extend(lines.into_iter().rev().take(LIVE_REASONING).rev());
         }
         let text = &self.streaming[self.streamed..];
         if !text.trim().is_empty() {
@@ -439,9 +438,6 @@ fn paragraph_end(rest: &str) -> usize {
     }
     end
 }
-
-/// How many lines of reasoning show while it goes on.
-const LIVE_REASONING: usize = 6;
 
 /// `12.3k`, `850`.
 pub(crate) fn tokens(n: u64) -> String {
@@ -526,6 +522,15 @@ mod tests {
         delta(&mut view, "Look at the file.", true);
         view.apply(&Event::MessageAppended { turn, message: Message::new(Role::Assistant, Vec::new()), usage: None });
         assert!(matches!(&view.take_committed()[..], [Item::Reasoning { first, .. }] if first == "Look at the file."));
+    }
+
+    #[test]
+    fn reasoning_uses_all_the_available_transcript_rows() {
+        let mut view = View::new();
+        let text = (1..=12).map(|i| format!("thought {i}")).collect::<Vec<_>>().join("\n");
+        view.apply(&Event::ReasoningDelta { turn: "t".into(), text });
+        assert_eq!(view.live_lines(80, 20).len(), 12);
+        assert_eq!(view.live_lines(80, 3)[0].to_string(), "∴ thought 10");
     }
 
     #[test]

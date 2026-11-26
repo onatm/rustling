@@ -1,5 +1,5 @@
 //! Chat on the terminal's main screen. The transcript goes into native scrollback;
-//! a bottom pane holds the streaming tail, menus, activity, editor or approval, and footer.
+//! thinking and replies stream into the transcript above the pinned controls.
 
 mod layout;
 mod screen;
@@ -782,7 +782,7 @@ impl App {
 mod tests {
     use super::*;
 
-    fn loading_app() -> App {
+    pub(super) fn loading_app() -> App {
         let options = ChatOptions {
             system: None, resume_latest: false, resume: None, yes: false,
             effort: Effort::Default, max_tokens: 4096, logs: false,

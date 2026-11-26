@@ -45,15 +45,10 @@ impl App {
         if let Some(ask) = self.asks.front() {
             return (approval(ask, width.into(), limit.into()).len() + 1).min(usize::from(limit)) as u16;
         }
-        // Keep the same live area for a whole turn, including between streamed paragraphs.
-        if self.view.is_busy() {
-            return limit;
-        }
         let editor = self.editor_rows(width);
-        let activity = u16::from(!self.activity_line(width.into()).spans.is_empty());
         let logs = if self.logs_open { self.log.len().clamp(1, LOG_PANEL) + 1 } else { 0 };
         let extras = (logs + self.completions().len()).min(usize::from(limit)) as u16;
-        (editor + 1 + activity + extras).min(limit)
+        (editor + 1 + extras).min(limit)
     }
 
     fn editor_rows(&self, width: u16) -> u16 {
@@ -85,19 +80,11 @@ impl App {
         let mut spare = rows.height - editor;
         let footer = spare.min(1);
         spare -= footer;
-        let activity = self.activity_line(width);
-        let activity_rows = u16::from(!activity.spans.is_empty()).min(spare);
-        spare -= activity_rows;
         let completions = self.completions();
         let menu = completions.len().min(spare as usize) as u16;
         spare -= menu;
         let logs = if self.logs_open { (1 + self.log.len().clamp(1, LOG_PANEL)).min(spare as usize) as u16 } else { 0 };
-        let live = self.view.live_lines(width, (spare - logs) as usize);
-        // Unused space is above the pane. Suggestions and logs open above the
-        // editor so a changing menu never moves the input or its shortcut row.
-        take(&mut rows, spare - logs - live.len() as u16);
-        let live_area = take(&mut rows, live.len() as u16);
-        f.render_widget(Paragraph::new(live), live_area);
+        take(&mut rows, spare - logs);
         let picked = self.picked.min(completions.len().saturating_sub(1));
         let first = (picked + 1).saturating_sub(menu as usize);
         for (i, completion) in completions.iter().enumerate().skip(first).take(menu as usize) {
@@ -122,7 +109,6 @@ impl App {
                 f.render_widget(Line::styled(clip(&line.text, width), style), take(&mut rows, 1));
             }
         }
-        f.render_widget(activity, take(&mut rows, activity_rows));
         let edit_area = take(&mut rows, editor);
         if let Some(lines) = question {
             f.render_widget(Paragraph::new(lines), edit_area);
@@ -170,6 +156,25 @@ impl App {
         let placeholder = if self.view.is_busy() { "Send a follow-up…" } else { "Ask Rustling…" };
         self.input.set_placeholder_text(placeholder);
         f.render_widget(&self.input, Rect { x: inner.x + gutter, width: inner.width - gutter, ..inner });
+    }
+
+    /// Use the same leading separator as a finished transcript item, space permitting.
+    pub(super) fn transcript_preview(&self, width: usize, available: usize) -> Vec<Line<'static>> {
+        if available == 0 {
+            return Vec::new();
+        }
+        let mut lines = self.view.live_lines(width, available);
+        if lines.is_empty() {
+            let activity = self.activity_line(width);
+            if activity.spans.is_empty() {
+                return lines;
+            }
+            lines.push(activity);
+        }
+        if lines.len() < available {
+            lines.insert(0, Line::default());
+        }
+        lines
     }
 
     fn activity_line(&self, width: usize) -> Line<'static> {
