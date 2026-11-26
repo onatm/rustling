@@ -114,7 +114,8 @@ to rustling instead of scrolling the terminal, and selecting text needs the modi
 | Ctrl-L | Open or close the log, with `--logs`. |
 | Up, Down | Recall what you sent. |
 
-Typing `/` lists the commands: `/mcp` lists the MCP servers, `/new` starts a new session, `/resume ID` switches to another, `/sessions` lists them, `/compact [focus]`
+Typing `/` lists the commands: `/mcp` lists the MCP servers, `/new` starts a new session, `/resume` opens a picker ordered by last activity (↑/↓ to select, Enter to resume, Esc to cancel),
+`/resume ID` switches directly, `/sessions` lists them, `/compact [focus]`
 summarises older messages to make room, `/effort` shows or sets how much the model reasons, and `/exit` quits.
 `/effort off` stops the reasoning altogether, as `--no-reasoning` does, and `/effort high` (or any level) brings
 it back. The effort is part of the prompt, so the reply after a change processes the conversation again.

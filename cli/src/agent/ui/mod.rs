@@ -23,7 +23,7 @@ use crossterm::event::{
 };
 use crossterm::{execute, terminal};
 use manifatura::kit::Answer;
-use manifatura::{Abort, Event, Session, SessionId, ToolCall};
+use manifatura::{Abort, Event, Session, SessionId, SessionMeta, ToolCall};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::widgets::{Paragraph, Widget};
@@ -35,7 +35,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use self::logs::{LogLine, Logs};
 use self::view::{Activity, Item, Level, View, dim, tokens};
 use super::reasoning::{Effort, LEVELS};
-use super::{ChatOptions, Prepared};
+use super::{ChatOptions, Prepared, ago, recent_sessions};
 
 /// An approval the agent is waiting for.
 pub(crate) struct Ask {
@@ -48,7 +48,7 @@ const KEPT_LOG_LINES: usize = 200;
 /// The commands, their argument and what they do, for completion and `/help`.
 const COMMANDS: &[(&str, &str, &str)] = &[
     ("/new", "", "start a new session"),
-    ("/resume", "ID", "switch to another session"),
+    ("/resume", "[ID]", "pick a session or open it by ID"),
     ("/sessions", "", "list this directory's sessions"),
     ("/compact", "[focus]", "summarise older messages to make room"),
     ("/effort", "[level]", "how much the model reasons: off, none … max, or 0–0.99"),
@@ -101,7 +101,9 @@ struct App {
     /// The highlighted completion, while the input is a command being typed.
     picked: usize,
     /// This directory's sessions, for completing `/resume`.
-    sessions: Vec<String>,
+    sessions: Vec<SessionMeta>,
+    /// Selected row while the session picker is open.
+    resume_pick: Option<usize>,
     asks: VecDeque<Ask>,
     /// Set by a first Ctrl-C with nothing to stop; a second one quits.
     armed: bool,
@@ -122,7 +124,7 @@ struct App {
 }
 
 /// What a one-line input could complete to: the commands it begins, or after `/resume `, the sessions.
-fn completions(line: &str, sessions: &[String]) -> Vec<Completion> {
+fn completions(line: &str, sessions: &[SessionMeta]) -> Vec<Completion> {
     if !line.starts_with('/') {
         return Vec::new();
     }
@@ -143,9 +145,11 @@ fn completions(line: &str, sessions: &[String]) -> Vec<Completion> {
         let partial = partial.trim();
         return sessions
             .iter()
-            .filter(|id| id.starts_with(partial) && id.as_str() != partial)
+            .filter(|s| s.id.as_str().starts_with(partial) && s.id.as_str() != partial)
             .take(MAX_COMPLETIONS)
-            .map(|id| Completion { text: format!("/resume {id}"), label: id.clone(), about: String::new(), runs: true })
+            .map(|s| Completion {
+                text: format!("/resume {}", s.id.as_str()), label: s.id.as_str().into(), about: ago(s.updated), runs: true,
+            })
             .collect();
     }
     if line.contains(' ') {
@@ -161,17 +165,8 @@ fn completions(line: &str, sessions: &[String]) -> Vec<Completion> {
             },
             label: format!("{name} {argument}").trim_end().to_owned(),
             about: (*about).to_owned(),
-            runs: argument.is_empty(),
+            runs: argument.is_empty() || *name == "/resume",
         })
-        .collect()
-}
-
-/// The ids of this directory's sessions, most recent first.
-async fn session_ids(ready: &Prepared) -> Vec<String> {
-    super::session_lines(ready.store.as_ref())
-        .await
-        .into_iter()
-        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
         .collect()
 }
 
@@ -267,7 +262,10 @@ async fn screen(
                         app.view.apply(&event);
                         // A first turn is what puts a new session in the store.
                         if let (Event::TurnCompleted { .. }, Some(ready)) = (&event, &app.ready) {
-                            app.sessions = session_ids(ready).await;
+                            match recent_sessions(ready.store.as_ref()).await {
+                                Ok(sessions) => app.sessions = sessions,
+                                Err(error) => app.view.notice(Level::Warn, format!("Could not list sessions: {error}")),
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -347,6 +345,7 @@ impl App {
             log_button: None,
             picked: 0,
             sessions: Vec::new(),
+            resume_pick: None,
             asks: VecDeque::new(),
             armed: false,
             tick: 0,
@@ -373,7 +372,7 @@ impl App {
             self.view.notice(Level::Warn, problem.clone());
         }
         self.events = Some(session.subscribe());
-        self.sessions = session_ids(&prepared).await;
+        self.sessions = recent_sessions(prepared.store.as_ref()).await?;
         self.ready = Some(prepared);
         Ok(())
     }
@@ -394,7 +393,7 @@ impl App {
                     self.logs_open = !self.logs_open;
                 }
             }
-            Input::Paste(text) if self.asks.is_empty() => {
+            Input::Paste(text) if self.asks.is_empty() && self.resume_pick.is_none() => {
                 self.input.insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
             }
             _ => {}
@@ -420,6 +419,22 @@ impl App {
             if let Some(answer) = answer {
                 let ask = self.asks.pop_front().expect("checked");
                 let _ = ask.reply.send(answer);
+            }
+            return;
+        }
+        if let Some(selected) = self.resume_pick {
+            let last = self.sessions.len().saturating_sub(1);
+            match (key.code, ctrl) {
+                (KeyCode::Up, _) => self.resume_pick = Some(selected.saturating_sub(1)),
+                (KeyCode::Down, _) => self.resume_pick = Some((selected + 1).min(last)),
+                (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => self.resume_pick = None,
+                (KeyCode::Enter, _) => {
+                    self.resume_pick = None;
+                    if let Some(session) = self.sessions.get(selected) {
+                        self.resume(session.id.clone()).await;
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -616,22 +631,25 @@ impl App {
                 self.view.notice(Level::Info, format!("new session {}", session.id().as_str()));
                 self.switch(session);
             }
-            "/resume" if !argument.is_empty() => {
-                let id = SessionId::from(argument);
-                let known = ready.store_list().await;
-                if !known.contains(&id) {
-                    self.view.notice(Level::Warn, format!("no session {argument} here; /sessions lists them"));
-                    return;
-                }
-                let session = ready.runtime.session(&ready.agent, id);
-                match session.history().await {
-                    Ok(history) => {
-                        self.view.replay(&history);
-                        self.view.notice(Level::Info, format!("resumed session {argument} ({} messages)", history.len()));
+            "/resume" if !argument.is_empty() => self.resume(SessionId::from(argument)).await,
+            "/resume" | "/sessions" => {
+                match recent_sessions(ready.store.as_ref()).await {
+                    Err(error) => self.view.notice(Level::Error, format!("Could not list sessions: {error}")),
+                    Ok(sessions) => {
+                        self.sessions = sessions;
+                        if self.sessions.is_empty() {
+                            self.view.notice(Level::Info, "No sessions in this directory yet");
+                        } else if command == "/resume" {
+                            self.resume_pick = Some(0);
+                        } else {
+                            let current = ready.session.id();
+                            for row in &self.sessions {
+                                let mark = if &row.id == current { "● " } else { "  " };
+                                self.view.notice(Level::Info, format!("{mark}{}  {}", row.id.as_str(), ago(row.updated)));
+                            }
+                        }
                     }
-                    Err(error) => self.view.notice(Level::Error, error.to_string()),
                 }
-                self.switch(session);
             }
             "/mcp" => {
                 if ready.servers.is_empty() && ready.problems.is_empty() {
@@ -644,13 +662,6 @@ impl App {
                 }
                 for problem in &ready.problems {
                     self.view.notice(Level::Warn, problem.clone());
-                }
-            }
-            "/sessions" => {
-                let current = ready.session.id().clone();
-                for line in super::session_lines(ready.store.as_ref()).await {
-                    let mark = if line.starts_with(current.as_str()) { "● " } else { "  " };
-                    self.view.notice(Level::Info, format!("{mark}{line}"));
                 }
             }
             "/effort" if argument.is_empty() => {
@@ -686,6 +697,31 @@ impl App {
                 }
             }
             _ => self.view.notice(Level::Warn, format!("unknown command {command}; /help lists them")),
+        }
+    }
+
+    async fn resume(&mut self, id: SessionId) {
+        let Some(ready) = &self.ready else { return };
+        // Opening an unknown ID creates a session header. Recheck the store even for a picker selection.
+        match recent_sessions(ready.store.as_ref()).await {
+            Ok(sessions) if sessions.iter().any(|s| s.id == id) => {}
+            Ok(_) => {
+                self.view.notice(Level::Warn, format!("No session {} here; /resume lists them", id.as_str()));
+                return;
+            }
+            Err(error) => {
+                self.view.notice(Level::Error, format!("Could not list sessions: {error}"));
+                return;
+            }
+        }
+        let session = ready.runtime.session(&ready.agent, id);
+        match session.history().await {
+            Ok(history) => {
+                self.view.notice(Level::Info, format!("Resumed session {} ({} messages)", session.id().as_str(), history.len()));
+                self.view.replay(&history);
+                self.switch(session);
+            }
+            Err(error) => self.view.notice(Level::Error, format!("Could not resume session: {error}")),
         }
     }
 
@@ -790,9 +826,36 @@ mod tests {
         assert_eq!(app.text(), "draft\nsecond line");
     }
 
+    #[tokio::test]
+    async fn picker_scrolls_to_the_selection_and_escape_restores_input() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = loading_app();
+        app.sessions = (0..12).map(|i| SessionMeta {
+            id: SessionId::from(format!("session-{i:02}").as_str()), agent: None, updated: 0,
+        }).collect();
+        app.resume_pick = Some(0);
+        for _ in 0..20 {
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).await;
+        }
+        let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let rendered = term.backend().to_string();
+        assert!(rendered.contains("› session-11") && !rendered.contains("session-00"), "{rendered}");
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)).await;
+        assert_eq!(app.resume_pick, Some(10));
+        app.input(Input::Paste("ignored in picker".into())).await;
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        assert_eq!(app.resume_pick, None);
+        assert!(app.text().is_empty());
+    }
+
     #[test]
     fn commands_and_sessions_complete() {
-        let sessions = vec!["01a2-aaaa".to_owned(), "01b3-bbbb".to_owned()];
+        let sessions = ["01a2-aaaa", "01b3-bbbb"].map(|id| SessionMeta {
+            id: SessionId::from(id), updated: 0, agent: None,
+        });
         let names = |line: &str| -> Vec<String> { completions(line, &sessions).into_iter().map(|c| c.text).collect() };
         assert_eq!(names("/re"), ["/resume "]);
         assert_eq!(names("/s"), ["/sessions", "/status"]);

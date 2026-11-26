@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use tracing::Level as LogLevel;
 
 use super::view::{clip, copper, dim, tokens, tool_summary};
-use super::{Activity, App, Ask, LOG_BUTTON, LOG_PANEL, SPINNER, text};
+use super::{Activity, App, Ask, LOG_BUTTON, LOG_PANEL, SPINNER, ago, text};
 
 /// Take rows from the top of the remaining area.
 fn take(area: &mut Rect, count: u16) -> Rect {
@@ -39,6 +39,10 @@ fn approval(ask: &Ask, width: usize, height: usize) -> Vec<Line<'static>> {
 impl App {
     pub(super) fn draw(&mut self, f: &mut Frame) {
         let mut rows = f.area();
+        if let Some(selected) = self.resume_pick && self.asks.is_empty() {
+            self.draw_sessions(f, rows, selected);
+            return;
+        }
         let width = rows.width as usize;
         // Budget the editor or approval first. Suggestions and logs only use spare rows.
         let question = self.asks.front().map(|ask| approval(ask, width, rows.height as usize));
@@ -92,6 +96,27 @@ impl App {
             }
         }
         self.draw_footer(f, take(&mut rows, footer));
+    }
+
+    fn draw_sessions(&mut self, f: &mut Frame, mut rows: Rect, selected: usize) {
+        self.log_button = None;
+        f.render_widget(Line::styled("Resume a session", copper()), take(&mut rows, 1));
+        let count = usize::from(rows.height.saturating_sub(1));
+        let first = (selected + 1).saturating_sub(count);
+        let current = self.ready.as_ref().map(|ready| ready.session.id());
+        for (i, session) in self.sessions.iter().enumerate().skip(first).take(count) {
+            let (mark, style) = if selected == i { ("› ", copper()) } else { ("  ", Style::new()) };
+            let current = if current == Some(&session.id) { " · current" } else { "" };
+            let age = format!("  {}{current}", ago(session.updated));
+            let available = (rows.width as usize).saturating_sub(2 + age.len());
+            let row = Line::from(vec![
+                Span::styled(mark, style),
+                Span::styled(clip(session.id.as_str(), available), style),
+                Span::styled(age, dim()),
+            ]);
+            f.render_widget(row, take(&mut rows, 1));
+        }
+        f.render_widget(Line::styled("↑↓ select · Enter resume · Esc cancel", dim()), take(&mut rows, 1));
     }
 
     fn draw_composer(&mut self, f: &mut Frame, area: Rect) {

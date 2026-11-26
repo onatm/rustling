@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use manifatura::kit::context::{ContextFiles, SystemPrompt};
 use manifatura::kit::{self, Answer, Summarizer};
 use manifatura::store::JsonlStore;
-use manifatura::{Agent, Hooks, Message, Runtime, Session, SessionId, Store, ToolCall, hook};
+use manifatura::{Agent, Hooks, Message, Runtime, Session, SessionId, SessionMeta, Store, ToolCall, hook};
 use rustling::engine::{Client, EngineOptions, Usage};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -52,11 +52,13 @@ pub(crate) fn chat(model_dir: &Path, engine: EngineOptions, options: ChatOptions
     let store = Arc::new(JsonlStore::new(sessions_dir(&cwd)?)?);
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     if options.resume == Some(None) {
-        let lines = runtime.block_on(session_lines(store.as_ref()));
-        if lines.is_empty() {
+        let sessions = runtime.block_on(recent_sessions(store.as_ref()))?;
+        if sessions.is_empty() {
             println!("No sessions in this directory yet.");
         }
-        lines.iter().for_each(|line| println!("{line}"));
+        for session in sessions {
+            println!("{}  {}", session.id.as_str(), ago(session.updated));
+        }
         return Ok(());
     }
     use std::io::IsTerminal;
@@ -103,12 +105,6 @@ pub(crate) struct Prepared {
     pub(crate) servers: Vec<(String, Vec<String>, bool)>,
     /// What went wrong starting the others.
     pub(crate) problems: Vec<String>,
-}
-
-impl Prepared {
-    pub(crate) async fn store_list(&self) -> Vec<SessionId> {
-        self.store.list().await.map(|sessions| sessions.into_iter().map(|s| s.id).collect()).unwrap_or_default()
-    }
 }
 
 /// Builds the agent over the engine: its tools, instructions and hooks, the runtime, and the session to open.
@@ -235,11 +231,11 @@ fn slug(path: &Path) -> String {
     slug.trim_matches('-').to_owned()
 }
 
-/// This directory's sessions, most recent first: `<id>  <how long ago>`.
-pub(crate) async fn session_lines(store: &dyn Store) -> Vec<String> {
-    let mut sessions = store.list().await.unwrap_or_default();
+/// The same recency ordering for the picker, completions and the command-line listing.
+async fn recent_sessions(store: &dyn Store) -> Result<Vec<SessionMeta>> {
+    let mut sessions = store.list().await?;
     sessions.sort_by_key(|s| std::cmp::Reverse(s.updated));
-    sessions.into_iter().map(|s| format!("{}  {}", s.id.as_str(), ago(s.updated))).collect()
+    Ok(sessions)
 }
 
 /// How long ago a time in milliseconds since the epoch was, roughly.
