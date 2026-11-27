@@ -64,11 +64,36 @@ to rustling instead of scrolling the terminal, and selecting text needs the modi
 
 ## Chat commands
 
-Typing `/` lists the commands: `/mcp` lists the MCP servers, `/new` starts a new session, `/resume` opens a picker ordered by last activity (↑/↓ to select, Enter to resume, Esc to cancel),
+Typing `/` lists the commands: `/mcp` lists the MCP servers, `/skills` lists the skills, `/new` starts a new session, `/resume` opens a picker ordered by last activity (↑/↓ to select, Enter to resume, Esc to cancel),
 `/resume ID` switches directly, `/sessions` lists them, `/compact [focus]`
 summarises older messages to make room, `/effort` shows or sets how much the model reasons, and `/exit` quits.
 `/effort off` stops the reasoning altogether, as `--no-reasoning` does, and `/effort high` (or any level) brings
 it back. The effort is part of the prompt, so the reply after a change processes the conversation again.
+
+## Skills
+
+A skill is a set of instructions for one kind of task, in the [Agent Skills](https://agentskills.io) format: a
+directory with a `SKILL.md`. The prompt lists each skill's name and description. When a task matches one, the
+model loads its instructions with the `skill` tool, which never asks for approval.
+
+Rustling has one skill built in, `codebase-tour` ([its instructions](skills/codebase-tour/SKILL.md)), for questions
+about how a project fits together. A project adds its own under `.rustling/skills/<name>/SKILL.md`, in the
+repository root or any directory down to the current one. A project skill with the same name as a built-in one
+replaces it. Rustling reads only these two sources: not `.agents/skills`, and no skills from your home directory.
+
+```markdown
+---
+name: release
+description: Prepare a release. Use when asked to cut, tag or announce a release.
+---
+
+1. Read CHANGELOG.md and list what changed since the last version.
+2. …
+```
+
+Start a skill yourself with `/name`, and add a request after it: `/codebase-tour how do sessions resume?`. Its
+instructions go to the model with your message. `/skills` lists the skills and where each comes from, and
+`/status` names them. Skills are read when the chat starts, so a new or changed skill applies from the next one.
 
 ## Reasoning
 

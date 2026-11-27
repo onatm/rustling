@@ -1932,13 +1932,14 @@ checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
 name = "manifatura"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09006a1a043a0fb29887f3c9bc82e63717091cbe9f25445813f554dc7c4f1f8f"
+checksum = "6ed58b760b63edd12a7abbd89398489c919a8c5034c5ba1227ce66a11b1de2ff"
 dependencies = [
  "manifatura-agent",
  "manifatura-kit",
  "manifatura-mcp",
+ "manifatura-skills",
  "manifatura-store",
  "manifatura-tools",
  "schemars",
@@ -1947,9 +1948,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-agent"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1981751ea24b7d26c9f26399ebc5faf490ea14964c5850cabe12facc7b3866e2"
+checksum = "0fd8eea040044c06dd220f88d4e9e2bf6f9b33e087889197eec4f5f21702abc2"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1961,9 +1962,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-kit"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "041cbea9adaefad73e6fc162ccb94ab4f4ceaff86248d2c48d210f33b708c36b"
+checksum = "ca21bfd21c7349682a850e0e8abd2c9e9ac66a3ccd3bca28c51655ee25560ed4"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1975,9 +1976,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-mcp"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7faf8680025a5facd604883f9d1174e0bb4ad1c9ca2048406c6c60c69c22a47a"
+checksum = "8beb3e60cb8ab76b39a7d6661533d4becdfeccc2ce3bf62366556d478e6ddf0e"
 dependencies = [
  "manifatura-agent",
  "reqwest",
@@ -1989,10 +1990,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "manifatura-store"
-version = "0.1.0"
+name = "manifatura-skills"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81c43d251fb9fdd7830d820914c477e9d64dfbe5e03dfc45a1b74cf33e8be923"
+checksum = "7afab4b83d52a4061fc8d5e4dff19b6fdbaa69223e83ff45a48303ec714570d5"
+dependencies = [
+ "manifatura-agent",
+ "manifatura-kit",
+ "serde",
+ "serde_json",
+ "serde_norway",
+]
+
+[[package]]
+name = "manifatura-store"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8625e5b27ff74e517672efd3f7bb9db6c3bba1e4bc0201ce3baf388af04ec8b1"
 dependencies = [
  "async-trait",
  "manifatura-agent",
@@ -2002,9 +2016,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-tools"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1247fa288365b5915518f6a7ed3300eefb97cdaf9092162e2441e7ff1fa01975"
+checksum = "7781b68a16c822de19e910dfd466baada424038454b82417c67ba20dde41248a"
 dependencies = [
  "async-trait",
  "globset",
@@ -3338,6 +3352,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_norway"
+version = "0.9.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e408f29489b5fd500fab51ff1484fc859bb655f32c671f307dcd733b72e8168c"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml-norway",
+]
+
+[[package]]
 name = "serde_path_to_error"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4173,6 +4200,12 @@ name = "unit-prefix"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
+
+[[package]]
+name = "unsafe-libyaml-norway"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b39abd59bf32521c7f2301b52d05a6a2c975b6003521cbd0c6dc1582f0a22104"
 
 [[package]]
 name = "untrusted"

@@ -23,6 +23,7 @@ use crossterm::event::{
 use crossterm::{execute, terminal};
 use self::screen::ChatScreen;
 use manifatura::kit::Answer;
+use manifatura::skills::Skill;
 use manifatura::{Abort, Event, Session, SessionId, SessionMeta};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -48,6 +49,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/status", "", "show model, session and token statistics"),
     ("/tools", "", "show tool output from the current or last turn"),
     ("/mcp", "", "the MCP servers and their tools"),
+    ("/skills", "", "the skills; start one with /name [request]"),
     ("/help", "", "what the keys and commands do"),
     ("/exit", "", "quit"),
 ];
@@ -118,8 +120,8 @@ struct App {
     yes: bool,
 }
 
-/// What a one-line input could complete to: the commands it begins, or after `/resume `, the sessions.
-fn completions(line: &str, sessions: &[SessionMeta]) -> Vec<Completion> {
+/// What a one-line input could complete to: the commands and skills it begins, or after `/resume `, the sessions.
+fn completions(line: &str, sessions: &[SessionMeta], skills: &[Skill]) -> Vec<Completion> {
     if !line.starts_with('/') {
         return Vec::new();
     }
@@ -162,7 +164,24 @@ fn completions(line: &str, sessions: &[SessionMeta]) -> Vec<Completion> {
             about: (*about).to_owned(),
             runs: argument.is_empty() || *name == "/resume",
         })
+        .chain(
+            skills
+                .iter()
+                .map(|skill| (format!("/{}", skill.name), skill))
+                .filter(|(name, _)| name.starts_with(line) && !is_command(name))
+                .map(|(name, skill)| Completion {
+                    text: format!("{name} "),
+                    label: format!("{name} [request]"),
+                    about: skill.description.clone(),
+                    runs: false,
+                }),
+        )
         .collect()
+}
+
+/// Whether `name` is one of the chat's own commands, which come before a skill of the same name.
+fn is_command(name: &str) -> bool {
+    matches!(name, "/quit") || COMMANDS.iter().any(|(command, ..)| *command == name)
 }
 
 /// Runs the screen until the person quits. Returns the engine, so the caller can shut it down once the runtime
@@ -519,7 +538,10 @@ impl App {
             }).collect();
         }
         match (self.input.lines(), self.asks.is_empty() && !self.completions_hidden) {
-            ([line], true) => completions(line, &self.sessions),
+            ([line], true) => {
+                let skills = self.ready.as_ref().map_or(&[][..], |ready| ready.skills.skills());
+                completions(line, &self.sessions, skills)
+            }
             _ => Vec::new(),
         }
     }
@@ -570,19 +592,24 @@ impl App {
         if text.starts_with('/') {
             return self.command(&text).await;
         }
+        self.send(text.clone(), text).await;
+    }
+
+    /// Sends `text` to the agent, shown as `shown`: as a new turn, or while it works, before its next step.
+    async fn send(&mut self, shown: String, text: String) {
         let Some(ready) = &self.ready else {
             self.view.notice(Level::Info, "the model is still loading");
             return;
         };
         if self.view.is_busy() {
             // Sent while the agent works: it reads it before its next step.
-            match ready.session.steer(text.clone()) {
-                true => self.view.push(Item::User(format!("{text}  (sent while working)"))),
+            match ready.session.steer(text) {
+                true => self.view.push(Item::User(format!("{shown}  (sent while working)"))),
                 false => self.view.notice(Level::Warn, "could not send that while the agent works"),
             }
             return;
         }
-        self.view.push(Item::User(text.clone()));
+        self.view.push(Item::User(shown));
         match ready.session.prompt(text).await {
             Ok(turn) => {
                 self.abort = Some(turn.abort_handle());
@@ -629,6 +656,10 @@ impl App {
         if self.view.is_busy() {
             self.view.notice(Level::Info, format!("{command} waits until the agent is done"));
             return;
+        }
+        let skill = command.strip_prefix('/').filter(|name| !is_command(command) && ready.skills.get(name).is_some());
+        if let Some(name) = skill {
+            return self.start_skill(name, argument, line).await;
         }
         match command {
             "/new" => {
@@ -702,8 +733,29 @@ impl App {
                     Err(error) => self.view.notice(Level::Error, format!("could not compact: {error}")),
                 }
             }
+            "/skills" => {
+                if ready.skills.is_empty() {
+                    self.view.notice(Level::Info, format!("no skills; add them to {}/<name>/SKILL.md", super::PROJECT_SKILLS));
+                }
+                for skill in ready.skills.skills() {
+                    let from = skill.path().map_or_else(|| "built in".to_owned(), |path| path.display().to_string());
+                    self.view.notice(Level::Info, format!("/{}  {}  ({from})", skill.name, skill.description));
+                }
+            }
             _ => self.view.notice(Level::Warn, format!("unknown command {command}; /help lists them")),
         }
+    }
+
+    /// Starts the skill `name` from `/name request`: its instructions go to the agent ahead of the request, so it
+    /// needs no step to load them. The transcript shows what was typed.
+    async fn start_skill(&mut self, name: &str, request: &str, line: &str) {
+        let Some(ready) = &self.ready else { return };
+        let Some(instructions) = ready.skills.activation(name, ready.env.as_ref()).await else { return };
+        let request = match request {
+            "" => format!("Use the {name} skill."),
+            request => request.to_owned(),
+        };
+        self.send(line.to_owned(), format!("{instructions}\n\n{request}")).await;
     }
 
     async fn resume(&mut self, id: SessionId) {
@@ -782,6 +834,9 @@ impl App {
             parts.push(format!("session {id}"));
             for path in &ready.files {
                 parts.push(format!("instructions from {}", path.display()));
+            }
+            if !ready.skills.is_empty() {
+                parts.push(format!("skills: {}", ready.skills.names().join(", ")));
             }
         }
         parts.join("\n")
@@ -996,15 +1051,28 @@ mod tests {
         let sessions = ["01a2-aaaa", "01b3-bbbb"].map(|id| SessionMeta {
             id: SessionId::from(id), updated: 0, agent: None,
         });
-        let names = |line: &str| -> Vec<String> { completions(line, &sessions).into_iter().map(|c| c.text).collect() };
+        let names = |line: &str| -> Vec<String> { completions(line, &sessions, &[]).into_iter().map(|c| c.text).collect() };
         assert_eq!(names("/re"), ["/resume "]);
-        assert_eq!(names("/s"), ["/sessions", "/status"]);
+        assert_eq!(names("/s"), ["/sessions", "/status", "/skills"]);
         assert_eq!(names("/"), COMMANDS.iter().map(|(n, a, _)| if a.is_empty() { n.to_string() } else { format!("{n} ") }).collect::<Vec<_>>());
         assert_eq!(names("/resume 01b"), ["/resume 01b3-bbbb"]);
         assert_eq!(names("/resume 01a2-aaaa"), Vec::<String>::new(), "a complete id needs no completing");
         assert!(names("hello").is_empty() && names("/compact focus").is_empty());
-        assert!(completions("/new", &sessions)[0].runs && !completions("/compact", &sessions)[0].runs);
+        assert!(completions("/new", &sessions, &[])[0].runs && !completions("/compact", &sessions, &[])[0].runs);
         assert_eq!(names("/effort o"), ["/effort off"]);
         assert_eq!(names("/effort m").len(), 3, "medium, minimal and max");
+    }
+
+    #[test]
+    fn skills_complete_after_the_commands_they_do_not_shadow() {
+        let skill = |name: &str| {
+            Skill::parse(&format!("---\nname: {name}\ndescription: About {name}.\n---\nBody.")).unwrap()
+        };
+        let skills = [skill("codebase-tour"), skill("status")];
+        let found = completions("/", &[], &skills);
+        let tour = found.iter().find(|c| c.text == "/codebase-tour ").expect("the skill is offered");
+        assert!(!tour.runs && tour.about == "About codebase-tour.");
+        assert_eq!(found.iter().filter(|c| c.text.starts_with("/status")).count(), 1, "the command wins");
+        assert_eq!(completions("/co", &[], &skills).iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["/compact ", "/codebase-tour "]);
     }
 }

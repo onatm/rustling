@@ -314,7 +314,7 @@ impl View {
             }
             for content in &message.content {
                 match (message.role, content) {
-                    (Role::User, Content::Text { text }) => self.push(Item::User(text.clone())),
+                    (Role::User, Content::Text { text }) => self.push(Item::User(typed(text))),
                     (Role::Assistant, Content::Text { text }) if !text.trim().is_empty() => {
                         self.push(Item::Assistant(text.clone()))
                     }
@@ -454,8 +454,29 @@ pub(crate) fn tokens(n: u64) -> String {
     }
 }
 
+/// What the person typed for a user message: a skill started with `/name request` was sent as the skill's
+/// instructions and then the request, and shows as the command again.
+fn typed(text: &str) -> String {
+    let Some(rest) = text.strip_prefix("<skill_content name=\"") else { return text.to_owned() };
+    let (Some((name, _)), Some((_, request))) = (rest.split_once('"'), rest.split_once("</skill_content>\n\n")) else {
+        return text.to_owned();
+    };
+    match request == format!("Use the {name} skill.") {
+        true => format!("/{name}"),
+        false => format!("/{name} {request}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_skill_message_replays_as_its_command() {
+        let sent = "<skill_content name=\"codebase-tour\">\nBody.\n</skill_content>\n\n";
+        assert_eq!(super::typed(&format!("{sent}how does chat work?")), "/codebase-tour how does chat work?");
+        assert_eq!(super::typed(&format!("{sent}Use the codebase-tour skill.")), "/codebase-tour");
+        assert_eq!(super::typed("hello"), "hello");
+    }
+
     use super::*;
     use manifatura::Usage;
     use serde_json::json;

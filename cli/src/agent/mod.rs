@@ -2,8 +2,8 @@
 //!
 //! The engine runs on its own thread; [`LocalProvider`] hands it the agent's requests. The agent has three
 //! tools (`read`, `grep`, `glob`), each asking before it runs, a system prompt built from the `AGENTS.md` files of the working directory and
-//! the tools' own guidelines, and sessions kept as JSON lines, so a conversation can be resumed later. The screen
-//! is in [`ui`].
+//! the tools' own guidelines, skills (built in, and the project's `.rustling/skills`) behind a `skill` tool, and sessions kept as JSON
+//! lines, so a conversation can be resumed later. The screen is in [`ui`].
 
 pub(crate) mod mcp;
 mod provider;
@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use manifatura::kit::context::{ContextFiles, SystemPrompt};
+use manifatura::skills::{Skill, SkillSet, Skills, SystemPromptExt};
 use manifatura::kit::{self, Answer, Summarizer};
 use manifatura::store::JsonlStore;
 use manifatura::{Agent, Hooks, Message, Runtime, Session, SessionId, SessionMeta, Store, ToolCall, hook};
@@ -30,6 +31,13 @@ const BASE: &str = include_str!("system.md");
 
 /// The tools the agent registers, from manifatura's built-ins. Each asks before it runs, unless `--yes`.
 const TOOLS: &[&str] = &["read", "grep", "glob"];
+
+/// The skills built into rustling, as `SKILL.md` text. A project skill of the same name replaces one.
+const BUILTIN_SKILLS: &[&str] = &[include_str!("skills/codebase-tour/SKILL.md")];
+
+/// Where a project keeps its skills, searched in each directory from the repository root down to the working
+/// directory. Rustling reads only its own skills: not `.agents/skills`, and none from the home directory.
+const PROJECT_SKILLS: &str = ".rustling/skills";
 
 pub(crate) struct ChatOptions {
     /// Text added to the system prompt, after the context files.
@@ -101,6 +109,10 @@ pub(crate) struct Prepared {
     pub(crate) reasoning: reasoning::Reasoning,
     /// The instruction files the prompt includes.
     pub(crate) files: Vec<PathBuf>,
+    /// The skills the prompt lists, which `/name` also starts.
+    pub(crate) skills: SkillSet,
+    /// Where the tools act, which a skill started with `/name` is read through.
+    pub(crate) env: Arc<manifatura::tools::Local>,
     /// The MCP servers that started, with their tools' names and whether those are offered directly.
     pub(crate) servers: Vec<(String, Vec<String>, bool)>,
     /// What went wrong starting the others.
@@ -118,7 +130,7 @@ pub(crate) async fn prepare(
     started: Vec<Result<mcp::Started, String>>,
 ) -> Result<Prepared> {
     let window = client.context();
-    let env = manifatura::tools::Local::new(cwd)?;
+    let env = Arc::new(manifatura::tools::Local::new(cwd)?);
     let mut tools = manifatura::tools::by_name(TOOLS).map_err(anyhow::Error::msg)?;
     // The tools that ask: the built-ins, and those of servers configured with `approve`.
     let mut asking: Vec<String> = TOOLS.iter().map(|&name| name.to_owned()).collect();
@@ -148,7 +160,11 @@ pub(crate) async fn prepare(
         files = files.home(home);
     }
     let files = files.load(&env).await;
-    let mut prompt = SystemPrompt::new(BASE.trim()).tools(&tools).context_files(&files);
+    let skills = load_skills(&env).await?;
+    problems.extend(skills.warnings().iter().cloned());
+    // The skill tool only reads skills already loaded, so it never asks.
+    tools.extend(skills.tool());
+    let mut prompt = SystemPrompt::new(BASE.trim()).tools(&tools).context_files(&files).skills(&skills);
     if let Some(system) = &options.system {
         prompt = prompt.section(system);
     }
@@ -181,7 +197,7 @@ pub(crate) async fn prepare(
 
     let reasoning = reasoning::Reasoning::new(options.effort.clone());
     let provider = LocalProvider::new(client, reasoning.clone(), options.max_tokens, stats);
-    let runtime = Runtime::builder().provider(provider).store(store.clone()).env(env).build();
+    let runtime = Runtime::builder().provider(provider).store(store.clone()).env(env.clone()).build();
 
     let known = store.list().await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let id = match (&options.resume, options.resume_latest) {
@@ -204,7 +220,19 @@ pub(crate) async fn prepare(
         false => Vec::new(),
     };
     let files = files.into_iter().map(|file| file.path).collect();
-    Ok(Prepared { runtime, agent, session, history, store, summarizer, reasoning, files, servers, problems })
+    Ok(Prepared { runtime, agent, session, history, store, summarizer, reasoning, files, skills, env, servers, problems })
+}
+
+/// The built-in skills, then the project's, which take precedence.
+async fn load_skills(env: &dyn manifatura::Env) -> Result<SkillSet> {
+    let mut skills = Skills::new().project(PROJECT_SKILLS);
+    for text in BUILTIN_SKILLS {
+        skills = skills.builtin(Skill::parse(text).map_err(anyhow::Error::msg).context("a built-in skill")?);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        skills = skills.home(home);
+    }
+    Ok(skills.load(env).await)
 }
 
 /// Where this directory's sessions are kept: `rustling/sessions/<directory>` under `$XDG_DATA_HOME`, or under
@@ -286,6 +314,40 @@ fn cap(output: &str, max: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_built_in_skills_parse() {
+        for text in BUILTIN_SKILLS {
+            let skill = Skill::parse(text).unwrap();
+            assert!(text.contains(&format!("name: {}\n", skill.name)));
+        }
+    }
+
+    #[tokio::test]
+    async fn project_skills_join_and_replace_the_built_in_ones() {
+        let root = std::env::temp_dir().join(format!("rustling-skills-{}", std::process::id()));
+        let skill = |name: &str, description: &str| {
+            let dir = root.join(PROJECT_SKILLS).join(name);
+            std::fs::create_dir_all(dir.join("references")).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\ndescription: {description}\n---\nSteps.\n")).unwrap();
+            std::fs::write(dir.join("references/notes.md"), "notes").unwrap();
+        };
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        skill("codebase-tour", "The project's own tour.");
+        skill("release", "Cut a release.");
+        // The convention's directory is not rustling's: it is left alone.
+        std::fs::create_dir_all(root.join(".agents/skills/other")).unwrap();
+        std::fs::write(root.join(".agents/skills/other/SKILL.md"), "---\nname: other\ndescription: x\n---\n").unwrap();
+
+        let env = manifatura::tools::Local::new(&root).unwrap();
+        let skills = load_skills(&env).await.unwrap();
+        assert_eq!(skills.names(), ["codebase-tour", "release"]);
+        assert_eq!(skills.get("codebase-tour").unwrap().description, "The project's own tour.");
+        assert_eq!(skills.warnings().len(), 1, "the built-in tour is hidden: {:?}", skills.warnings());
+        let text = skills.activation("release", &env).await.unwrap();
+        assert!(text.contains("Steps.") && text.contains("<file>references/notes.md</file>"), "{text}");
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn a_directory_becomes_a_slug() {
