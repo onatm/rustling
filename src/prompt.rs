@@ -60,6 +60,18 @@ impl Prompter {
         }
     }
 
+    /// The tokens that open a tool call, in JSON or in text.
+    pub fn tool_call_tokens(&self) -> Result<Vec<u32>> {
+        let mut tokens = Vec::new();
+        for marker in ["<|content_invoke_tool_json|>", "<|content_invoke_tool_text|>"] {
+            match self.encode(marker)?[..] {
+                [token] => tokens.push(token),
+                _ => return Err(anyhow!("the tokenizer does not have a single token for {marker}")),
+            }
+        }
+        Ok(tokens)
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self.tokenizer.encode(text, false).map_err(|e| anyhow!("tokenizing: {e}"))?;
         Ok(encoding.get_ids().to_vec())

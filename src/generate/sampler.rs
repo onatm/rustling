@@ -24,8 +24,8 @@ impl Default for SamplerConfig {
 pub struct Sampler {
     config: SamplerConfig,
     rng: StdRng,
-    /// A token that is never chosen, whatever its logit.
-    banned: Option<u32>,
+    /// Tokens that are never chosen, whatever their logits.
+    banned: Vec<u32>,
     scratch: Scratch,
 }
 
@@ -42,18 +42,18 @@ impl Sampler {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => rand::make_rng(),
         };
-        Self { config, rng, banned: None, scratch: Scratch::default() }
+        Self { config, rng, banned: Vec::new(), scratch: Scratch::default() }
     }
 
-    /// The same sampler, never choosing `token`. This is how reasoning is switched off: the token that opens a
-    /// reasoning block is taken out, and the model goes on to its next choice, an answer or a tool call.
+    /// The same sampler, never choosing `token` either. This is how reasoning and tool calls are switched off: the
+    /// token that opens a reasoning block or a tool call is taken out, and the model goes on to its next choice.
     pub fn without(mut self, token: u32) -> Self {
-        self.banned = Some(token);
+        self.banned.push(token);
         self
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
-        match self.scratch.candidates(self.config, self.banned, logits) {
+        match self.scratch.candidates(self.config, &self.banned, logits) {
             Candidates::Greedy(token) => token,
             Candidates::Dense(weights) => draw(&mut self.rng, in_order(weights)),
             Candidates::Weighted(candidates) => draw(&mut self.rng, candidates.iter().copied()),
@@ -65,7 +65,7 @@ impl Sampler {
     /// the proposal is kept with the probability sampling would have given it, and otherwise the replacement
     /// is drawn from the remaining tokens.
     pub fn verify(&mut self, logits: &[f32], proposed: u32) -> Verdict {
-        match self.scratch.candidates(self.config, self.banned, logits) {
+        match self.scratch.candidates(self.config, &self.banned, logits) {
             Candidates::Greedy(token) if token == proposed => Verdict::Accepted,
             Candidates::Greedy(token) => Verdict::Replaced(token),
             Candidates::Dense(weights) => {
@@ -111,15 +111,23 @@ fn draw(rng: &mut StdRng, candidates: impl Iterator<Item = (u32, f64)> + Clone) 
 
 impl Scratch {
     /// The tokens sampling can choose from, with unnormalised probabilities, after temperature, top-k and top-p.
-    fn candidates(&mut self, config: SamplerConfig, banned: Option<u32>, logits: &[f32]) -> Candidates<'_> {
+    fn candidates(&mut self, config: SamplerConfig, banned: &[u32], logits: &[f32]) -> Candidates<'_> {
         let SamplerConfig { temperature, top_k, top_p } = config;
         let without_banned;
-        let logits = match banned.filter(|&token| (token as usize) < logits.len()) {
-            Some(token) => {
-                without_banned = { let mut copy = logits.to_vec(); copy[token as usize] = f32::NEG_INFINITY; copy };
+        let logits = match banned.iter().any(|&token| (token as usize) < logits.len()) {
+            true => {
+                without_banned = {
+                    let mut copy = logits.to_vec();
+                    for &token in banned {
+                        if let Some(logit) = copy.get_mut(token as usize) {
+                            *logit = f32::NEG_INFINITY;
+                        }
+                    }
+                    copy
+                };
                 &without_banned[..]
             }
-            None => logits,
+            false => logits,
         };
         let descending = |a: &u32, b: &u32| logits[*b as usize].total_cmp(&logits[*a as usize]);
         if temperature <= 0.0 || top_k == 1 {
@@ -213,6 +221,8 @@ mod tests {
         assert_eq!(greedy.verify(&logits, 1), Verdict::Replaced(3));
         let mut sampled = Sampler::new(SamplerConfig::default(), Some(1)).without(1);
         assert!((0..2_000).all(|_| sampled.sample(&logits) != 1));
+        let mut both = Sampler::new(SamplerConfig { temperature: 0.0, ..Default::default() }, Some(1)).without(1).without(3);
+        assert_eq!(both.sample(&logits), 0);
     }
 
     #[test]

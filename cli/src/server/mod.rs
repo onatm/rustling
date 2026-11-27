@@ -57,6 +57,8 @@ struct ChatRequest {
     /// A level name or a number, passed to the chat template.
     reasoning_effort: Option<Value>,
     stop: Option<StopSequences>,
+    /// `"none"` keeps the reply from calling tools; anything else leaves it to the model.
+    tool_choice: Option<Value>,
 }
 
 impl ChatRequest {
@@ -72,6 +74,7 @@ impl ChatRequest {
             reasoning_effort: self.reasoning_effort,
             cancel: Default::default(),
             no_reasoning: false,
+            no_tool_calls: self.tool_choice.as_ref().and_then(Value::as_str) == Some("none"),
             stop: match self.stop {
                 None => vec![],
                 Some(StopSequences::One(stop)) => vec![stop],
@@ -313,6 +316,20 @@ mod tests {
         // Images are refused, as in the chat endpoint.
         let image = json!({ "input": [{ "role": "user", "content": [{ "type": "input_image", "image_url": "x" }] }] });
         assert!(chat_from_responses(&image).is_err());
+    }
+
+    #[test]
+    fn tool_choice_none_keeps_the_reply_from_calling_tools() {
+        let request = |choice: Value| -> Request {
+            let body = json!({ "messages": [{ "role": "user", "content": "hi" }], "tools": [], "tool_choice": choice });
+            serde_json::from_value::<ChatRequest>(body).unwrap().into_request()
+        };
+        assert!(request(json!("none")).no_tool_calls);
+        assert!(!request(json!("auto")).no_tool_calls);
+        assert!(!request(json!({ "type": "function", "function": { "name": "f" } })).no_tool_calls);
+        assert!(!request(Value::Null).no_tool_calls);
+        let (chat, _) = chat_from_responses(&json!({ "input": "hi", "tool_choice": "none" })).unwrap();
+        assert!(chat.into_request().no_tool_calls);
     }
 
     #[test]

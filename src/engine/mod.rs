@@ -95,6 +95,9 @@ pub struct Request {
     /// Keep this reply from reasoning at all, as [`EngineOptions::no_reasoning`] does for every reply: the
     /// model cannot open a reasoning block. The effort is `"none"` unless the request gives one.
     pub no_reasoning: bool,
+    /// Keep this reply from calling tools: the tokens that open a tool call are never chosen, so the model answers in
+    /// text. The tools stay declared, so the prompt is the same as with them.
+    pub no_tool_calls: bool,
     /// Text that ends the reply where it first appears; it is not sent.
     pub stop: Vec<String>,
     /// Stops the request where it is, queued, processing its prompt or generating, once set.

@@ -129,6 +129,7 @@ pub(crate) fn chat_from_responses(body: &Value) -> Result<(ChatRequest, Vec<Stri
         seed: None,
         reasoning_effort: Some(body["reasoning"]["effort"].clone()).filter(|effort| !effort.is_null()),
         stop: None,
+        tool_choice: Some(body["tool_choice"].clone()).filter(|choice| !choice.is_null()),
     };
     Ok((request, custom))
 }

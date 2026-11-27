@@ -116,6 +116,11 @@ pub(super) fn handle(
     if no_reasoning {
         sampler = sampler.without(prompter.reasoning_token()?);
     }
+    if request.no_tool_calls {
+        for token in prompter.tool_call_tokens()? {
+            sampler = sampler.without(token);
+        }
+    }
     let mut generated: Vec<u32> = Vec::new();
     let (mut reasoning_sent, mut content_sent, mut calls_sent) = (0, 0, 0);
     let mut hit_stop = false;
