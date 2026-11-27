@@ -1932,7 +1932,9 @@ checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
 name = "manifatura"
-version = "0.2.1"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5ea48412a35da73e64cbfa3a3f59bb4a748ad48a6de717d250978950f2d1c2"
 dependencies = [
  "manifatura-agent",
  "manifatura-kit",
@@ -1947,7 +1949,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-agent"
-version = "0.2.1"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68abddb1cb6d220e3e0c15816ade4bbe9a80c9f2afb1138e31bc63485c856386"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1959,7 +1963,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-kit"
-version = "0.2.1"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffa9d99b9a408d278f29df2d2dad0803bc61b7007d241a5d9ea78f318312f823"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1971,7 +1977,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-mcp"
-version = "0.2.1"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3543cd79979105afdb93c7d8853d46948266e93f1deb24b9a6d9797b7c0463e5"
 dependencies = [
  "manifatura-agent",
  "reqwest",
@@ -1984,7 +1992,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-skills"
-version = "0.2.1"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff6d2b931dc991ea69ee014bf090ee1c3b30d97112dddcec6cf94e31781b6275"
 dependencies = [
  "manifatura-agent",
  "manifatura-kit",
@@ -1995,7 +2005,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-store"
-version = "0.2.1"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "387b4c123e321bea52199d02eb23002f21833138d7b1e653b42fbbb6421de9a8"
 dependencies = [
  "async-trait",
  "manifatura-agent",
@@ -2005,7 +2017,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-subagents"
-version = "0.2.1"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c47e91481f963100a1f15b8e3006339f4ef5fe6f8416417173c31249441eb534"
 dependencies = [
  "async-trait",
  "manifatura-agent",
@@ -2018,7 +2032,9 @@ dependencies = [
 
 [[package]]
 name = "manifatura-tools"
-version = "0.2.1"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f12c685d41b48f0d13d0beeec82825524d065627df2a5b0c565452d1b0b777a"
 dependencies = [
  "async-trait",
  "globset",
