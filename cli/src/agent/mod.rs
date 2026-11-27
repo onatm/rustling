@@ -1,7 +1,7 @@
 //! `chat`: a coding agent built on manifatura, with the model in the same process.
 //!
 //! The engine runs on its own thread; [`LocalProvider`] hands it the agent's requests. The agent has three
-//! tools (`read`, `grep`, `glob`), each asking before it runs, a system prompt built from the `AGENTS.md` files of the working directory and
+//! tools (`read`, `grep`, `glob`), each asking before it runs, an `explore` subagent behind a `task` tool, a system prompt built from the `AGENTS.md` files of the working directory and
 //! the tools' own guidelines, skills (built in, and the project's `.rustling/skills`) behind a `skill` tool, and sessions kept as JSON
 //! lines, so a conversation can be resumed later. The screen is in [`ui`].
 
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use manifatura::kit::context::{ContextFiles, SystemPrompt};
 use manifatura::skills::{Skill, SkillSet, Skills, SystemPromptExt};
+use manifatura::subagents::{Definition, Subagent, Subagents};
 use manifatura::kit::{self, Answer, Summarizer};
 use manifatura::store::JsonlStore;
 use manifatura::{Agent, Hooks, Message, Runtime, Session, SessionId, SessionMeta, Store, ToolCall, hook};
@@ -34,6 +35,14 @@ const TOOLS: &[&str] = &["read", "grep", "glob"];
 
 /// The skills built into rustling, as `SKILL.md` text. A project skill of the same name replaces one.
 const BUILTIN_SKILLS: &[&str] = &[include_str!("skills/codebase-tour/SKILL.md")];
+
+/// The subagents built into rustling, as Markdown. Each runs the chat's own agent (the same prompt and tools, so the
+/// engine reuses its processed prompt) with the file's body as its brief, calling only the tools its `tools` names
+/// and keeping the last of its `max_steps` for its report.
+const BUILTIN_AGENTS: &[&str] = &[include_str!("agents/explore.md")];
+
+/// The name in the header of the chat's own sessions; a subagent's sessions carry its own.
+const AGENT_NAME: &str = "rustling";
 
 /// Where a project keeps its skills, searched in each directory from the repository root down to the working
 /// directory. Rustling reads only its own skills: not `.agents/skills`, and none from the home directory.
@@ -111,6 +120,8 @@ pub(crate) struct Prepared {
     pub(crate) files: Vec<PathBuf>,
     /// The skills the prompt lists, which `/name` also starts.
     pub(crate) skills: SkillSet,
+    /// The subagents behind the `task` tool, which `/explore` also starts.
+    pub(crate) subagents: Subagents,
     /// Where the tools act, which a skill started with `/name` is read through.
     pub(crate) env: Arc<manifatura::tools::Local>,
     /// The MCP servers that started, with their tools' names and whether those are offered directly.
@@ -164,6 +175,11 @@ pub(crate) async fn prepare(
     problems.extend(skills.warnings().iter().cloned());
     // The skill tool only reads skills already loaded, so it never asks.
     tools.extend(skills.tool());
+    // The subagent is the chat's own agent, so its requests start with the same header. The engine serves one
+    // request at a time, so task calls run one after another. While one runs, its approvals say whose they are.
+    let active = Active::default();
+    let subagents = subagents(active.clone())?;
+    tools.push(subagents.tool());
     let mut prompt = SystemPrompt::new(BASE.trim()).tools(&tools).context_files(&files).skills(&skills);
     if let Some(system) = &options.system {
         prompt = prompt.section(system);
@@ -171,7 +187,7 @@ pub(crate) async fn prepare(
     let instructions = prompt.cwd(cwd).date(today()).build();
 
     let summarizer = Arc::new(Summarizer::default().keep_recent(window as u64 / 3).max_tokens(2048));
-    let mut agent = Agent::new(instructions).name("rustling").tools(tools);
+    let mut agent = Agent::new(instructions).name(AGENT_NAME).tools(tools);
     // The catalog goes first, so the hooks after it see the tool a run_tool call stands for.
     if deferred {
         agent = agent.hooks(kit::catalog());
@@ -181,9 +197,10 @@ pub(crate) async fn prepare(
         // "Always" allows the tool for the rest of the session. A turn interrupted while asking drops the question.
         agent = agent.hooks(kit::approve(asking, move |call: ToolCall| {
             let asks = asks.clone();
+            let from = active.get();
             async move {
                 let (reply, answer) = oneshot::channel();
-                if asks.send(Ask::new(call, reply)).is_err() {
+                if asks.send(Ask::new(call, reply).from(from)).is_err() {
                     return Answer::Deny(Some("nobody is there to ask".into()));
                 }
                 answer.await.unwrap_or(Answer::Deny(None))
@@ -199,7 +216,7 @@ pub(crate) async fn prepare(
     let provider = LocalProvider::new(client, reasoning.clone(), options.max_tokens, stats);
     let runtime = Runtime::builder().provider(provider).store(store.clone()).env(env.clone()).build();
 
-    let known = store.list().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let known = recent_sessions(store.as_ref()).await?;
     let id = match (&options.resume, options.resume_latest) {
         (Some(Some(id)), _) => {
             let id = SessionId::from(id.as_str());
@@ -220,7 +237,35 @@ pub(crate) async fn prepare(
         false => Vec::new(),
     };
     let files = files.into_iter().map(|file| file.path).collect();
-    Ok(Prepared { runtime, agent, session, history, store, summarizer, reasoning, files, skills, env, servers, problems })
+    Ok(Prepared { runtime, agent, session, history, store, summarizer, reasoning, files, skills, subagents, env, servers, problems })
+}
+
+/// The built-in subagents, for the `task` tool and `/explore`. `active` follows which one is running.
+fn subagents(active: Active) -> Result<Subagents> {
+    let mut list = Vec::new();
+    for text in BUILTIN_AGENTS {
+        let definition = Definition::parse(text).map_err(anyhow::Error::msg).context("a built-in subagent")?;
+        list.push(Subagent::from_definition(definition));
+    }
+    Ok(Subagents::new(list).sequential().on_event(move |progress| match &progress.event {
+        manifatura::Event::TurnStarted { .. } => active.set(Some(progress.agent.clone())),
+        manifatura::Event::TurnCompleted { .. } => active.set(None),
+        _ => {}
+    }))
+}
+
+/// The subagent running now, if any. Task calls run one at a time, so a question asked meanwhile is its.
+#[derive(Clone, Default)]
+struct Active(Arc<std::sync::Mutex<Option<String>>>);
+
+impl Active {
+    fn set(&self, name: Option<String>) {
+        *self.0.lock().unwrap() = name;
+    }
+
+    fn get(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
 }
 
 /// The built-in skills, then the project's, which take precedence.
@@ -259,9 +304,11 @@ fn slug(path: &Path) -> String {
     slug.trim_matches('-').to_owned()
 }
 
-/// The same recency ordering for the picker, completions and the command-line listing.
+/// The same recency ordering for the picker, completions and the command-line listing. A subagent's sessions are
+/// left out: they belong to the chat that started them.
 async fn recent_sessions(store: &dyn Store) -> Result<Vec<SessionMeta>> {
     let mut sessions = store.list().await?;
+    sessions.retain(|s| s.agent.as_deref() == Some(AGENT_NAME));
     sessions.sort_by_key(|s| std::cmp::Reverse(s.updated));
     Ok(sessions)
 }
@@ -321,6 +368,33 @@ mod tests {
             let skill = Skill::parse(text).unwrap();
             assert!(text.contains(&format!("name: {}\n", skill.name)));
         }
+    }
+
+    #[test]
+    fn the_built_in_subagents_are_offered_by_the_task_tool() {
+        for text in BUILTIN_AGENTS {
+            Definition::parse(text).unwrap();
+        }
+        // explore reads and searches, within a budget.
+        let explore = Definition::parse(BUILTIN_AGENTS[0]).unwrap();
+        assert_eq!(explore.tools.as_deref(), Some(&["read".to_owned(), "grep".into(), "glob".into()][..]));
+        assert_eq!(explore.max_steps, Some(20));
+        let tool = subagents(Active::default()).unwrap().tool();
+        assert_eq!(tool.name(), "task");
+        assert!(tool.is_sequential());
+        assert!(tool.spec().description.contains("- explore: Answers one question"), "{}", tool.spec().description);
+    }
+
+    #[tokio::test]
+    async fn the_session_list_leaves_out_subagents() {
+        use manifatura::{Entry, Record, RECORD_VERSION};
+        let store = manifatura::MemoryStore::new();
+        for (id, agent) in [("chat", AGENT_NAME), ("chat.explore-1", "explore")] {
+            let header = Entry::new(None, Record::Header { v: RECORD_VERSION, agent: agent.into() });
+            store.append(&SessionId::from(id), &[header]).await.unwrap();
+        }
+        let ids: Vec<_> = recent_sessions(&store).await.unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, [SessionId::from("chat")]);
     }
 
     #[tokio::test]

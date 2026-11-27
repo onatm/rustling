@@ -5,12 +5,18 @@ description: Explain how a project, or one feature of it, is put together. Use w
 
 # Codebase tour
 
-Work from the code, not from guesses. Read only what you need.
+Work from the code, not from guesses. The `explore` subagent does the searching and reading, so the files it goes through stay out of your context.
 
-1. Get the shape first. Use `glob` for the manifests and docs at the top: `Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, `README*`, `AGENTS.md`. Read the README and the main manifest.
-2. Find the entry points: `main` functions, binaries, exported modules, routes or commands. Use `glob` for the source layout and `grep` for the names.
-3. For a feature, start from where the user meets it (a command, an endpoint, a UI action) and follow the calls with `grep`, one hop at a time. Read the parts of files that matter, with `offset` and `limit` for long ones.
-4. Stop when you can explain the path. Do not read every file.
+1. Hand the question to `explore` with the `task` tool. It sees nothing of this conversation, so write the prompt in full:
+   - the question, in the user's terms;
+   - what you already know: names, files or commands the user mentioned;
+   - what to report: the main parts in the order things happen, and the key places as `path:line`.
+
+   For a whole project, ask for its shape: the manifests and README, the entry points, the main modules. For a feature, ask it to start where the user meets it (a command, an endpoint, a UI action) and follow the calls.
+2. If the question has separate parts, such as two features or a client and a server, give each its own task call.
+3. Read a file yourself only to check something a report left unclear.
+
+If `task` is refused because you are a subagent yourself, do the searching directly: `glob` for the layout and manifests, `grep` for names, then read only the parts that matter, with `offset` and `limit` for long files.
 
 Answer with:
 
@@ -18,4 +24,4 @@ Answer with:
 - **How it fits together**: the main parts and how data or control moves between them, in the order it happens.
 - **Where to look**: the key files and functions as `path:line`, each with a few words on its role.
 
-Say plainly what you did not check.
+Say plainly what was not checked.

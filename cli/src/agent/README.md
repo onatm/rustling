@@ -2,7 +2,8 @@
 
 `rustling chat` runs a coding assistant for the current directory, with the model in the same process.
 Its built-in tools read files (`read`), search their contents (`grep`) and find paths (`glob`).
-Each asks for approval by default.
+Each asks for approval by default. For questions that take many searches and reads, it can hand the work to an
+[`explore` subagent](#subagents).
 
 To install the CLI and download the model, follow the [project quick start](../../../README.md#quick-start).
 
@@ -64,7 +65,7 @@ to rustling instead of scrolling the terminal, and selecting text needs the modi
 
 ## Chat commands
 
-Typing `/` lists the commands: `/mcp` lists the MCP servers, `/skills` lists the skills, `/new` starts a new session, `/resume` opens a picker ordered by last activity (↑/↓ to select, Enter to resume, Esc to cancel),
+Typing `/` lists the commands: `/mcp` lists the MCP servers, `/skills` lists the skills, `/explore <question>` hands a question to the [`explore` subagent](#subagents), `/new` starts a new session, `/resume` opens a picker ordered by last activity (↑/↓ to select, Enter to resume, Esc to cancel),
 `/resume ID` switches directly, `/sessions` lists them, `/compact [focus]`
 summarises older messages to make room, `/effort` shows or sets how much the model reasons, and `/exit` quits.
 `/effort off` stops the reasoning altogether, as `--no-reasoning` does, and `/effort high` (or any level) brings
@@ -77,7 +78,7 @@ directory with a `SKILL.md`. The prompt lists each skill's name and description.
 model loads its instructions with the `skill` tool, which never asks for approval.
 
 Rustling has one skill built in, `codebase-tour` ([its instructions](skills/codebase-tour/SKILL.md)), for questions
-about how a project fits together. A project adds its own under `.rustling/skills/<name>/SKILL.md`, in the
+about how a project fits together. It hands the searching and reading to the [`explore` subagent](#subagents). A project adds its own under `.rustling/skills/<name>/SKILL.md`, in the
 repository root or any directory down to the current one. A project skill with the same name as a built-in one
 replaces it. Rustling reads only these two sources: not `.agents/skills`, and no skills from your home directory.
 
@@ -94,6 +95,31 @@ description: Prepare a release. Use when asked to cut, tag or announce a release
 Start a skill yourself with `/name`, and add a request after it: `/codebase-tour how do sessions resume?`. Its
 instructions go to the model with your message. `/skills` lists the skills and where each comes from, and
 `/status` names them. Skills are read when the chat starts, so a new or changed skill applies from the next one.
+
+## Subagents
+
+A subagent works on one task in a session of its own and reports back. Only its report enters the chat's context,
+which keeps a small window free for the conversation. The model starts one with the `task` tool.
+
+Rustling has one built in, `explore` ([its brief](agents/explore.md)), which answers a question about the code
+with what it found as `path:line`. The model may start it itself; to be sure it runs, start it yourself:
+
+```text
+/explore how does rustling decide which skills to load, and which one wins when two share a name?
+```
+
+Its report then goes to the chat with your question, and the chat answers from it. Until it reports, Esc stops it
+and messages wait. It is the chat's own agent with the same tools and instructions, so the engine
+reuses the prompt it has already processed, and the brief goes before the task. It may call only `read`, `grep` and
+`glob` (`tools` in [its definition](agents/explore.md)): it is offered the chat's other tools, so its prompt
+matches, but calls to them are refused. It cannot start subagents of its own. It has 20 model calls
+(`max_steps`): from halfway on it is told which one it is on, and the last is for its report, with tool calls
+off, so a search that runs long still ends with what it found. While it works, the transcript shows its latest tool call
+(`Exploring where sessions resume · Search fn resume`), and the finished line counts its calls.
+
+Its tools ask for approval as the chat's do, and the question names it (`explore · Read this file?`). Allowing a
+tool for the session holds for both. Esc stops the subagent along with the turn. Its sessions are kept with the
+chat's, but `--resume` and `/resume` leave them out.
 
 ## Reasoning
 

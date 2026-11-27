@@ -20,13 +20,21 @@ const CHOICES: [(&str, &str, Answer); 3] = [
 
 pub(crate) struct Ask {
     call: ToolCall,
+    /// The subagent that asks, when it is not the chat itself.
+    from: Option<String>,
     pub(super) reply: oneshot::Sender<Answer>,
     selected: usize,
 }
 
 impl Ask {
     pub(crate) fn new(call: ToolCall, reply: oneshot::Sender<Answer>) -> Self {
-        Self { call, reply, selected: 0 }
+        Self { call, from: None, reply, selected: 0 }
+    }
+
+    /// The question as a subagent's.
+    pub(crate) fn from(mut self, subagent: Option<String>) -> Self {
+        self.from = subagent;
+        self
     }
 
     pub(super) fn key(&mut self, key: KeyEvent) -> Option<Answer> {
@@ -76,6 +84,10 @@ impl Ask {
             "grep" => "Search file contents?".to_owned(),
             "glob" => "Find matching files?".to_owned(),
             name => format!("Run {name}?"),
+        };
+        let title = match &self.from {
+            Some(subagent) => format!("{subagent} · {title}"),
+            None => title,
         };
         let target = plain(&self.target(), width.saturating_sub(3), Style::new());
         // Short terminals keep the selected choice visible. On larger ones,
@@ -149,5 +161,7 @@ mod tests {
             assert_eq!(ask.key(KeyEvent::from(KeyCode::Char(key))), Some(answer));
         }
         assert_eq!(ask.key(KeyEvent::from(KeyCode::Esc)), Some(Answer::Deny(None)));
+        let ask = ask.from(Some("explore".into()));
+        assert!(ask.lines(60, 8).iter().any(|line| line.to_string().contains("explore · ")));
     }
 }

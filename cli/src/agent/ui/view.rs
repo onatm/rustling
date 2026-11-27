@@ -19,8 +19,8 @@ pub(crate) enum Item {
     Header { directory: String, model: String },
     User(String),
     Assistant(String),
-    /// Reasoning, collapsed to its first line once the answer starts, with how long it went on.
-    Reasoning { first: String, seconds: u64 },
+    /// Reasoning, whole, with how long it went on when that is known.
+    Reasoning { text: String, seconds: Option<u64> },
     Tool(Arc<ToolOutput>),
     ToolDetails(Arc<ToolOutput>),
     Notice(Level, String),
@@ -59,24 +59,86 @@ pub(super) fn prompt_text_width(width: usize) -> usize {
     width.saturating_sub(3).max(1)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct ToolOutput {
+    /// The tool, or for a task the subagent.
     name: String,
     summary: String,
     output: String,
     is_error: bool,
+    /// For a subagent: whether it is one, its tool calls as the transcript names them, and how long it took.
+    subagent: bool,
+    children: Vec<String>,
+    seconds: Option<u64>,
 }
 
 impl ToolOutput {
     fn heading(&self) -> String {
         let mark = if self.is_error { "✗" } else { "✓" };
-        let name = match self.name.as_str() {
-            "read" => "Read",
-            "grep" => "Search",
-            "glob" => "Find",
-            other => other,
+        format!("{mark} {} {}", title(&self.name), self.summary)
+    }
+
+    /// A finished call as a tree: `● Search fn main`, then under a `⎿` a subagent's calls, all of them, and what
+    /// came of it.
+    fn tree(&self, width: usize) -> Vec<Line<'static>> {
+        let mark = Style::new().fg(if self.is_error { Color::Red } else { Color::Green });
+        let mut out = call_lines(Span::styled("● ", mark), &self.name, &self.summary, width);
+        let mut branch = self.children.iter().map(|child| (child.clone(), dim())).collect::<Vec<_>>();
+        branch.push(self.result());
+        out.extend(branches(&branch, width));
+        out
+    }
+
+    /// What came of the call, in a line: an error's cause, a subagent's count of calls, or the output's size.
+    fn result(&self) -> (String, Style) {
+        let lines: Vec<&str> = self.output.lines().map(str::trim_end).filter(|line| !line.trim().is_empty()).collect();
+        if self.is_error {
+            return (lines.first().copied().unwrap_or("failed").to_owned(), Style::new().fg(Color::Red));
+        }
+        if self.subagent {
+            let calls = match self.children.len() {
+                1 => "1 tool call".to_owned(),
+                n => format!("{n} tool calls"),
+            };
+            let time = self.seconds.map_or_else(String::new, |s| format!(" · {}", duration(s)));
+            return (format!("Done · {calls}{time}"), dim());
+        }
+        let text = match (lines.len(), self.name.as_str()) {
+            (0, _) => "No output".to_owned(),
+            (1, _) => lines[0].trim().to_owned(),
+            (n, "read") => format!("Read {n} lines"),
+            (n, "grep") => format!("{n} matching lines"),
+            (n, "glob") => format!("{n} paths"),
+            (n, _) => format!("{n} lines of output"),
         };
-        format!("{mark} {name} {}", self.summary)
+        (text, dim())
+    }
+}
+
+/// A call's header: its mark, its name in bold and its summary, wrapped under itself.
+fn call_lines(mark: Span<'static>, name: &str, summary: &str, width: usize) -> Vec<Line<'static>> {
+    let mut spans = vec![mark, Span::styled(title(name).to_owned(), Style::new().add_modifier(Modifier::BOLD))];
+    if !summary.is_empty() {
+        spans.push(Span::raw(format!(" {summary}")));
+    }
+    wrap(spans, width, "  ")
+}
+
+/// Lines under a call: the first after `⎿`, the rest lined up with it, each wrapped rather than cut.
+fn branches(lines: &[(String, Style)], width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for (i, (text, style)) in lines.iter().enumerate() {
+        let lead = if i == 0 { "  ⎿ " } else { "    " };
+        out.extend(wrap(vec![Span::styled(lead, dim()), Span::styled(text.clone(), *style)], width, "    "));
+    }
+    out
+}
+
+/// Seconds as `42s` or `6m 20s`.
+fn duration(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        _ => format!("{}m {}s", seconds / 60, seconds % 60),
     }
 }
 
@@ -107,19 +169,19 @@ impl Item {
                 out.push(padding);
             }
             Item::Assistant(text) => out.extend(markdown(text, width)),
-            Item::Reasoning { first, seconds } => {
+            Item::Reasoning { text, seconds } => {
                 let style = dim().add_modifier(Modifier::ITALIC);
-                let line = format!("∴ Thought for {seconds}s · {first}");
-                out.push(Line::styled(clip(&line, width.saturating_sub(1).max(8)), style));
-            }
-            Item::Tool(tool) => {
-                let style = if tool.is_error { Style::new().fg(Color::Red) } else { dim() };
-                out.push(Line::styled(clip(&tool.heading(), width), style));
-                if tool.is_error {
-                    let cause = tool.output.lines().find(|line| !line.trim().is_empty()).unwrap_or("tool failed");
-                    out.extend(plain(&format!("  {cause}"), width, style).into_iter().take(2));
+                let heading = match seconds {
+                    Some(seconds) => format!("∴ Thought for {}", duration(*seconds)),
+                    None => "∴ Thought".to_owned(),
+                };
+                out.push(Line::styled(heading, style));
+                for mut line in plain(text.trim(), width.saturating_sub(2).max(8), style) {
+                    line.spans.insert(0, Span::raw("  "));
+                    out.push(line);
                 }
             }
+            Item::Tool(tool) => out.extend(tool.tree(width)),
             Item::ToolDetails(tool) => {
                 out.extend(plain(&tool.heading(), width, dim()));
                 out.extend(plain(&tool.output.replace('\t', "  "), width, Style::new()));
@@ -155,8 +217,38 @@ pub(crate) fn clip(text: &str, width: usize) -> String {
 }
 
 /// A call in a line: its path or pattern when it has one, else its input.
+/// How a tool, or a subagent, is named in the transcript.
+fn title(name: &str) -> &str {
+    match name {
+        "read" => "Read",
+        "grep" => "Search",
+        "glob" => "Find",
+        "explore" => "Explore",
+        other => other,
+    }
+}
+
+/// The name a call is shown under, and whether it is a subagent's: a task is shown as its subagent.
+fn shown_name(name: &str, input: &Value) -> (String, bool) {
+    match (name, input["agent"].as_str()) {
+        ("task", Some(agent)) => (agent.to_owned(), true),
+        _ => (name.to_owned(), false),
+    }
+}
+
+/// A subagent's tool call, from the line the task tool logs for it (`grep {"pattern":…}`), as the transcript
+/// names it.
+fn subagent_call(line: &str) -> String {
+    let (name, input) = line.split_once(' ').unwrap_or((line, ""));
+    match serde_json::from_str::<Value>(input) {
+        Ok(input) => format!("{} {}", title(name), tool_summary(name, &input)),
+        Err(_) => clip(line, 160),
+    }
+}
+
 pub(crate) fn tool_summary(name: &str, input: &Value) -> String {
     let text = match name {
+        "task" => input["description"].as_str().or(input["prompt"].as_str()).map(str::to_owned),
         "read" => input["path"].as_str().map(str::to_owned),
         "grep" | "glob" => input["pattern"].as_str().map(str::to_owned),
         "run_tool" => input["name"].as_str().map(|name| format!("{name} {}", input["input"])),
@@ -183,8 +275,13 @@ pub(crate) enum Activity {
 
 struct Running {
     call_id: String,
+    /// The tool, or for a task the subagent.
     name: String,
     summary: String,
+    /// For a subagent: whether it is one, and its tool calls so far.
+    subagent: bool,
+    children: Vec<String>,
+    started: Instant,
 }
 
 /// The display state of one session.
@@ -240,8 +337,8 @@ impl View {
         std::mem::take(&mut self.committed)
     }
 
-    fn finish_tool(&mut self, name: String, summary: String, output: String, is_error: bool) {
-        let tool = Arc::new(ToolOutput { name, summary, output, is_error });
+    fn finish_tool(&mut self, tool: ToolOutput) {
+        let tool = Arc::new(tool);
         self.tools.push(tool.clone());
         self.push(Item::Tool(tool));
     }
@@ -260,21 +357,36 @@ impl View {
             "read" => "Reading",
             "grep" => "Searching",
             "glob" => "Finding",
+            "explore" => "Exploring",
             other => other,
         };
         let mut label = format!("{verb} {}", call.summary);
+        if let Some(latest) = call.children.last() {
+            label.push_str(&format!(" · {latest}"));
+        }
         if self.running.len() > 1 {
             label.push_str(&format!(" (+{} more)", self.running.len() - 1));
         }
         label
     }
 
-    /// Ends the reasoning: it goes to the scrollback as one line.
+    /// The calls running now, as trees: a subagent with every call it has made so far.
+    pub(crate) fn running_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        for call in &self.running {
+            out.extend(call_lines(Span::styled("○ ", dim()), &call.name, &call.summary, width));
+            let children: Vec<(String, Style)> = call.children.iter().map(|child| (child.clone(), dim())).collect();
+            out.extend(branches(&children, width));
+        }
+        out
+    }
+
+    /// Ends the reasoning: it goes to the scrollback whole.
     fn collapse_reasoning(&mut self) {
         let reasoning = std::mem::take(&mut self.reasoning);
-        let seconds = self.thinking_since.take().map_or(0, |since| since.elapsed().as_secs());
-        if let Some(first) = reasoning.lines().map(str::trim).find(|line| !line.is_empty()) {
-            self.push(Item::Reasoning { first: first.to_owned(), seconds });
+        let seconds = self.thinking_since.take().map(|since| since.elapsed().as_secs());
+        if !reasoning.trim().is_empty() {
+            self.push(Item::Reasoning { text: reasoning.trim().to_owned(), seconds });
         }
     }
 
@@ -315,15 +427,21 @@ impl View {
             for content in &message.content {
                 match (message.role, content) {
                     (Role::User, Content::Text { text }) => self.push(Item::User(typed(text))),
+                    (Role::Assistant, Content::Thinking { text, .. }) if !text.trim().is_empty() => {
+                        self.push(Item::Reasoning { text: text.trim().to_owned(), seconds: None })
+                    }
                     (Role::Assistant, Content::Text { text }) if !text.trim().is_empty() => {
                         self.push(Item::Assistant(text.clone()))
                     }
                     (Role::Assistant, Content::ToolCall { id, name, input }) => {
-                        calls.insert(id.clone(), (name.clone(), tool_summary(name, input)));
+                        calls.insert(id.clone(), (shown_name(name, input), tool_summary(name, input)));
                     }
                     (Role::Tool, Content::ToolResult { call_id, output, is_error }) => {
-                        let (name, summary) = calls.remove(call_id).unwrap_or_else(|| ("tool".into(), String::new()));
-                        self.finish_tool(name, summary, output.clone(), *is_error);
+                        let ((name, subagent), summary) =
+                            calls.remove(call_id).unwrap_or_else(|| (("tool".into(), false), String::new()));
+                        // A subagent's own calls are in its session, not this one.
+                        let tool = ToolOutput { name, summary, output: output.clone(), is_error: *is_error, subagent, ..Default::default() };
+                        self.finish_tool(tool);
                     }
                     _ => {}
                 }
@@ -359,15 +477,28 @@ impl View {
                 self.finish_reply();
             }
             Event::ActionStarted { call_id, name, input, .. } => {
-                self.running.push(Running { call_id: call_id.clone(), name: name.clone(), summary: tool_summary(name, input) });
+                let summary = tool_summary(name, input);
+                let (name, subagent) = shown_name(name, input);
+                let started = Instant::now();
+                self.running.push(Running { call_id: call_id.clone(), name, summary, subagent, children: Vec::new(), started });
                 self.activity = Activity::Running;
             }
+            Event::ActionLog { call_id, text, .. } => {
+                if let Some(running) = self.running.iter_mut().find(|r| &r.call_id == call_id) {
+                    running.children.push(subagent_call(text));
+                }
+            }
             Event::ActionResult { call_id, name, output, is_error, .. } => {
-                let summary = match self.running.iter().position(|r| &r.call_id == call_id) {
-                    Some(i) => self.running.remove(i).summary,
-                    None => String::new(),
-                };
-                self.finish_tool(name.clone(), summary, output.clone(), *is_error);
+                let mut tool = ToolOutput { name: name.clone(), output: output.clone(), is_error: *is_error, ..Default::default() };
+                if let Some(i) = self.running.iter().position(|r| &r.call_id == call_id) {
+                    let running = self.running.remove(i);
+                    tool.name = running.name;
+                    tool.summary = running.summary;
+                    tool.subagent = running.subagent;
+                    tool.seconds = running.subagent.then(|| running.started.elapsed().as_secs());
+                    tool.children = running.children;
+                }
+                self.finish_tool(tool);
                 self.activity = match self.running.is_empty() {
                     true => Activity::Thinking,
                     false => Activity::Running,
@@ -456,7 +587,21 @@ pub(crate) fn tokens(n: u64) -> String {
 
 /// What the person typed for a user message: a skill started with `/name request` was sent as the skill's
 /// instructions and then the request, and shows as the command again.
+/// What `/explore` sends the agent once the subagent has reported: the report, then the question.
+pub(crate) fn explore_message(question: &str, report: &str) -> String {
+    format!("<explore_report>\n{}\n</explore_report>\n\n{EXPLORE_NOTE}\n\n{question}", report.trim())
+}
+
+const EXPLORE_NOTE: &str = "The explore subagent looked into my question; its report is above. Answer from it, and read a \
+                            file yourself only to check something it left unclear.";
+
 fn typed(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix("<explore_report>\n")
+        && let Some((_, after)) = rest.rsplit_once("\n</explore_report>\n\n")
+        && let Some(question) = after.strip_prefix(EXPLORE_NOTE)
+    {
+        return format!("/explore {}", question.trim_start());
+    }
     let Some(rest) = text.strip_prefix("<skill_content name=\"") else { return text.to_owned() };
     let (Some((name, _)), Some((_, request))) = (rest.split_once('"'), rest.split_once("</skill_content>\n\n")) else {
         return text.to_owned();
@@ -475,11 +620,49 @@ mod tests {
         assert_eq!(super::typed(&format!("{sent}how does chat work?")), "/codebase-tour how does chat work?");
         assert_eq!(super::typed(&format!("{sent}Use the codebase-tour skill.")), "/codebase-tour");
         assert_eq!(super::typed("hello"), "hello");
+        let sent = super::explore_message("where is main?", "main is in src/main.rs:1\n");
+        assert_eq!(super::typed(&sent), "/explore where is main?");
     }
 
     use super::*;
     use manifatura::Usage;
     use serde_json::json;
+
+    #[test]
+    fn a_task_shows_its_subagent_and_what_it_does() {
+        let mut view = View::new();
+        let turn = "t".to_owned();
+        view.apply(&Event::TurnStarted { turn: turn.clone() });
+        view.apply(&Event::ActionStarted {
+            turn: turn.clone(),
+            call_id: "1".into(),
+            name: "task".into(),
+            input: json!({ "agent": "explore", "description": "where main is", "prompt": "Find main." }),
+        });
+        assert_eq!(view.running_label(), "Exploring where main is");
+        for text in [r#"glob {"pattern":"**/*.rs"}"#, r#"grep {"pattern":"fn main"}"#] {
+            view.apply(&Event::ActionLog { turn: turn.clone(), call_id: "1".into(), text: text.into() });
+        }
+        assert_eq!(view.running_label(), "Exploring where main is · Search fn main");
+        let live: Vec<String> = view.running_lines(60).iter().map(Line::to_string).collect();
+        assert_eq!(live, ["○ Explore where main is", "  ⎿ Find **/*.rs", "    Search fn main"]);
+        view.apply(&Event::ActionResult {
+            turn: turn.clone(),
+            call_id: "1".into(),
+            name: "task".into(),
+            output: "main is in src/main.rs:1".into(),
+            is_error: false,
+        });
+        let items = view.take_committed();
+        let Item::Tool(tool) = &items[0] else { panic!("{items:?}") };
+        assert_eq!(tool.heading(), "✓ Explore where main is");
+        // Every call it made stays listed under it, then what came of it.
+        let lines: Vec<String> = items[0].lines(60).iter().map(Line::to_string).collect();
+        assert_eq!(lines[1], "● Explore where main is");
+        assert_eq!(lines[2], "  ⎿ Find **/*.rs");
+        assert_eq!(lines[3], "    Search fn main");
+        assert!(lines[4].starts_with("    Done · 2 tool calls · "), "{lines:?}");
+    }
 
     #[test]
     fn events_become_items() {
@@ -510,7 +693,8 @@ mod tests {
         assert!(matches!(&items[1], Item::Tool(tool) if tool.summary == "fn main"));
         assert_eq!(items[2], Item::Notice(Level::Error, "error: boom".into()));
         assert!(!view.is_busy());
-        assert_eq!(items[1].lines(40).len(), 2);
+        let lines: Vec<String> = items[1].lines(40).iter().map(Line::to_string).collect();
+        assert_eq!(lines, ["", "● Search fn main", "  ⎿ 2 matching lines"]);
         view.show_tools();
         let details = view.take_committed();
         assert!(details[0].lines(40).iter().any(|line| line.to_string().contains("src/bin.rs")));
@@ -536,11 +720,14 @@ mod tests {
         delta(&mut view, " thought.\nThird", true);
         assert!(view.take_committed().is_empty());
         assert_eq!(view.live_lines(40, 10).len(), 3);
-        // Once the answer starts it is one line; the answer goes in paragraph by paragraph, not inside a code block.
+        // Once the answer starts it goes to the scrollback whole; the answer goes in paragraph by paragraph, not
+        // inside a code block.
         delta(&mut view, "One.\n\n```\na\n\nb\n", false);
         let items = view.take_committed();
-        assert_eq!(items, [Item::Reasoning { first: "First thought.".into(), seconds: 0 }, Item::Assistant("One.".into())]);
-        assert_eq!(items[0].lines(80).len(), 2, "a blank line, then the one line");
+        let thought = "First thought.\nSecond thought.\nThird";
+        assert_eq!(items, [Item::Reasoning { text: thought.into(), seconds: Some(0) }, Item::Assistant("One.".into())]);
+        let lines: Vec<String> = items[0].lines(80).iter().map(Line::to_string).collect();
+        assert_eq!(lines, ["", "∴ Thought for 0s", "  First thought.", "  Second thought.", "  Third"]);
         delta(&mut view, "```\nAfter.", false);
         assert_eq!(view.take_committed(), [Item::Assistant("```\na\n\nb\n```".into())]);
         view.apply(&Event::MessageAppended { turn: turn.clone(), message: Message::assistant("ignored"), usage: None });
@@ -549,7 +736,7 @@ mod tests {
         // Reasoning that ends in a tool call, with no answer, collapses as well.
         delta(&mut view, "Look at the file.", true);
         view.apply(&Event::MessageAppended { turn, message: Message::new(Role::Assistant, Vec::new()), usage: None });
-        assert!(matches!(&view.take_committed()[..], [Item::Reasoning { first, .. }] if first == "Look at the file."));
+        assert!(matches!(&view.take_committed()[..], [Item::Reasoning { text, .. }] if text == "Look at the file."));
     }
 
     #[test]

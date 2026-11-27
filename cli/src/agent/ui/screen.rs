@@ -179,10 +179,12 @@ mod tests {
 
         app.view.apply(&Event::TextDelta { turn: "t".into(), text: "The answer".into() });
         draw(&mut app, &mut backend);
+        // The reasoning stays whole: its heading, then its three lines.
         assert!(row(backend.buffer(), first).contains("Thought for"));
-        let answer = first + 2;
+        assert_eq!(row(backend.buffer(), first + 3), "  third");
+        let answer = first + 5;
         assert_eq!(row(backend.buffer(), answer), "The answer");
-        assert_eq!(row(backend.buffer(), first + 1), "");
+        assert_eq!(row(backend.buffer(), first + 4), "");
 
         app.view.apply(&Event::TextDelta { turn: "t".into(), text: " is here.\n\nNext".into() });
         draw(&mut app, &mut backend);

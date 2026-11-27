@@ -171,6 +171,13 @@ impl App {
         }
         let mut lines = self.view.live_lines(width, available);
         if lines.is_empty() {
+            // The calls running now, as trees above the spinner, their latest lines when they do not fit.
+            let mut running = self.view.running_lines(width);
+            let room = available.saturating_sub(2);
+            if running.len() > room {
+                running.drain(..running.len() - room);
+            }
+            lines = running;
             let activity = self.activity_line(width);
             if activity.spans.is_empty() {
                 return lines;

@@ -33,7 +33,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 pub(crate) use self::approval::Ask;
 use self::logs::{LogLine, Logs};
-use self::view::{Activity, Item, Level, View, dim, tokens};
+use self::view::{Activity, Item, Level, View, dim, explore_message, tokens};
 use super::reasoning::{Effort, LEVELS};
 use super::{ChatOptions, Prepared, ago, recent_sessions};
 
@@ -50,6 +50,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/tools", "", "show tool output from the current or last turn"),
     ("/mcp", "", "the MCP servers and their tools"),
     ("/skills", "", "the skills; start one with /name [request]"),
+    ("/explore", "<question>", "hand a question about the code to the explore subagent"),
     ("/help", "", "what the keys and commands do"),
     ("/exit", "", "quit"),
 ];
@@ -107,6 +108,8 @@ struct App {
     tick: usize,
     quit: bool,
     abort: Option<Abort>,
+    /// A running `/explore`: its question, and what it reports.
+    exploring: Option<(String, mpsc::UnboundedReceiver<Explored>)>,
     /// The agent, once the model is loaded.
     ready: Option<Prepared>,
     events: Option<broadcast::Receiver<Event>>,
@@ -288,6 +291,7 @@ async fn screen(
                     Err(broadcast::error::RecvError::Closed) => app.events = None,
                 },
                 Some(ask) = asks.recv() => app.asks.push_back(ask),
+                Some(explored) = recv_explored(&mut app.exploring) => app.explored(explored).await,
                 () = app.files.receive() => {}
                 Some(line) = logs.0.recv() => app.log_line(line),
                 Ok(()) = stats.changed() => {
@@ -314,6 +318,23 @@ async fn screen(
     let id = app.ready.as_ref().map(|ready| ready.session.id().clone());
     drop(app);
     (engine, id, result)
+}
+
+/// What a running `/explore` sends the screen: the lines it logs, then its report.
+enum Explored {
+    Line(String),
+    Done(manifatura::ToolResult),
+}
+
+/// The turn and call ids `/explore` shows its work under.
+const EXPLORE: &str = "explore";
+
+/// The running `/explore`'s next message, or never when none runs.
+async fn recv_explored(exploring: &mut Option<(String, mpsc::UnboundedReceiver<Explored>)>) -> Option<Explored> {
+    match exploring {
+        Some((_, rx)) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The next session event, or never when there is no session yet.
@@ -353,6 +374,7 @@ impl App {
             tick: 0,
             quit: false,
             abort: None,
+            exploring: None,
             ready: None,
             events: None,
             last: None,
@@ -601,6 +623,10 @@ impl App {
             self.view.notice(Level::Info, "the model is still loading");
             return;
         };
+        if self.exploring.is_some() {
+            self.view.notice(Level::Info, "explore is still working; send this once it reports, or press Esc to stop it");
+            return;
+        }
         if self.view.is_busy() {
             // Sent while the agent works: it reads it before its next step.
             match ready.session.steer(text) {
@@ -610,6 +636,12 @@ impl App {
             return;
         }
         self.view.push(Item::User(shown));
+        self.prompt(text).await;
+    }
+
+    /// Starts a turn for `text`, which the transcript already shows.
+    async fn prompt(&mut self, text: String) {
+        let Some(ready) = &self.ready else { return };
         match ready.session.prompt(text).await {
             Ok(turn) => {
                 self.abort = Some(turn.abort_handle());
@@ -662,6 +694,8 @@ impl App {
             return self.start_skill(name, argument, line).await;
         }
         match command {
+            "/explore" if argument.is_empty() => self.view.notice(Level::Info, "/explore <question>: what to find out about the code"),
+            "/explore" => self.explore(argument, line),
             "/new" => {
                 let session = ready.runtime.session(&ready.agent, SessionId::new());
                 self.view.replay(&[]);
@@ -756,6 +790,56 @@ impl App {
             request => request.to_owned(),
         };
         self.send(line.to_owned(), format!("{instructions}\n\n{request}")).await;
+    }
+
+    /// Starts the explore subagent on `question` from `/explore question`, without waiting for the model to choose
+    /// it. The transcript shows it as a task; its report then goes to the agent with the question.
+    fn explore(&mut self, question: &str, line: &str) {
+        let Some(ready) = &self.ready else { return };
+        self.view.push(Item::User(line.to_owned()));
+        self.view.apply(&Event::TurnStarted { turn: EXPLORE.into() });
+        self.view.apply(&Event::ActionStarted {
+            turn: EXPLORE.into(),
+            call_id: EXPLORE.into(),
+            name: manifatura::subagents::TASK_TOOL.into(),
+            input: serde_json::json!({ "agent": EXPLORE, "description": question }),
+        });
+        let abort = Abort::new();
+        self.abort = Some(abort.clone());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (subagents, session, prompt) = (ready.subagents.clone(), ready.session.clone(), question.to_owned());
+        tokio::spawn(async move {
+            let lines = tx.clone();
+            let log = move |line| {
+                let _ = lines.send(Explored::Line(line));
+            };
+            let report = subagents.run(&session, EXPLORE, &prompt, &abort, log).await;
+            let _ = tx.send(Explored::Done(report));
+        });
+        self.exploring = Some((question.to_owned(), rx));
+    }
+
+    async fn explored(&mut self, explored: Explored) {
+        let report = match explored {
+            Explored::Line(text) => {
+                return self.view.apply(&Event::ActionLog { turn: EXPLORE.into(), call_id: EXPLORE.into(), text });
+            }
+            Explored::Done(report) => report,
+        };
+        let Some((question, _)) = self.exploring.take() else { return };
+        let aborted = self.abort.take().is_some_and(|abort| abort.is_aborted());
+        self.view.apply(&Event::ActionResult {
+            turn: EXPLORE.into(),
+            call_id: EXPLORE.into(),
+            name: manifatura::subagents::TASK_TOOL.into(),
+            output: report.output.clone(),
+            is_error: report.is_error,
+        });
+        let outcome = if aborted { manifatura::Outcome::Aborted } else { manifatura::Outcome::Completed };
+        self.view.apply(&Event::TurnCompleted { turn: EXPLORE.into(), outcome, error: None, usage: Default::default() });
+        if !aborted {
+            self.prompt(explore_message(&question, &report.output)).await;
+        }
     }
 
     async fn resume(&mut self, id: SessionId) {

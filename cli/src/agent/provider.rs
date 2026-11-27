@@ -4,7 +4,7 @@
 use futures_util::StreamExt;
 use manifatura::{
     Abort, BoxStream, Content, ErrorKind, Message, ModelInfo, ModelRequest, Provider, Response, Role,
-    StopReason, StreamEvent, Usage,
+    StopReason, StreamEvent, ToolChoice, Usage,
 };
 use rustling::engine::{self, Cancel, Client, Event, Failure, FailureKind, Finish, Request};
 
@@ -44,6 +44,8 @@ impl Provider for LocalProvider {
             max_tokens: req.max_tokens.map(|n| n as usize),
             reasoning_effort,
             no_reasoning,
+            // The tools stay declared, so the prompt is the one the engine has processed; only calling them is off.
+            no_tool_calls: req.tool_choice == ToolChoice::Off,
             cancel: cancel.clone(),
             ..Request::default()
         };
@@ -242,10 +244,7 @@ mod tests {
     #[test]
     fn a_conversation_becomes_template_messages() {
         let call = Content::ToolCall { id: "c1".into(), name: "read".into(), input: json!({ "path": "a.txt" }) };
-        let req = ModelRequest {
-            model: "m".into(),
-            system: "Be brief.".into(),
-            messages: vec![
+        let conversation = vec![
                 Message::user("Read a.txt"),
                 Message::new(
                     Role::Assistant,
@@ -253,11 +252,9 @@ mod tests {
                 ),
                 Message::new(Role::Tool, vec![Content::ToolResult { call_id: "c1".into(), output: "hi".into(), is_error: false }]),
                 Message::system_note("A note."),
-            ],
-            tools: vec![manifatura::ToolSpec { name: "read".into(), description: "Read.".into(), input_schema: json!({}) }],
-            max_tokens: None,
-            reasoning: None,
-        };
+            ];
+        let read = manifatura::ToolSpec { name: "read".into(), description: "Read.".into(), input_schema: json!({}) };
+        let req = ModelRequest::new("m", conversation).system("Be brief.").tools(vec![read]);
         let out = messages(&req);
         let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["system", "user", "assistant", "tool", "system"]);
